@@ -26,11 +26,11 @@ services:
       - MINIO_SECURE=false
       - SCRIPT_REF_DIR=/app/script_store
       - SCRIPT_TIMEOUT=30.0
-      - UPSTREAM_TIMEOUT=60.0
+      # 2K 同步生成实测 27~82s，60s 会截断慢请求
+      - UPSTREAM_TIMEOUT=180.0
       - ENVIRONMENT=production
-      - UPSTREAM_A_API_KEY=mock-key-a
-      - UPSTREAM_B_AK=test-ak
-      - UPSTREAM_B_SK=test-sk
+      # 数据面门禁。内联脚本即远程代码执行，缺这一项时适配器会拒绝所有请求。
+      - ADAPTER_KEY=${ADAPTER_KEY:?ADAPTER_KEY must be set}
     depends_on:
       - redis
       - minio

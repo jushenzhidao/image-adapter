@@ -22,6 +22,11 @@ htmlcov/
 *.log
 logs/
 
+# 上游实测出图（本地验证产物，勿入库）
+ark_*.jpeg
+ark_*.jpg
+ark_*.png
+
 # 编辑器与系统
 .idea/
 .vscode/
