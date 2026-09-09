@@ -1,0 +1,34 @@
+[project]
+name = "image-adapter"
+version = "1.0.0"
+description = "OpenAI Images protocol adapter for heterogeneous upstreams"
+requires-python = ">=3.13"
+dependencies = [
+    "starlette>=1.6.0",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.52.4",
+    "aiohttp>=3.14.3",
+    "redis>=8.1.0",
+    "minio>=7.2.20",
+    "pillow>=12.3.0",
+    "logfire[starlette]>=4.41.0",
+    "pydantic-settings>=2.15.0",
+    "pyyaml>=6.0.3",
+    "gunicorn>=26.2.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "httpx>=0.28.1",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

@@ -1,0 +1,200 @@
+# Image Adapter — 协议适配执行引擎
+
+把任意厂商的图像/多模态 API 转成 OpenAI 标准端点：`/v1/images/generations`、`/v1/images/edits`、`/v1/chat/completions`、`/v1/responses`。
+
+**以 `/v1/images/generations` 为唯一规范格式。** 文生图与图生图走同一个端点：带上 `image`（可选 `mask`）即图生图，`image` 支持 URL、data URI、裸 base64 三种形态，脚本侧用 `ctx.image_*` 统一转成上游要的那一种。
+
+`/v1/images/edits` 只是它的 **multipart 前门**：OpenAI 把 edits 拆出去是载体差异（multipart 文件上传 vs JSON），不是语义差异，所以该路由不含任何适配逻辑，只做一次形态改写后汇入同一条管道——脚本永远只需实现一套契约。
+
+| multipart/form-data | 规范 JSON |
+|---|---|
+| `image=@a.png`（文件） | `image: "data:image/png;base64,..."` |
+| `image[]=@a.png&image[]=@b.png` | `image: ["data:...", "data:..."]` |
+| `mask=@m.png` | `mask: "data:image/png;base64,..."` |
+| `image=https://cdn/a.png`（文本） | `image: "https://cdn/a.png"` |
+| `n=2` | `n: 2`（转 int） |
+| 厂商私有字段 | 原样透传为字符串 |
+
+上传文件转成 data URI 而非裸 base64，mime 由**magic number 嗅探**得出（SDK 常把 PNG 声明成 `application/octet-stream`），因此 `ctx.image_*` 后续无需再嗅探。校验不重复实现——改写后的 body 走 generations 同一个 `validate_images_body()`，两个端点接受与拒绝的请求完全一致。
+
+## 职责边界
+
+本服务是纯粹的**数据面（执行引擎）**，自身不存储任何渠道、模型、计费知识。
+
+| | 控制面（New API） | 数据面（本服务） |
+|---|---|---|
+| 职责 | 渠道 / 模型 / 计费 / 路由 | 沙箱执行、协议转换、异步轮询、图片存储、可观测 |
+| 配置来源 | 渠道配置界面 | 无配置文件，全部由请求头驱动 |
+| 状态 | 持久化 | 无状态（Redis 仅作缓存与会话链） |
+
+推论：**一个渠道 = 一个上游端点**。同厂商的 chat 与 images 各建一个 New API 渠道、各填各自的 URL，天然复用 New API 的负载均衡与故障切换。
+
+## 渠道契约（请求头）
+
+New API 在渠道配置里声明适配策略，通过头透传：
+
+| 头 | 必填 | 说明 |
+|---|---|---|
+| `X-Upstream-Url` | 是 | 上游完整端点，如 `https://api.vendor-x.com/v2/text2img` |
+| `X-Script` | 三选一 | 内联脚本源码，换行写作字面量 `\n` |
+| `X-Script-64` | 三选一 | 源码的 base64（避免 `\n` 转义混乱） |
+| `X-Script-Ref` | 三选一 | 命名引用 `vendor_y/mj@v1.3`，或 https URL |
+| `Authorization` | 否 | **上游厂商**凭证，原样透传，不用于本服务鉴权 |
+| `X-Adapter-Key` | 是 | 本服务准入密钥 |
+| `X-Upstream-Method` | 否 | 默认 `POST` |
+| `X-Auth-Emit` | 否 | 凭证位置非标准时，如 `header:X-API-Key:Bearer` |
+| `X-Async` | 否 | 异步 Job 型上游，如 `poll=2,timeout=300` |
+| `X-Script-Sha256` | 否 | 完整性锁定 |
+| `X-Channel-Options` | 否 | JSON 对象，脚本内通过 `ctx.options` 读取 |
+
+最小形态示例：
+
+```json
+{
+  "X-Adapter-Key": "<data-plane-key>",
+  "X-Upstream-Url": "https://api.vendor-x.com/v2/text2img",
+  "Authorization": "Bearer <vendor-key>",
+  "X-Script": "async def transform(ctx, payload, phase):\n    if phase == 'request':\n        return {'desc': payload['prompt']}\n    return {'data': [{'url': payload['img']}]}"
+}
+```
+
+请求链路：取 `X-Upstream-Url` + 脚本 + `Authorization` → `transform(phase='request')` 转请求体 → 带凭证调上游 → `transform(phase='response')` 转响应体 → 返回客户端。
+
+## 脚本契约
+
+单一入口函数，相位（phase）区分方向：
+
+```python
+async def transform(ctx, payload, phase):
+    if phase == 'request':
+        # Vision 场景：把 OpenAI 的图片 URL 下载转 base64 给上游
+        img = await ctx.download_image(payload['image_url'])
+        return {'desc': payload['prompt'], 'image_b64': ctx.encode_b64(img)}
+
+    # response 方向：上游返回二进制，客户端要 URL → 传 MinIO
+    url = await ctx.upload_temp_image(payload)   # payload 是 bytes
+    return {'data': [{'url': url}]}
+```
+
+相位取值：
+
+- `request` / `response` —— 同步链路，必需
+- `poll_request` / `poll_response` —— 仅 `X-Async` 开启时需要，脚本须用模块级 `PHASES` 声明，否则报 `channel_config_error`
+
+`poll_response` 返回 `{'done': bool, 'payload': ...}`；`done=True` 时 `payload` 交给 `response` 相位收尾。
+
+### ctx API
+
+| 成员 | 说明 |
+|---|---|
+| `ctx.options` | `X-Channel-Options` 解析后的 dict |
+| `ctx.upstream_url` | 当前渠道 URL |
+| `ctx.request_id` | 贯穿日志的请求 ID |
+| `await ctx.download_image(url)` | 下载图片，Redis 缓存 |
+| `await ctx.upload_temp_image(raw)` | 传 MinIO 返回预签名 URL；无 MinIO 时降级为 data URI |
+| `ctx.encode_b64(raw)` / `ctx.decode_b64(s)` | base64 编解码 |
+| `await ctx.image_bytes(ref)` | 三态入参（URL / data URI / 裸 base64）统一取原始字节 |
+| `await ctx.image_b64(ref)` | 三态入参 → 裸 base64（解码校验后重编码） |
+| `await ctx.image_data_uri(ref)` | 三态入参 → data URI，mime 由magic number 嗅探 |
+| `await ctx.image_url(ref)` | 三态入参 → 可公网访问 URL（必要时经 MinIO 中转） |
+| `ctx.is_url(s)` / `ctx.is_data_uri(s)` | 形态判断，写多分支转换时用 |
+| `ctx.emit(url=..., method=..., headers=..., query=..., form=..., raw=..., timeout=...)` | 覆盖本次上游调用的任意维度（轮询换端点、multipart 上传等） |
+| `ctx.key` | 上游凭证（`Authorization` 去掉 Bearer 后的值），签名计算时用 |
+| `await ctx.sleep(s)` | 异步等待（脚本内禁用 `import asyncio`） |
+| `ctx.logfire` | 追踪句柄，`with ctx.logfire.span('...')` |
+
+## 安全模型
+
+从请求头注入 Python 源码本质上是**受控的远程代码执行**，因此有四道防线，全部默认开启：
+
+1. **准入**：`X-Adapter-Key`（恒定时间比较）。`ADAPTER_KEY` 未配置时拒绝所有请求，除非显式 `ADAPTER_KEY_REQUIRED=false`。
+2. **来源策略**：生产建议 `ALLOW_INLINE_SCRIPT=false` + `SCRIPT_SHA256_ALLOWLIST=<hash1,hash2>`，只放行审核过的脚本；远程 URL 引用默认关闭。
+3. **AST 沙箱**：白名单 stdlib 导入；禁 `exec/eval/open/getattr/setattr` 等及一切 dunder 访问，堵死 `().__class__` 逃逸族。
+4. **受限 builtins**：编译后在无文件/网络/import 能力的命名空间执行；基础设施只能通过 `ctx` 触达。
+
+`X-Upstream-Url` 与 `ctx.download_image` 均过 SSRF 校验（scheme/host/私网段策略，`UPSTREAM_ALLOW_PRIVATE_NETWORK=false` 时拒绝内网目标）。
+
+## 快速开始
+
+```bash
+# 安装
+/Users/betterme/.workbuddy/binaries/python/versions/3.13.12/bin/python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# 测试（76 项）
+.venv/bin/python -m pytest tests/ -q
+
+# 启动
+ADAPTER_KEY=dev-key .venv/bin/python -m uvicorn adapter.main:app --port 8080
+```
+
+E2E 冒烟（火山方舟，脚本走内置 script_store 引用）：
+
+```bash
+curl -s -X POST localhost:8080/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -H "X-Adapter-Key: dev-key" \
+  -H "X-Upstream-Url: https://ark.cn-beijing.volces.com/api/v3/images/generations" \
+  -H "X-Script-Ref: volcengine_ark/images@v1" \
+  -H "Authorization: Bearer $VOLCENGINE_ARK_API_KEY" \
+  -d '{"prompt":"一只可爱的白色小猫","size":"2048x2048","response_format":"url"}'
+```
+
+同一个上游脚本，换用 OpenAI SDK 的 multipart 形态（`image` 传文件，头与脚本完全不变）：
+
+```bash
+curl -s -X POST localhost:8080/v1/images/edits \
+  -H "X-Adapter-Key: dev-key" \
+  -H "X-Upstream-Url: https://ark.cn-beijing.volces.com/api/v3/images/generations" \
+  -H "X-Script-Ref: volcengine_ark/images@v1" \
+  -H "Authorization: Bearer $VOLCENGINE_ARK_API_KEY" \
+  -F image=@cat.png \
+  -F prompt=把猫换成橘色 \
+  -F response_format=url
+```
+
+## 项目结构
+
+```
+adapter/
+  main.py            # ASGI 应用与生命周期
+  settings.py        # 数据面策略（无渠道配置）
+  channel.py         # 渠道头解析（ChannelSpec / AuthEmit / AsyncSpec）
+  script_source.py   # 内联 / base64 / 引用 / 远程 四种脚本来源 + sha256 校验
+  sandbox.py         # AST 扫描
+  script_cache.py    # 按源码 sha256 缓存编译产物（替代热重载）
+  executor.py        # 相位管线：auth -> request -> 上游 -> poll -> response
+  context.py         # ctx：脚本唯一的基础设施接口
+  urlguard.py        # SSRF 防线
+  api/pipeline.py    # 各端点共用的请求路径
+  api/images.py      # 规范格式：generations（校验逻辑的唯一来源）
+  api/image_edits.py # multipart 前门：改写形态后汇入 images
+script_store/        # 命名脚本库（X-Script-Ref 的本地后端）
+  volcengine_ark/images@v1.py
+tests/               # 76 项：单元（沙箱/工具）+ 集成（真实 HTTP mock 上游）
+```
+
+## 关键环境变量
+
+```bash
+ADAPTER_KEY=                     # 数据面准入密钥（必填，除非显式关闭）
+ALLOW_INLINE_SCRIPT=true         # 生产置 false
+SCRIPT_SHA256_ALLOWLIST=         # 逗号分隔的脚本哈希白名单
+SCRIPT_REF_DIR=./script_store    # 命名引用的脚本目录
+UPSTREAM_ALLOW_PRIVATE_NETWORK=true  # 生产置 false（SSRF）
+UPSTREAM_HOST_ALLOWLIST=         # 逗号分隔的上游主机白名单
+REDIS_URL=                       # 空 = 内存降级
+MINIO_ENDPOINT=                  # 空 = data URI 降级
+LOGFIRE_TOKEN=                   # 空 = 仅本地
+SCRIPT_TIMEOUT=30
+UPSTREAM_TIMEOUT=60
+POLL_TIMEOUT_DEFAULT=300
+```
+
+## 响应头
+
+每个成功响应携带 `X-Request-Id` 与 `X-Script-Sha256`（实际执行的脚本指纹，供控制面审计比对）。
+
+## License
+
+Proprietary. Developed for internal use.
