@@ -1,0 +1,82 @@
+name: Release
+
+# Tag 触发，而非 push main 自动 bump：版本号由人决定，
+# 每次 push 就发一个公开 Release 太激进。打 tag 即发版。
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.0); the tag must already exist'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gh release create --generate-notes 需要完整历史，浅克隆会生成空 notes
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG='${{ github.event.inputs.tag }}'
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::tag must start with v: $TAG"; exit 1 ;;
+          esac
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          set -euo pipefail
+          echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          IMAGE='${{ steps.ver.outputs.image }}'
+          docker build \
+            -t "$IMAGE:${{ steps.ver.outputs.version }}" \
+            -t "$IMAGE:latest" \
+            .
+          docker push "$IMAGE:${{ steps.ver.outputs.version }}"
+          docker push "$IMAGE:latest"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create '${{ steps.ver.outputs.tag }}' \
+            --title '${{ steps.ver.outputs.tag }}' \
+            --generate-notes
+
+      - name: Make container package public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api --method PATCH \
+            -H 'Accept: application/vnd.github+json' \
+            "users/${{ github.repository_owner }}/packages/container/$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')/visibility" \
+            -f visibility=public
