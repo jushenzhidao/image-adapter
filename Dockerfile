@@ -11,8 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
 COPY adapter /app/adapter
-COPY scripts /app/scripts
-COPY config /app/config
+COPY script_store /app/script_store
 COPY mock_upstream /app/mock_upstream
 
 # Non-root ownership

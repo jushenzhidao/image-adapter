@@ -11,22 +11,24 @@
 VOLCENGINE_ARK_API_KEY=ark-your-api-key-here
 ```
 
-### 2. 路由配置
-已在 `config/upstreams.yaml` 中添加：
-```yaml
-volcengine_ark:
-  base_url: "https://ark.cn-beijing.volces.com"
-  timeout: 60
-  async_mode: false
-  auth_type: "bearer"
-  auth_config:
-    env_key: "VOLCENGINE_ARK_API_KEY"
-  models:
-    - doubao-seedream-5-0-260128
-    - doubao-seedream
-  endpoints:
-    - images
-```
+### 2. 渠道配置（控制面 / New API 侧）
+
+适配器**不持有上游注册表**，不存在 `config/upstreams.yaml` 这类路由文件。
+上游由调用方随请求以 header 指定，脚本按 ref 从 `script_store/` 加载：
+
+| Header | 值 |
+|---|---|
+| `X-Upstream-Url` | `https://ark.cn-beijing.volces.com/api/v3/images/generations` |
+| `X-Script-Ref` | `volcengine_ark/images@v1` |
+| `Authorization` | `Bearer <VOLCENGINE_ARK_API_KEY>` |
+| `X-Channel-Options` | `{"model": "doubao-seedream-5-0-260128"}`（可选） |
+
+适配脚本在 `script_store/volcengine_ark/images@v1.py`；
+`X-Script-Ref` 由 `adapter/script_source.py::_resolve_ref_path()` 解析到该文件，
+根目录由 `SCRIPT_REF_DIR` 控制（默认 `<项目根>/script_store`）。
+
+> 图生图复用同一端点与同一脚本：请求体带 `image` 时 Seedream 即执行编辑，
+> 无需单独路由。
 
 ## API 调用示例
 
@@ -100,9 +102,9 @@ curl -X POST https://ark.cn-beijing.volces.com/api/v3/images/generations \
 
 ### 3. 固定参数
 适配器自动添加以下参数：
-- `sequential_image_generation: "disabled"` - 禁用顺序生成
 - `watermark: true` - 启用水印
 - `stream: false` - 禁用流式响应
+- `sequential_image_generation` - 仅当调用方/渠道选项显式提供时才发送（5-0-pro 系列模型不支持该参数，硬编码会导致 400，2026-09-09 实测）
 
 ## 测试验证
 
@@ -116,10 +118,12 @@ curl -X POST https://ark.cn-beijing.volces.com/api/v3/images/generations \
 ```
 
 ### 集成测试
-启动适配器后运行：
+脚本侧的异步轮询与参数映射由集成测试覆盖：
 ```bash
-python test_volcengine_integration.py
+LOGFIRE_TOKEN="" .venv/bin/python -m pytest tests/integration -q
 ```
+
+> 注：早期文档中的 `test_volcengine_integration.py` 已不存在，勿再引用。
 
 ## 已知限制
 

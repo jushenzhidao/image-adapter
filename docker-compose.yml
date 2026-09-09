@@ -15,8 +15,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./scripts:/app/scripts:ro
-      - ./config:/app/config:ro
+      - ./script_store:/app/script_store:ro
     environment:
       - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
       - REDIS_URL=redis://redis:6379/0
@@ -25,9 +24,8 @@ services:
       - MINIO_SECRET_KEY=minioadmin
       - MINIO_BUCKET=adapter-temp
       - MINIO_SECURE=false
-      - SCRIPT_PATH=/app/scripts
-      - UPSTREAMS_CONFIG_PATH=/app/config/upstreams.yaml
-      - SANDBOX_TIMEOUT=30.0
+      - SCRIPT_REF_DIR=/app/script_store
+      - SCRIPT_TIMEOUT=30.0
       - UPSTREAM_TIMEOUT=60.0
       - ENVIRONMENT=production
       - UPSTREAM_A_API_KEY=mock-key-a
