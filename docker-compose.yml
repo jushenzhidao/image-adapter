@@ -1,102 +1,68 @@
-version: "3.8"
-
-networks:
-  adapter-net:
-    driver: bridge
+# The adapter is a stateless transparent proxy: the upstream URL, credentials,
+# timeout and script all arrive per-request from the control plane (New API) as
+# headers. Nothing here needs a database, a cache or an object store to boot.
+#
+# Redis and MinIO are therefore optional accelerators, not dependencies, and
+# they are configured in .env rather than declared here:
+#   REDIS_URL empty  -> state/cache fall back to in-process stores
+#   MINIO_ENDPOINT empty -> ctx.image_url() falls back to a data URI
+# Point those at managed services when you want cross-worker state and real
+# public URLs; leave them empty for a single-node deployment.
 
 services:
   adapter:
     build:
       context: .
       dockerfile: Dockerfile
-    image: openai-adapter:latest
+    image: ghcr.io/jushenzhidao/image-adapter:latest
     container_name: adapter
     restart: unless-stopped
     ports:
-      - "8080:8080"
-    volumes:
-      - ./script_store:/app/script_store:ro
+      - "${PORT:-8080}:8080"
+
+    # Single source of truth for configuration. Every Settings field is read
+    # from here by name (see adapter/settings.py), so adding a knob needs no
+    # compose change. ADAPTER_KEY gates the data plane and must be set: inline
+    # scripts are remote code execution by design.
+    env_file:
+      - .env
+
     environment:
-      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
-      - REDIS_URL=redis://redis:6379/0
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
-      - MINIO_BUCKET=adapter-temp
-      - MINIO_SECURE=false
-      - SCRIPT_REF_DIR=/app/script_store
-      - SCRIPT_TIMEOUT=30.0
-      # 2K 同步生成实测 27~82s，60s 会截断慢请求
-      - UPSTREAM_TIMEOUT=180.0
-      - ENVIRONMENT=production
-      # 数据面门禁。内联脚本即远程代码执行，缺这一项时适配器会拒绝所有请求。
-      - ADAPTER_KEY=${ADAPTER_KEY:?ADAPTER_KEY must be set}
-    depends_on:
-      - redis
-      - minio
-      - mock-upstream
-    networks:
-      - adapter-net
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 1G
-    user: "1000:1000"
+      # Overrides .env: named refs resolve inside the image, not on the host.
+      SCRIPT_REF_DIR: /app/script_store
+      # gunicorn binds this port inside the container; the host mapping above
+      # is what varies between deployments.
+      PORT: 8080
+
+    # No volumes: script_store is baked into the image, so the container has no
+    # host-path dependency and can be scheduled anywhere.
+
+    # Hardening. The process only ever writes to /tmp (gunicorn worker
+    # heartbeats), so the root filesystem stays read-only.
     read_only: true
     tmpfs:
-      - /tmp:noexec,nosuid,size=100m
+      - /tmp:noexec,nosuid,size=256m
+    security_opt:
+      - no-new-privileges:true
 
-  mock-upstream:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: openai-adapter:latest
-    container_name: mock-upstream
-    restart: unless-stopped
-    ports:
-      - "9100:9100"
-    command: ["python", "-m", "uvicorn", "mock_upstream.main:app", "--host", "0.0.0.0", "--port", "9100"]
-    networks:
-      - adapter-net
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
 
-  redis:
-    image: redis:7-alpine
-    container_name: adapter-redis
-    restart: unless-stopped
-    volumes:
-      - redis_data:/data
-    networks:
-      - adapter-net
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
+    # File descriptors, not CPU or memory, are the binding constraint: each
+    # in-flight generation holds an inbound and an outbound socket for up to
+    # 80s. CPU/memory limits are deliberately absent so the container can use
+    # whatever the host has; set them per environment if you need isolation.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
 
-  minio:
-    image: minio/minio:latest
-    container_name: adapter-minio
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
-    volumes:
-      - minio_data:/data
-    networks:
-      - adapter-net
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
-
-volumes:
-  redis_data:
-  minio_data:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

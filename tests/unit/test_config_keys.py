@@ -33,13 +33,19 @@ ALLOWED_NON_FIELDS = {
     # Consumed by a human running curl against the vendor directly; the
     # adapter never reads upstream credentials from the environment.
     "VOLCENGINE_ARK_API_KEY",
+    # Read by gunicorn.conf.py at process start, not by the adapter. These
+    # tune the WSGI/ASGI supervisor (worker count, watchdog), which is a
+    # deployment concern that never reaches application settings.
+    "WEB_CONCURRENCY",
+    "GUNICORN_TIMEOUT",
+    "GUNICORN_GRACEFUL_TIMEOUT",
+    "WORKER_CONNECTIONS",
 }
 
-# Same idea for compose, which also configures the sidecar services.
-ALLOWED_COMPOSE_NON_FIELDS = ALLOWED_NON_FIELDS | {
-    "MINIO_ROOT_USER",  # minio server's own credentials, not the adapter's
-    "MINIO_ROOT_PASSWORD",
-}
+# compose used to run redis/minio sidecars and needed their server-side
+# credentials here. Those services are gone: the adapter now talks to managed
+# infrastructure or degrades in-process, so compose sets no extra keys.
+ALLOWED_COMPOSE_NON_FIELDS = ALLOWED_NON_FIELDS
 
 
 def _env_keys(path: Path) -> list[str]:
@@ -94,10 +100,8 @@ def test_compose_adapter_service_has_no_dead_keys() -> None:
         if bad:
             dead[service] = bad
 
-    # Sidecars run other images and legitimately take their own variables.
+    # The mock upstream runs a different image and takes its own variables.
     dead.pop("mock-upstream", None)
-    dead.pop("redis", None)
-    dead.pop("minio", None)
 
     assert not dead, (
         f"docker-compose.yml sets keys that match no Settings field and would "

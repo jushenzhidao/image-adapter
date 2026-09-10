@@ -35,16 +35,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         limit = settings.rate_limit_per_minute
 
         if settings.redis_url:
-            import redis.asyncio
-
-            client = redis.asyncio.from_url(settings.redis_url)
+            # Reuse the process-wide connection held by StateStore. Creating a
+            # client per request cost a handshake on every limited call, and a
+            # Redis blip would surface as a 500 from the middleware instead of
+            # the documented degradation.
+            store = request.app.state.state_store
             try:
-                count = await client.incr(key)
-                if count == 1:
-                    await client.expire(key, 60)
-            finally:
-                await client.aclose()
-            if count > limit:
+                count = await store.incr_window(key, 60)
+            except Exception as exc:
+                logger.warning(
+                    "rate limit backend unavailable (%s); allowing the request", exc
+                )
+                count = None
+            if count is not None and count > limit:
                 return error_response(RateLimitError())
         else:
             now = time.time()

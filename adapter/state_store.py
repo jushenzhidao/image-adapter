@@ -6,6 +6,7 @@ expiry timestamps (dev degradation, Spec section 6).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -15,6 +16,9 @@ if TYPE_CHECKING:
     from adapter.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+# Health probes run on a timer and must not outlive their usefulness.
+_PING_TIMEOUT = 5.0
 
 
 class StateStore:
@@ -55,13 +59,39 @@ class StateStore:
             self._mem[key] = (time.monotonic() + ttl, payload)
 
     async def ping(self) -> bool:
-        """Health probe. True when Redis reachable (or degraded to memory)."""
+        """Health probe. True when Redis is reachable.
+
+        False means the store is running on its in-process fallback, which is
+        a degraded but serving state, so callers report it rather than failing.
+        The timeout matters: a Redis host that accepts the connection but never
+        answers would otherwise hold the health request open indefinitely.
+        """
         if not self._settings.redis_url:
             return False
         try:
-            return bool(await self._get_redis().ping())
+            return bool(
+                await asyncio.wait_for(self._get_redis().ping(), timeout=_PING_TIMEOUT)
+            )
         except Exception:
             return False
+
+    async def incr_window(self, key: str, ttl: int) -> int | None:
+        """Increments a counter, setting its TTL on creation.
+
+        Returns None when Redis is not configured, which tells the caller to
+        use its own in-process fallback rather than guessing a count.
+
+        This lives here so the rate limiter reuses the one process-wide
+        connection. Opening a client per request made every limited call pay a
+        TCP (and possibly TLS) handshake before it could be served.
+        """
+        if not self._settings.redis_url:
+            return None
+        client = self._get_redis()
+        count = int(await client.incr(key))
+        if count == 1:
+            await client.expire(key, ttl)
+        return count
 
     async def close(self) -> None:
         if self._redis is not None:
