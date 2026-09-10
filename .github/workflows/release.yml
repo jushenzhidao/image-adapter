@@ -1,93 +1,139 @@
 name: Release
 
-# Tag 触发，而非 push main 自动 bump：版本号由人决定，
-# 每次 push 就发一个公开 Release 太激进。打 tag 即发版。
+# push main 即自动发版：patch 自增 → 跑测试 → 构建并推镜像 → 打 tag → 建 Release。
+#
+# 为什么只监听分支、不监听 tags：本 workflow 自己会 push 新 tag，若同时也监听
+# tags 就会二次触发自己（无限循环 / 重复发版）。需要 minor/major 时人工打一个
+# tag 作为新基线，下一次 push 会从它继续 patch 自增。
+#
+# 版本号只存在于 tag，不写回 pyproject.toml。写回需要向主干提交，而 GITHUB_TOKEN
+# 推送的提交不会触发任何 workflow，会静默破坏依赖该提交的流水线。代价是 manifest
+# 里的版本号会停在旧值 —— 镜像不受影响，它的版本号由 --build-arg 注入（见
+# Dockerfile 的 APP_VERSION）。
 on:
   push:
-    tags: ['v*.*.*']
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to release (e.g. v1.0.0); the tag must already exist'
-        required: true
 
 permissions:
-  contents: write
-  packages: write
+  contents: write    # 推 tag + 建 Release
+  packages: write    # 推 ghcr
 
+# 两次 push 并发跑会算出同一个版本号并竞争同一个 tag，必须串行而非取消。
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-main
   cancel-in-progress: false
 
 jobs:
   release:
+    # 逃生阀：纯文档或 CI 自身的提交不该出版本时，在 commit message 里写
+    # [skip release]。workflow_dispatch 没有 head_commit，用 || '' 兜底。
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip release]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          # gh release create --generate-notes 需要完整历史，浅克隆会生成空 notes
+          # 浅克隆拿不到历史 tag，版本号会永远从 v0.0.0 起算。
           fetch-depth: 0
 
-      - name: Resolve version
+      - name: Resolve next version
         id: ver
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG='${{ github.event.inputs.tag }}'
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          case "$TAG" in
-            v*) ;;
-            *) echo "::error::tag must start with v: $TAG"; exit 1 ;;
-          esac
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          # 用 --sort=-v:refname 而非 git describe：后者取的是「最近可达的 tag」，
+          # 在有合并历史时会挑错版本；且字典序会把 v1.9.0 判为新于 v1.10.0。
+          # glob 顺带排除 latest 这类滚动指针。
+          PREV="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+          PREV="${PREV:-v0.0.0}"          # 零 tag 仓库的冷启动
+          CORE="${PREV#v}"
+          MAJOR="${CORE%%.*}"
+          REST="${CORE#*.}"
+          MINOR="${REST%%.*}"
+          PATCH="${REST#*.}"
+          PATCH="${PATCH%%[-+]*}"          # 预发布后缀会打断 $(( )) 算术，先剥掉
+          NEW="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+
+          echo "prev=${PREV}"                          >> "$GITHUB_OUTPUT"
+          echo "tag=${NEW}"                            >> "$GITHUB_OUTPUT"
+          echo "version=${NEW#v}"                      >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short=7 HEAD)"   >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "next version: ${PREV} -> ${NEW}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 发版前先验证：镜像一旦推出去就可能被部署，tag 一旦推出去就代表承诺。
+      - name: Run tests
+        env:
+          # 未设置 token 时 logfire 只在本进程内运行，不会向云端发 trace。
+          LOGFIRE_TOKEN: ''
+        run: python -m pytest tests/ -q
+
+      - name: Build changelog
+        run: |
+          set -euo pipefail
+          PREV='${{ steps.ver.outputs.prev }}'
+          NEW='${{ steps.ver.outputs.tag }}'
+          REPO_URL='https://github.com/${{ github.repository }}'
+          # 不用 `gh release create --generate-notes`：它依赖已合并的 PR，而本仓库
+          # 直推 main，实测只产出一行 compare 链接。自己 git log 更可靠。
+          if [ "$PREV" = "v0.0.0" ]; then
+            {
+              printf '## Initial release\n\n'
+              # 首个 release 会遍历全部历史，限长以免正文过大。
+              git log --no-merges --pretty='- %s (%h)' --max-count=50 HEAD
+            } > CHANGELOG.md
+          else
+            {
+              printf '**Full changelog**: %s/compare/%s...%s\n\n' "$REPO_URL" "$PREV" "$NEW"
+              printf '## Changes since %s\n\n' "$PREV"
+              git log --no-merges --pretty='- %s (%h)' "${PREV}..HEAD"
+            } > CHANGELOG.md
+          fi
+          cat CHANGELOG.md
 
       - name: Log in to GitHub Container Registry
         run: |
           set -euo pipefail
           echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
 
+      # 镜像先推、tag 后打：构建失败时不会留下「有 tag、没有镜像」的半成品发布。
+      # 三个 tag 共用同一次 build，因此 digest 必然一致（可用 manifest 核验）。
       - name: Build and push image
         run: |
           set -euo pipefail
           IMAGE='${{ steps.ver.outputs.image }}'
+          VERSION='${{ steps.ver.outputs.version }}'
+          SHA='${{ steps.ver.outputs.sha }}'
           docker build \
-            -t "$IMAGE:${{ steps.ver.outputs.version }}" \
+            --build-arg APP_VERSION="$VERSION" \
+            -t "$IMAGE:$VERSION" \
             -t "$IMAGE:latest" \
+            -t "$IMAGE:sha-$SHA" \
             .
-          docker push "$IMAGE:${{ steps.ver.outputs.version }}"
+          docker push "$IMAGE:$VERSION"
           docker push "$IMAGE:latest"
+          docker push "$IMAGE:sha-$SHA"
 
-      - name: Build changelog
+      - name: Tag and push
         run: |
           set -euo pipefail
-          TAG='${{ steps.ver.outputs.tag }}'
-          REPO_URL='https://github.com/${{ github.repository }}'
-          # --generate-notes relies on merged pull requests, and this repo pushes
-          # straight to main, so it emitted nothing but a compare link. Build the
-          # list from commits instead, which works with or without PRs.
-          #
-          # TAG^ peels the annotated tag to its commit and takes the first
-          # parent, so describe returns the PREVIOUS version tag, not this one.
-          PREV=''
-          if PREV="$(git describe --tags --abbrev=0 --match 'v*.*.*' "${TAG}^" 2>/dev/null)"; then
-            RANGE="${PREV}..${TAG}"
-          else
-            RANGE="${TAG}"   # first tagged release: list everything reachable
+          NEW='${{ steps.ver.outputs.tag }}'
+          # runner 上没有 git 身份，annotated tag 需要它。
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          if git rev-parse -q --verify "refs/tags/$NEW" >/dev/null; then
+            echo "::error::tag $NEW already exists -- concurrent run or rewritten history"
+            exit 1
           fi
-          {
-            if [ -n "$PREV" ]; then
-              printf '**Full changelog**: %s/compare/%s...%s\n\n' "$REPO_URL" "$PREV" "$TAG"
-              printf '## Changes since %s\n\n' "$PREV"
-            else
-              printf '## Initial release\n\n'
-            fi
-            git log --no-merges --pretty='- %s (%h)' "$RANGE"
-          } > CHANGELOG.md
-          cat CHANGELOG.md
+          git tag -a "$NEW" -m "Release $NEW"
+          git push origin "$NEW"
 
       - name: Create GitHub Release
         env:
@@ -98,16 +144,21 @@ jobs:
             --title '${{ steps.ver.outputs.tag }}' \
             --notes-file CHANGELOG.md
 
-      # Package visibility is deliberately NOT automated here. The documented
-      # routes (PATCH /user/packages/{type}/{name} and the org equivalent) need a
-      # classic PAT with write:packages, because GITHUB_TOKEN cannot administer
-      # user-scoped packages -- the previous attempt at this called an
-      # undocumented path, returned 404 on every run, and hid it behind
-      # continue-on-error. Visibility is a one-time manual setting that persists
-      # across pushes, so verify it by hand after the first release:
-      #
-      #   anonymous pull proves it, no credentials needed:
-      #     TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:OWNER/NAME:pull&service=ghcr.io" \
-      #       | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-      #     curl -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOKEN" \
-      #       https://ghcr.io/v2/OWNER/NAME/manifests/latest   # 200 = public
+      - name: Summary
+        run: |
+          {
+            echo "### 已发布 ${{ steps.ver.outputs.tag }}"
+            echo ""
+            echo "- \`${{ steps.ver.outputs.image }}:${{ steps.ver.outputs.version }}\`"
+            echo "- \`${{ steps.ver.outputs.image }}:latest\`"
+            echo "- \`${{ steps.ver.outputs.image }}:sha-${{ steps.ver.outputs.sha }}\`"
+            echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${{ steps.ver.outputs.tag }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 包可见性仍是人工设置，不自动化：GITHUB_TOKEN 管不了用户级 package，
+      # 正确路由需要 classic PAT 的 write:packages，为这点引入 PAT 不划算。
+      # 免凭据核验公开性（200 = 匿名可拉）：
+      #   TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:OWNER/NAME:pull&service=ghcr.io" \
+      #     | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+      #   curl -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOKEN" \
+      #     https://ghcr.io/v2/OWNER/NAME/manifests/latest

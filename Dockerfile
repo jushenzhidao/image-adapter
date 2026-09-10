@@ -11,6 +11,16 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
+# 发布版本号由 CI 在构建时注入（release.yml 传 --build-arg APP_VERSION=<x.y.z>）。
+#
+# 镜像里没有 pyproject.toml，所以 adapter/logfire_setup.py 的版本解析链在容器内
+# 会一路回落到 "unknown"；这个 ENV 是容器内唯一可靠的版本来源。
+#
+# 注意：compose 用 env_file 注入 .env，如果 .env 里也设了 LOGFIRE_SERVICE_VERSION，
+# 会覆盖这里的值 —— 那边已刻意移除该键，正是为了不盖掉构建参数。
+ARG APP_VERSION=dev
+ENV LOGFIRE_SERVICE_VERSION=${APP_VERSION}
+
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
