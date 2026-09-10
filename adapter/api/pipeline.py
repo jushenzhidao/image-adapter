@@ -134,6 +134,7 @@ async def adapt(
         endpoint=endpoint,
         http=getattr(request.app.state, "http", None),
         cache=getattr(request.app.state, "asset_cache", None),
+        storage=getattr(request.app.state, "storage", None),
     )
     extra_headers: dict[str, str] = {}
     try:

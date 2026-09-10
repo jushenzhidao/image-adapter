@@ -64,13 +64,13 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | 层 | 技术 | 锁定版本 | 锁定原因 |
 |----|------|----------|----------|
 | 运行时 | Python | 3.13.12（managed: `/Users/betterme/.workbuddy/binaries/python/versions/3.13.12/bin/python3`） | 本机托管版本 |
-| Web 框架 | Starlette | pip 安装后回填 | 轻量 ASGI，原生 StreamingResponse |
+| Web 框架 | FastAPI | pip 安装后回填 | 基于 Starlette；用 `Header()` 声明渠道契约，/docs 可试调 |
 | ASGI 服务器 | uvicorn（生产 + gunicorn） | pip 安装后回填 | 多 Worker 绕 GIL |
 | HTTP 客户端 | aiohttp | pip 安装后回填 | 异步连接池 + 流式下载 |
 | 缓存/状态 | redis-py（`redis.asyncio`，**不用已废弃的 aioredis 包**） | pip 安装后回填 | 官方异步客户端 |
 | 对象存储 | minio | pip 安装后回填 | S3 兼容预签名 URL |
 | 图片处理 | Pillow | pip 安装后回填 | 格式转换 |
-| 可观测 | logfire | pip 安装后回填 | OTel 标准；**Starlette 用 `logfire.instrument_starlette(app)`，不是 instrument_fastapi** |
+| 可观测 | logfire | pip 安装后回填 | OTel 标准；`logfire.instrument_fastapi(app)`，**capture_headers=False**（渠道头含凭据与脚本源码） |
 | 配置 | pydantic-settings | pip 安装后回填 | 环境变量类型安全 |
 | 热重载 | watchdog | pip 安装后回填 | 跨平台文件监听 |
 | 测试 | pytest + pytest-asyncio + httpx(ASGI TestClient) | pip 安装后回填 | 异步测试 |
@@ -166,7 +166,7 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | 坑 | 技术栈指纹 | 根因 | 修法 |
 |----|------------|------|------|
 | aioredis 包已废弃且与新 Python 不兼容 | redis | aioredis 并入 redis-py | 用 `redis.asyncio`，文档中 aioredis 字样仅作概念 |
-| logfire.instrument_fastapi 用于 Starlette 报错 | logfire+starlette | 框架不匹配 | 用 `logfire.instrument_starlette(app)` |
+| logfire 埋点函数与框架不匹配（历史） | logfire+fastapi | 曾跑在裸 Starlette 上 | 迁移 FastAPI 后统一为 `logfire.instrument_fastapi(app)` |
 | 03_技术架构 §3.4 黑名单含 Subscript/Await | ast | 误封禁会导致所有正常脚本（下标/await）无法加载 | 沙箱只禁危险 import/调用/dunder 属性访问，不禁 Subscript/Await |
 | watchdog 回调在子线程，直接操作 asyncio 对象崩溃 | watchdog+asyncio | 线程边界 | 回调用 `loop.call_soon_threadsafe` 或仅做线程安全的 dict pop |
 | gunicorn UvicornWorker 下模块缓存为进程级 | gunicorn | 各 Worker 独立缓存 | 热重载靠每 Worker 各自的 watchdog 监听，无需跨进程同步 |

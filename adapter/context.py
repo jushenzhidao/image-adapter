@@ -118,6 +118,27 @@ def build_cache(settings: Settings) -> Any:
     return TTLCache(max_bytes=settings.asset_cache_max_bytes)
 
 
+def build_storage(settings: Settings) -> Any | None:
+    """One Minio client per process, or None when object storage is off.
+
+    Building one per request (which ``ContextCore.storage`` used to do) throws
+    away the urllib3 connection pool: every upload then pays a fresh TCP+TLS
+    handshake and a bucket-region lookup. The client is thread-safe and holds
+    no request state, so sharing it is safe. ``upload_temp_image`` calls it
+    through ``asyncio.to_thread`` because the SDK is synchronous.
+    """
+    if not settings.minio_endpoint:
+        return None
+    from minio import Minio
+
+    return Minio(
+        settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        secure=settings.minio_secure,
+    )
+
+
 class ContextCore:
     """Per-request state, infra handles and teardown.
 
@@ -134,6 +155,7 @@ class ContextCore:
         endpoint: str = "",
         http: aiohttp.ClientSession | None = None,
         cache: Any = None,
+        storage: Any = None,
     ) -> None:
         self.request_id = request_id
         self.channel = channel
@@ -164,7 +186,7 @@ class ContextCore:
         self._owns_http = http is None
         self._cache = cache
         self._owns_cache = cache is None
-        self._storage: Any = None
+        self._storage = storage
 
         self.logfire = logfire_module
 
@@ -189,14 +211,11 @@ class ContextCore:
     @property
     def storage(self) -> Any | None:
         if self._storage is None and self.settings.minio_endpoint:
-            from minio import Minio
-
-            self._storage = Minio(
-                self.settings.minio_endpoint,
-                access_key=self.settings.minio_access_key,
-                secret_key=self.settings.minio_secret_key,
-                secure=self.settings.minio_secure,
-            )
+            # Standalone use (unit tests, direct ContextCore construction):
+            # the application lifespan normally injects the shared client,
+            # which is what keeps the connection pool and the region lookup
+            # from being rebuilt on every request.
+            self._storage = build_storage(self.settings)
         return self._storage
 
     @property
@@ -250,4 +269,11 @@ class AdapterContext(
     SKIP = SKIP
 
 
-__all__ = ["SKIP", "AdapterContext", "RequestPlan", "TTLCache", "build_cache"]
+__all__ = [
+    "SKIP",
+    "AdapterContext",
+    "RequestPlan",
+    "TTLCache",
+    "build_cache",
+    "build_storage",
+]

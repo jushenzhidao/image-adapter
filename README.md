@@ -47,6 +47,10 @@ New API 在渠道配置里声明适配策略，通过头透传：
 | `X-Script-Sha256` | 否 | 完整性锁定 |
 | `X-Channel-Options` | 否 | JSON 对象，脚本内通过 `ctx.options` 读取 |
 
+这 11 个头在代码里由 `adapter/main.py::channel_contract` 用 `Header()` 声明：因此 `/docs`
+可以直接填写试调，契约表不会再与实现漂移。全部声明为**可选**是有意为之——缺失的头仍由
+`channel.py` 报 `channel_config_error`（400，OpenAI 错误体），而不是被 FastAPI 拦成 422。
+
 最小形态示例：
 
 ```json
@@ -121,7 +125,7 @@ async def transform(ctx, payload, phase):
 /Users/betterme/.workbuddy/binaries/python/versions/3.13.12/bin/python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 测试（76 项）
+# 测试（240 项）
 .venv/bin/python -m pytest tests/ -q
 
 # 启动
@@ -228,7 +232,7 @@ REDIS_URL=                       # 空 = 内存降级
 MINIO_ENDPOINT=                  # 空 = data URI 降级
 LOGFIRE_TOKEN=                   # 空 = 仅本地
 SCRIPT_TIMEOUT=30
-UPSTREAM_TIMEOUT=60
+UPSTREAM_TIMEOUT=180
 POLL_TIMEOUT_DEFAULT=300
 ```
 

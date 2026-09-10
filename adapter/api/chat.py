@@ -12,7 +12,7 @@ import time
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
-from adapter.api.common import handle_errors, json_ok
+from adapter.api.common import json_ok
 from adapter.api.pipeline import adapt
 from adapter.errors import InvalidRequestError
 from adapter.utils.sse import stream_chat_as_sse
@@ -26,7 +26,6 @@ def _validate(body: dict) -> None:
         )
 
 
-@handle_errors
 async def chat_handler(request: Request) -> Response:
     outcome = await adapt(request, "chat", _validate)
 

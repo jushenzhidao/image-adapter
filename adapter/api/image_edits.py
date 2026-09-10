@@ -29,7 +29,7 @@ from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import Response
 
-from adapter.api.common import handle_errors, json_ok
+from adapter.api.common import json_ok
 from adapter.api.images import validate_images_body
 from adapter.api.pipeline import adapt
 from adapter.errors import InvalidRequestError
@@ -143,7 +143,6 @@ async def normalise_edits_form(request: Request, max_bytes: int) -> dict:
     return body
 
 
-@handle_errors
 async def image_edits_handler(request: Request) -> Response:
     settings = request.app.state.settings
     body = await normalise_edits_form(request, settings.max_asset_bytes)

@@ -2,12 +2,18 @@
 # timeout and script all arrive per-request from the control plane (New API) as
 # headers. Nothing here needs a database, a cache or an object store to boot.
 #
-# Redis and MinIO are therefore optional accelerators, not dependencies, and
-# they are configured in .env rather than declared here:
-#   REDIS_URL empty  -> state/cache fall back to in-process stores
-#   MINIO_ENDPOINT empty -> ctx.image_url() falls back to a data URI
-# Point those at managed services when you want cross-worker state and real
-# public URLs; leave them empty for a single-node deployment.
+# Redis is still an optional accelerator, not a dependency: the adapter starts
+# and serves with none of it. It is shipped as a built-in service below because
+# it becomes REQUIRED as soon as WEB_CONCURRENCY > 1 -- with no shared store the
+# /v1/responses state chain breaks silently across workers.
+#
+# REDIS_URL (set in .env) is the single switch:
+#   redis://redis:6379/0  -> this built-in service (default)
+#   redis://<host>:6379/0 -> an external / managed redis
+#   empty                 -> in-process stores, single worker only
+# The adapter deliberately does NOT depends_on redis: an unreachable backend
+# degrades to the in-process fallback instead of blocking startup.
+# MINIO_ENDPOINT empty -> ctx.image_url() falls back to a data URI
 
 services:
   adapter:
@@ -15,7 +21,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: ghcr.io/jushenzhidao/image-adapter:latest
-    container_name: adapter
+    container_name: image-adapter
     restart: unless-stopped
     ports:
       - "${PORT:-8080}:8080"
@@ -77,3 +83,36 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+
+  # Built-in store for cross-worker state: /v1/responses chains, the image
+  # cache and the rate-limit counter. Every key is a TTL cache with no
+  # authoritative data, so persistence is off and eviction is LRU -- losing the
+  # whole store costs a cache miss, never a lost write.
+  #
+  # Configured through `command` rather than `environment`: these are redis
+  # server flags, not adapter Settings fields, and the config gate in
+  # tests/unit/test_config_keys.py flags env keys that map to no field.
+  #
+  # No `ports`: only the adapter needs to reach it, over the compose network.
+  redis:
+    image: redis:7-alpine
+    container_name: adapter-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

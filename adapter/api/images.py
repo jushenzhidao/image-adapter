@@ -29,7 +29,7 @@ import time
 from starlette.requests import Request
 from starlette.responses import Response
 
-from adapter.api.common import handle_errors, json_ok
+from adapter.api.common import json_ok
 from adapter.api.pipeline import adapt
 from adapter.errors import InvalidRequestError
 
@@ -97,7 +97,6 @@ def validate_images_body(body: dict) -> None:
         raise InvalidRequestError("'prompt' is required", param="prompt")
 
 
-@handle_errors
 async def images_handler(request: Request) -> Response:
     outcome = await adapt(request, "images", validate_images_body)
 

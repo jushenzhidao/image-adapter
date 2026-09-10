@@ -15,7 +15,7 @@ import uuid
 from starlette.requests import Request
 from starlette.responses import Response
 
-from adapter.api.common import handle_errors, json_ok
+from adapter.api.common import json_ok
 from adapter.api.pipeline import adapt
 from adapter.errors import InvalidRequestError
 from adapter.state_store import StateStore
@@ -23,7 +23,6 @@ from adapter.state_store import StateStore
 CTX_PREFIX = "resp_ctx:"
 
 
-@handle_errors
 async def responses_handler(request: Request) -> Response:
     store: StateStore = request.app.state.state_store
 

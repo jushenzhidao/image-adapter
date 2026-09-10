@@ -1,26 +1,42 @@
-"""Starlette ASGI application: routes, middleware, lifecycle.
+"""FastAPI application: routes, middleware, lifecycle.
 
 The app holds no channel or model state. Per-request adaptation state arrives
-in headers; the only long-lived objects are the script cache and state store.
+in headers; the only long-lived objects are the script cache, the state store,
+one HTTP session and one object-storage client per process.
+
+Two deliberate choices are worth knowing before editing this file:
+
+* **No ``response_model`` anywhere.** Handlers return ``Response`` objects
+  directly, which makes FastAPI skip validation and serialisation entirely.
+  That is what lets a script-shaped payload (including the upstream's ``usage``
+  block, which billing depends on) pass through untouched. Adding a
+  ``response_model`` to a route that returns a ``dict`` would silently start
+  trimming unknown fields.
+* **Every channel header is declared optional.** ``channel_contract`` exists so
+  the eleven headers appear in /docs and can be exercised from there, not to
+  validate them. Required-header failures stay ``channel_config_error`` (400,
+  OpenAI envelope) from ``adapter/channel.py`` instead of a FastAPI 422.
 """
 
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Annotated, Any
 
 import aiohttp
-import logfire
-from starlette.applications import Starlette
+from fastapi import Depends, FastAPI, Header
 from starlette.middleware import Middleware
-from starlette.routing import Route
 
 from adapter.api.chat import chat_handler
+from adapter.api.common import JSON_PARSER
 from adapter.api.health import health_handler
 from adapter.api.image_edits import image_edits_handler
 from adapter.api.images import images_handler
 from adapter.api.responses import responses_handler
-from adapter.context import build_cache
+from adapter.context import build_cache, build_storage
+from adapter.error_handlers import install_error_handlers
+from adapter.logfire_setup import init_logfire, resolve_service_version
 from adapter.middleware.cors import build_cors_middleware
 from adapter.middleware.logging import LoggingMiddleware
 from adapter.middleware.rate_limit import RateLimitMiddleware
@@ -37,8 +53,79 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+async def channel_contract(
+    x_upstream_url: Annotated[
+        str | None,
+        Header(alias="X-Upstream-Url", description="上游完整端点（必填）"),
+    ] = None,
+    x_script: Annotated[
+        str | None,
+        Header(alias="X-Script", description="内联脚本源码，换行写作字面量 \\n"),
+    ] = None,
+    x_script_64: Annotated[
+        str | None,
+        Header(alias="X-Script-64", description="脚本源码的 base64，避开 \\n 转义"),
+    ] = None,
+    x_script_ref: Annotated[
+        str | None,
+        Header(
+            alias="X-Script-Ref",
+            description="命名引用 vendor_y/mj@v1.3，或 https URL",
+        ),
+    ] = None,
+    authorization: Annotated[
+        str | None,
+        Header(alias="Authorization", description="上游厂商凭证，原样透传，不用于本服务鉴权"),
+    ] = None,
+    x_adapter_key: Annotated[
+        str | None,
+        Header(alias="X-Adapter-Key", description="本服务准入密钥（必填）"),
+    ] = None,
+    x_upstream_method: Annotated[
+        str | None, Header(alias="X-Upstream-Method", description="默认 POST")
+    ] = None,
+    x_auth_emit: Annotated[
+        str | None,
+        Header(
+            alias="X-Auth-Emit",
+            description="凭证位置非标准时使用，如 header:X-API-Key:Bearer",
+        ),
+    ] = None,
+    x_async_: Annotated[
+        str | None,
+        Header(alias="X-Async", description="异步 Job 型上游，如 poll=2,timeout=300"),
+    ] = None,
+    x_script_sha256: Annotated[
+        str | None, Header(alias="X-Script-Sha256", description="脚本完整性锁定")
+    ] = None,
+    x_channel_options: Annotated[
+        str | None,
+        Header(
+            alias="X-Channel-Options",
+            description="JSON 对象，脚本内经 ctx.options 读取",
+        ),
+    ] = None,
+) -> None:
+    """The channel contract expressed as code rather than prose.
+
+    README documents these eleven headers in a table. Declaring them here means
+    the contract cannot drift from the implementation, and /docs doubles as a
+    test client for it: fill the fields in and send.
+
+    Nothing is read or validated here -- ``adapter/channel.py`` parses the raw
+    request, so failures keep their ``channel_config_error`` code and the
+    OpenAI error envelope. That is also why every parameter is optional.
+    """
+    return None
+
+
+# Attached to every OpenAI-compatible route so /docs lists the channel headers
+# on each of them.
+_CONTRACT = [Depends(channel_contract)]
+
+
 @asynccontextmanager
-async def lifespan(app: Starlette):
+async def lifespan(app: FastAPI):
     # Tests may inject their own Settings onto app.state before startup;
     # only fall back to the environment-derived singleton when absent.
     cfg = getattr(app.state, "settings", None) or settings
@@ -62,6 +149,9 @@ async def lifespan(app: Starlette):
         ),
     )
     app.state.asset_cache = build_cache(cfg)
+    # Same reasoning as the HTTP session, one layer down: a per-request Minio
+    # client discards the urllib3 pool, so every upload re-handshakes TLS.
+    app.state.storage = build_storage(cfg)
 
     if cfg.adapter_key_required and not cfg.adapter_key:
         logger.error(
@@ -74,7 +164,7 @@ async def lifespan(app: Starlette):
             "executed in-process; prefer X-Script-Ref with a sha256 allowlist."
         )
 
-    logfire.info("adapter_startup", environment=cfg.environment)
+    logger.info("adapter_startup json_parser=%s", JSON_PARSER)
     yield
 
     await app.state.http.close()
@@ -84,32 +174,56 @@ async def lifespan(app: Starlette):
     await app.state.state_store.close()
 
 
-logfire.configure(
-    token=settings.logfire_token or None,
-    service_name="openai-adapter",
-    service_version="2.0.0",
-    environment=settings.environment,
-    send_to_logfire="if-token-present",
-)
-
-if not settings.logfire_token:
-    logger.warning("Logfire running in local-only mode (LOGFIRE_TOKEN not set)")
-
-routes = [
-    Route("/health", health_handler, methods=["GET"]),
-    Route("/v1/chat/completions", chat_handler, methods=["POST"]),
-    Route("/v1/responses", responses_handler, methods=["POST"]),
-    Route("/v1/images/generations", images_handler, methods=["POST"]),
-    # Multipart front door for the route above; no separate script contract.
-    Route("/v1/images/edits", image_edits_handler, methods=["POST"]),
-]
-
 middleware = [
     build_cors_middleware(settings),
     Middleware(LoggingMiddleware),
     Middleware(RateLimitMiddleware),
 ]
 
-app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
+app = FastAPI(
+    title="Image Adapter",
+    summary="把任意厂商的图像/多模态 API 转成 OpenAI 标准端点",
+    version=resolve_service_version(settings),
+    lifespan=lifespan,
+    middleware=middleware,
+)
 
-logfire.instrument_starlette(app)
+# Registered on the app rather than per handler, so the envelope also covers
+# the exits a decorator cannot reach: router 404/405 and request validation.
+install_error_handlers(app)
+
+app.add_api_route("/health", health_handler, methods=["GET"], tags=["ops"])
+app.add_api_route(
+    "/v1/chat/completions",
+    chat_handler,
+    methods=["POST"],
+    dependencies=_CONTRACT,
+    tags=["openai"],
+)
+app.add_api_route(
+    "/v1/responses",
+    responses_handler,
+    methods=["POST"],
+    dependencies=_CONTRACT,
+    tags=["openai"],
+)
+app.add_api_route(
+    "/v1/images/generations",
+    images_handler,
+    methods=["POST"],
+    dependencies=_CONTRACT,
+    tags=["openai"],
+)
+# Multipart front door for the route above; no separate script contract.
+app.add_api_route(
+    "/v1/images/edits",
+    image_edits_handler,
+    methods=["POST"],
+    dependencies=_CONTRACT,
+    tags=["openai"],
+)
+
+init_logfire(app, settings)
+
+
+__all__: list[Any] = ["app", "channel_contract", "lifespan"]

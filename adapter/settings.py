@@ -122,6 +122,26 @@ class Settings(BaseSettings):
 
     # --- Observability -----------------------------------------------------
     logfire_token: str = ""
+    # Service identity reported to Logfire. An empty version means "read it
+    # from the installed package metadata", so the number in the dashboard
+    # cannot drift from pyproject.toml the way a hardcoded literal did.
+    logfire_service_name: str = "openai-adapter"
+    logfire_service_version: str = ""
+    # Head sampling ratio for spans. 1.0 (default) traces every request; lower
+    # it to bound export volume at high QPS. Metrics and logs are unaffected.
+    logfire_sample_rate: float = 1.0
+    # Human-readable span output on stderr. Helpful locally, noise in
+    # production; the remote export behaves identically either way.
+    logfire_console: bool = True
+    # Paths excluded from tracing. Every orchestrator probes /health on a
+    # timer, so tracing it buries the requests that matter.
+    logfire_excluded_urls: str = "/health"
+    # Request headers are never captured by default, and turning this on is a
+    # credential leak: the channel contract puts X-Adapter-Key (data-plane
+    # credential), Authorization (vendor credential) and X-Script (executable
+    # source) in headers. Enabling it requires scrubbing rules in
+    # adapter/logfire_setup.py first.
+    logfire_capture_headers: bool = False
 
     # --- TTLs (seconds) ----------------------------------------------------
     img_cache_ttl: int = 300

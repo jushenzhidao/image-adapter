@@ -5,15 +5,17 @@ description = "OpenAI Images protocol adapter for heterogeneous upstreams"
 requires-python = ">=3.13"
 dependencies = [
     "starlette>=1.6.0",
+    "fastapi>=0.141.0",
     "python-multipart>=0.0.20",
     "uvicorn>=0.52.4",
     "aiohttp>=3.14.3",
     "redis>=8.1.0",
     "minio>=7.2.20",
     "pillow>=12.3.0",
-    "logfire[starlette]>=4.41.0",
+    "logfire[fastapi]>=4.41.0",
     "pydantic-settings>=2.15.0",
     "pyyaml>=6.0.3",
+    "orjson>=3.12.0",
     "gunicorn>=26.2.0",
 ]
 
