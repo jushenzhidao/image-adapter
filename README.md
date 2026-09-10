@@ -71,9 +71,9 @@ New API 在渠道配置里声明适配策略，通过头透传：
 ```python
 async def transform(ctx, payload, phase):
     if phase == 'request':
-        # Vision 场景：把 OpenAI 的图片 URL 下载转 base64 给上游
-        img = await ctx.download_image(payload['image_url'])
-        return {'desc': payload['prompt'], 'image_b64': ctx.encode_b64(img)}
+        # Vision 场景：image_url 可能是远程 URL，也可能是 data URI / 裸 base64。
+        # 交给 ctx 判断形态——只有远程 URL 才会真的发起下载。
+        return {'desc': payload['prompt'], 'image_b64': await ctx.image_b64(payload['image_url'])}
 
     # response 方向：上游返回二进制，客户端要 URL → 传 MinIO
     url = await ctx.upload_temp_image(payload)   # payload 是 bytes
@@ -98,7 +98,7 @@ async def transform(ctx, payload, phase):
 | `await ctx.upload_temp_image(raw)` | 传 MinIO 返回预签名 URL；无 MinIO 时降级为 data URI |
 | `ctx.encode_b64(raw)` / `ctx.decode_b64(s)` | base64 编解码 |
 | `await ctx.image_bytes(ref)` | 三态入参（URL / data URI / 裸 base64）统一取原始字节 |
-| `await ctx.image_b64(ref)` | 三态入参 → 裸 base64（解码校验后重编码） |
+| `await ctx.image_b64(ref)` | 三态入参 → 裸 base64（校验+限长；已是 b64 则原样返回，不重编码） |
 | `await ctx.image_data_uri(ref)` | 三态入参 → data URI，mime 由magic number 嗅探 |
 | `await ctx.image_url(ref)` | 三态入参 → 可公网访问 URL（必要时经 MinIO 中转） |
 | `ctx.is_url(s)` / `ctx.is_data_uri(s)` | 形态判断，写多分支转换时用 |
@@ -127,6 +127,10 @@ return {"prompt": "blend", "n": "2"}   # 这些成为 multipart 文本字段
 
 字节一般来自 `await ctx.image_bytes(ref)`——三态入参（URL / data URI / 裸 base64）统一取原始字节，mime 由 `ctx.sniff_mime(bytes)` 嗅探。
 
+**关于 `ctx.download_image` 的错误分类（行为变更）**：它只接受远程 http(s) URL，**不**做三态分派（分派是 `image_bytes`/`image_b64`/`image_data_uri`/`image_url` 的职责）。传入 `data:` URI 或裸 base64 时，现在返回 **`invalid_request`（400，`param="image"`）**，消息里点名该用的方法；此前是 `check_url` 报的 **`channel_config_error`（`param="ctx.download_image(url)"`）**。改动理由是归因：内联图不是控制平面配错了头，而是脚本选错了方法。**控制平面若按 error code 分流（例如把 `channel_config_error` 当作渠道故障告警/停用），需同步这一条。**
+
+同一守卫顺带收敛了非字符串入参：`None`/`str` 以外的值现在统一得到上述 400；此前非空非字符串（如 `42`）会在 `check_url` 内执行 `.strip()` 抛 `AttributeError`，被包成 500 `ScriptRuntimeError`（无键名、不可读）。
+
 ## 安全模型
 
 从请求头注入 Python 源码本质上是**受控的远程代码执行**，因此有四道防线，全部默认开启：
@@ -138,6 +142,8 @@ return {"prompt": "blend", "n": "2"}   # 这些成为 multipart 文本字段
 
 `X-Upstream-Url` 与 `ctx.download_image` 均过 SSRF 校验（scheme/host/私网段策略，`UPSTREAM_ALLOW_PRIVATE_NETWORK=false` 时拒绝内网目标）。
 
+注意校验**只在 URL 分支生效**：客户端内联图（data URI / 裸 base64）由 `ctx` 本地解码，不经过 `UPSTREAM_HOST_SET` 白名单——这是正确行为（没有出站请求），但别把 host 白名单理解成「约束了所有图片入参」。
+
 ## 快速开始
 
 ```bash
@@ -145,7 +151,7 @@ return {"prompt": "blend", "n": "2"}   # 这些成为 multipart 文本字段
 /Users/betterme/.workbuddy/binaries/python/versions/3.13.12/bin/python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 测试（240 项）
+# 测试（318 项）
 .venv/bin/python -m pytest tests/ -q
 
 # 启动

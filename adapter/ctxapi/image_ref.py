@@ -30,7 +30,26 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
     """Fetching and shape conversion for client-supplied image references."""
 
     async def download_image(self, url: str) -> bytes:
-        """Fetches image bytes with an SSRF check, a size cap and a TTL cache."""
+        """Fetches image bytes with an SSRF check, a size cap and a TTL cache.
+
+        Remote http(s) URLs only -- this is the one entry point that does not
+        dispatch on shape. A client image arrives as a URL *or* inline data,
+        and the ``image_*`` helpers below are what normalise the three shapes;
+        calling this one with a data URI or a bare base64 string is the most
+        likely vision-script mistake. It used to be answered by ``check_url``
+        with ``channel_config_error`` ("the channel headers are unusable"),
+        which sends the reader to the wrong layer entirely. Hence the guard.
+        """
+        url = self._require_ref(url)
+        if not self.is_url(url):
+            raise InvalidRequestError(
+                "ctx.download_image() fetches remote http(s) URLs only; got "
+                f"{url[:16]!r}. Inline images are already bytes -- use "
+                "ctx.image_bytes(ref), or ctx.image_b64(ref) / "
+                "ctx.image_data_uri(ref) / ctx.image_url(ref) to pick a shape.",
+                param="image",
+            )
+
         safe_url = check_url(url, self.settings, header="ctx.download_image(url)")
         cache_key = f"img:{hashlib.sha256(safe_url.encode()).hexdigest()}"
 
@@ -93,7 +112,13 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
         return ref.strip()
 
     async def image_bytes(self, ref: str) -> bytes:
-        """Any of the three shapes -> raw bytes. Downloads when given a URL."""
+        """Any of the three shapes -> raw bytes. Downloads when given a URL.
+
+        This is *the* shape-dispatching entry point: a client reference is
+        either remote or already inline, and the caller should not have to know
+        which. ``download_image`` is the URL-only half of this method, not an
+        alternative to it.
+        """
         ref = self._require_ref(ref)
         if self.is_url(ref):
             return await self.download_image(ref)

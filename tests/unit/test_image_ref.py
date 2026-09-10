@@ -104,3 +104,55 @@ async def test_oversized_payload_is_still_refused():
 async def test_payload_exactly_at_the_cap_is_accepted():
     ctx = _ctx(max_asset_bytes=len(PNG))
     assert await ctx.image_b64(BARE) == BARE
+
+
+# ``download_image`` is the one entry point that does not dispatch on shape,
+# and its name is what makes vision scripts reach for it with inline data.
+# These pin the guard that turns that mistake into a self-correcting message.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ref", [BARE, DATA_URI])
+async def test_download_image_refuses_inline_references(ref):
+    """Both inline shapes are named as such, and the right helper is named.
+
+    Before the guard this came out as ``channel_config_error`` -- "the channel
+    headers are unusable" -- which points the reader at the control plane for
+    what is a script bug.
+    """
+    with pytest.raises(InvalidRequestError) as excinfo:
+        await _ctx().download_image(ref)
+
+    assert "image_bytes" in str(excinfo.value)
+    assert excinfo.value.code != "channel_config_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ref", ["", "   ", None, 42])
+async def test_download_image_refuses_non_string_references(ref):
+    with pytest.raises(InvalidRequestError):
+        await _ctx().download_image(ref)
+
+
+@pytest.mark.asyncio
+async def test_download_image_does_not_echo_the_payload():
+    """The rejected value is usually megabytes of base64; an error body is not
+    the place to hand it back."""
+    with pytest.raises(InvalidRequestError) as excinfo:
+        await _ctx().download_image("x" * 4096)
+
+    assert len(str(excinfo.value)) < 400
+
+
+@pytest.mark.asyncio
+async def test_download_image_leaves_http_urls_to_the_ssrf_guard(monkeypatch):
+    """The shape guard must not shadow the existing URL checks."""
+    reached = RuntimeError("check_url reached")
+
+    def fake_check(raw, settings, header="X-Upstream-Url"):
+        raise reached
+
+    monkeypatch.setattr("adapter.ctxapi.image_ref.check_url", fake_check)
+    with pytest.raises(RuntimeError) as excinfo:
+        await _ctx().download_image("https://cdn.example/a.png")
+    assert excinfo.value is reached
