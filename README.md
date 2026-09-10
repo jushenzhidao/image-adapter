@@ -164,15 +164,54 @@ adapter/
   sandbox.py         # AST 扫描
   script_cache.py    # 按源码 sha256 缓存编译产物（替代热重载）
   executor.py        # 相位管线：auth -> request -> 上游 -> poll -> response
-  context.py         # ctx：脚本唯一的基础设施接口
+  context.py         # ctx 组装根：仅状态 + 基础设施句柄 + 生命周期
+  ctxapi/            # ctx 脚本 API（按关注点分 mixin，新增能力只加文件）
+    base.py          #   属性契约 + Needs* 跨 mixin 依赖声明
+    codec.py         #   base64 / data URI / MIME
+    image_ref.py     #   下载 + 三形态互转
+    storage.py       #   bytes -> URL（MinIO，缺失则降级 data URI）
+    budget.py        #   ctx.remaining / ctx.deadline
+    plan.py          #   RequestPlan + ctx.emit()
+  script_source.py   # 来源策略：尺寸/哈希/白名单/SSRF（不含查找）
+  scriptstore/       # 命名引用的可插拔后端
+    ref.py           #   ref 语法（vendor_y/mj@v1.3）
+    base.py          #   ScriptStore 协议 + ChainStore 优先级链
+    dirstore.py      #   目录后端（一个实例对应一个根）
   urlguard.py        # SSRF 防线
   api/pipeline.py    # 各端点共用的请求路径
   api/images.py      # 规范格式：generations（校验逻辑的唯一来源）
   api/image_edits.py # multipart 前门：改写形态后汇入 images
-script_store/        # 命名脚本库（X-Script-Ref 的本地后端）
+script_store/        # 命名脚本库（默认后端，随镜像打包）
+  manifest.json      # 可选：别名（@stable/@latest）+ 每版本 sha256
   volcengine_ark/images@v1.py
-tests/               # 76 项：单元（沙箱/工具）+ 集成（真实 HTTP mock 上游）
+tests/               # 单元（沙箱/工具/组装/存储）+ 集成（真实 HTTP mock 上游）
 ```
+
+## 脚本存储：镜像内置 + 可选只读挂载
+
+命名引用 `X-Script-Ref` 按**链式优先级**解析，两种部署形态同时支持：
+
+| 顺序 | 后端 | 配置 | 用途 |
+|---|---|---|---|
+| 1 | overlay | `SCRIPT_OVERLAY_DIRS`（逗号分隔，可空） | 只读卷挂载，热修脚本免重建镜像 |
+| 2 | image | `SCRIPT_REF_DIR`（默认 `/app/script_store`） | 随镜像打包，恒存在，无宿主依赖 |
+
+**默认读镜像内置目录**：不配 `SCRIPT_OVERLAY_DIRS` 时链上只有 image 后端，
+行为与之前完全一致。挂载目录后，同名 ref 命中 overlay，未命中则回落镜像；
+目录不存在只是跳过，不算错误。编译缓存以源码 sha256 为键，改文件即换键，
+所以挂载目录里改脚本**无需重启**即可生效。
+
+**可选 `manifest.json`**（每个根一份，没有它也能正常用）：提供别名与摘要。
+
+```json
+{"scripts": {"volcengine_ark/images": {
+  "latest": "v1", "aliases": {"stable": "v1"}, "digests": {"v1": "7bb5c4cb..."}}}}
+```
+
+于是 `X-Script-Ref: volcengine_ark/images@stable` 与 `@latest` 都可用，改一处
+清单即可整体前移版本，不必改每个渠道头。`digests` **默认只声明不强制**，
+要强校验就打开 `SCRIPT_PIN_MANIFEST_DIGESTS=true`。清单损坏（非法 JSON、
+结构不对）只记 warning 并按「无清单」处理，不会连带其它 ref 一起失败。
 
 ## 关键环境变量
 
@@ -180,7 +219,9 @@ tests/               # 76 项：单元（沙箱/工具）+ 集成（真实 HTTP 
 ADAPTER_KEY=                     # 数据面准入密钥（必填，除非显式关闭）
 ALLOW_INLINE_SCRIPT=true         # 生产置 false
 SCRIPT_SHA256_ALLOWLIST=         # 逗号分隔的脚本哈希白名单
-SCRIPT_REF_DIR=./script_store    # 命名引用的脚本目录
+SCRIPT_REF_DIR=./script_store    # 命名引用的默认目录（镜像内置）
+SCRIPT_OVERLAY_DIRS=             # 逗号分隔的只读挂载目录，优先于上一项
+SCRIPT_PIN_MANIFEST_DIGESTS=false # true = 按 manifest 的 sha256 强校验脚本
 UPSTREAM_ALLOW_PRIVATE_NETWORK=true  # 生产置 false（SSRF）
 UPSTREAM_HOST_ALLOWLIST=         # 逗号分隔的上游主机白名单
 REDIS_URL=                       # 空 = 内存降级

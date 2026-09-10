@@ -119,7 +119,12 @@ async def adapt(
     async def fetch(url: str) -> str:
         return await _fetch_remote_script(url, settings)
 
-    source = await resolve_source(channel, settings, fetch=fetch)
+    source = await resolve_source(
+        channel,
+        settings,
+        fetch=fetch,
+        store=getattr(request.app.state, "script_store", None),
+    )
     script = request.app.state.script_cache.load(source)
 
     ctx = AdapterContext(

@@ -18,6 +18,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code. script_store ships inside the image, so SCRIPT_REF_DIR
 # resolves named refs (vendor_y/mj@v1.3) with no bind mount and the deployment
 # has no host-path dependency. mock_upstream is a test stub and stays out.
+#
+# A deployment that wants to ship a script without rebuilding can mount extra
+# read-only roots and list them in SCRIPT_OVERLAY_DIRS: those are searched
+# first, and this baked store remains the always-present fallback.
 COPY adapter /app/adapter
 COPY script_store /app/script_store
 COPY gunicorn.conf.py /app/gunicorn.conf.py

@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
 
 from adapter.channel import ChannelSpec
-from adapter.context import RequestPlan
+from adapter.ctxapi import RequestPlan
 from adapter.errors import UpstreamError
 
 JSON_CONTENT = "application/json"

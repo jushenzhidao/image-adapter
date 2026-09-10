@@ -42,8 +42,18 @@ class Settings(BaseSettings):
     # Comma-separated sha256 hex digests. Non-empty means allowlist-only mode:
     # every script, whatever its source, must hash into this set.
     script_sha256_allowlist: str = ""
-    # Directory backing named refs such as vendor_y/mj@v1.3
+    # Directory backing named refs such as vendor_y/mj@v1.3. This is the
+    # image-baked store: it always exists, so refs resolve with no host
+    # dependency, and it is the lowest-precedence backend.
     script_ref_dir: str = str(BASE_DIR / "script_store")
+    # Optional comma-separated read-only volume mounts, searched BEFORE
+    # script_ref_dir. Lets a deployment override or add a script without
+    # rebuilding the image; absent directories are skipped, not an error.
+    script_overlay_dirs: str = ""
+    # When a store root ships manifest.json, may it refuse a script whose
+    # sha256 disagrees? Off by default: the manifest declares intent, and an
+    # unsigned local file must not become a hard gate on a working deployment.
+    script_pin_manifest_digests: bool = False
 
     # Practical ceiling for inline scripts. ASGI servers cap the whole header
     # block (h11 allows 16 KiB total), so anything larger must use a ref.
@@ -118,6 +128,13 @@ class Settings(BaseSettings):
     temp_image_ttl: int = 3600
     # Lifetime of a /v1/responses turn in the state chain.
     resp_ctx_ttl: int = 3600
+
+    @property
+    def script_overlay_list(self) -> tuple[str, ...]:
+        """Overlay roots in declared order; empty means image-store only."""
+        return tuple(
+            p.strip() for p in self.script_overlay_dirs.split(",") if p.strip()
+        )
 
     @property
     def remote_host_set(self) -> frozenset[str]:

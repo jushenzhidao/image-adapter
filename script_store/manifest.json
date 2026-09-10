@@ -1,0 +1,13 @@
+{
+  "scripts": {
+    "volcengine_ark/images": {
+      "latest": "v1",
+      "aliases": {
+        "stable": "v1"
+      },
+      "digests": {
+        "v1": "7bb5c4cb57243e39931cc0dd31566e65a0399d4f46b52970a81bc527aa03d033"
+      }
+    }
+  }
+}

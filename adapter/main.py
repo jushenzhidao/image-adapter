@@ -25,6 +25,7 @@ from adapter.middleware.cors import build_cors_middleware
 from adapter.middleware.logging import LoggingMiddleware
 from adapter.middleware.rate_limit import RateLimitMiddleware
 from adapter.script_cache import ScriptCache
+from adapter.scriptstore import build_store
 from adapter.settings import get_settings
 from adapter.state_store import StateStore
 
@@ -43,6 +44,9 @@ async def lifespan(app: Starlette):
     cfg = getattr(app.state, "settings", None) or settings
     app.state.settings = cfg
     app.state.script_cache = ScriptCache(max_size=cfg.script_cache_size)
+    # Ref-resolution chain: overlay volume mounts first, image-baked store
+    # last. Built once, since a DirStore only resolves its root at startup.
+    app.state.script_store = build_store(cfg)
     app.state.state_store = StateStore(cfg)
 
     # One HTTP session for the whole process. Building it per request threw

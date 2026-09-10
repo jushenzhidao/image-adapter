@@ -34,8 +34,19 @@ services:
       # is what varies between deployments.
       PORT: 8080
 
-    # No volumes: script_store is baked into the image, so the container has no
-    # host-path dependency and can be scheduled anywhere.
+    # Default: no volumes. script_store is baked into the image, so the
+    # container has no host-path dependency and can be scheduled anywhere.
+    #
+    # To hot-patch a script without rebuilding, mount one or more read-only
+    # roots and list them in SCRIPT_OVERLAY_DIRS. Overlays are searched before
+    # the baked store, so a ref present in both resolves to the overlay, and
+    # anything absent still falls through to the image. Script compilation is
+    # keyed on source sha256, so an edited file takes effect with no restart:
+    #
+    #   volumes:
+    #     - ./script_overlay:/mnt/script_overlay:ro
+    #   environment:
+    #     SCRIPT_OVERLAY_DIRS: /mnt/script_overlay
 
     # Hardening. The process only ever writes to /tmp (gunicorn worker
     # heartbeats), so the root filesystem stays read-only.

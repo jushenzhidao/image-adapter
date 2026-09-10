@@ -29,7 +29,7 @@ import logfire
 
 from adapter.budget import Budget, resolve_total
 from adapter.channel import ChannelSpec
-from adapter.context import SKIP, AdapterContext, RequestPlan
+from adapter.context import SKIP, AdapterContext
 from adapter.errors import AdapterError, ChannelConfigError, ScriptRuntimeError
 from adapter.executor import (
     PHASE_AUTH,
@@ -120,7 +120,7 @@ async def _run_stage(
     """Runs one stage. Returns (artefact, ran) -- ran=False means skipped."""
     # Each stage starts from a clean plan so one stage's emitted URL, method
     # or timeout cannot leak into the next.
-    ctx.plan = RequestPlan()
+    ctx.reset_plan()
 
     body = await _call_phase(
         script, ctx, payload, f"request:{stage}", settings.script_timeout
@@ -162,7 +162,7 @@ async def _run_stage(
         upstream_payload = reply.payload
 
     # The response phase gets a fresh plan too: it may emit for the next stage.
-    ctx.plan = RequestPlan()
+    ctx.reset_plan()
     out = await _call_phase(
         script,
         ctx,
@@ -190,7 +190,7 @@ async def execute_staged(
         )
     )
     # Scripts read the countdown through ctx.remaining / ctx.deadline.
-    ctx._budget = budget
+    ctx.attach_budget(budget)
     ctx.stage = {}
 
     outcome = StageOutcome(payload=None)
@@ -220,7 +220,7 @@ async def execute_staged(
                 "stage", name=stage, remaining_s=budget.remaining
             ) as span:
                 if auth_headers:
-                    ctx.plan = RequestPlan()
+                    ctx.reset_plan()
                     ctx.emit(headers=auth_headers)
                 try:
                     artefact, ran = await _run_stage(
@@ -263,7 +263,7 @@ async def execute_staged(
     if outcome.degraded and script.handles(PHASE_DEGRADED):
         # The artefact in hand is an inter-stage handoff, not a client
         # response. Give the script a chance to shape the partial result.
-        ctx.plan = RequestPlan()
+        ctx.reset_plan()
         last_artefact = await _call_phase(
             script, ctx, last_artefact, PHASE_DEGRADED, settings.script_timeout
         )

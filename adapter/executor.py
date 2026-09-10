@@ -25,7 +25,7 @@ import logfire
 
 from adapter.budget import Budget
 from adapter.channel import ChannelSpec
-from adapter.context import AdapterContext, RequestPlan
+from adapter.context import AdapterContext
 from adapter.errors import (
     AdapterError,
     ChannelConfigError,
@@ -171,7 +171,7 @@ async def _run_poll_loop(
             interval = budget.cap(interval)
         await asyncio.sleep(interval)
 
-        ctx.plan = RequestPlan()
+        ctx.reset_plan()
         poll_body = await _call_phase(
             script, ctx, handle, PHASE_POLL_REQUEST, settings.script_timeout
         )
@@ -251,7 +251,7 @@ async def execute(
                 script, ctx, channel, settings, reply, budget=budget, stage=stage
             )
 
-        ctx.plan = RequestPlan()
+        ctx.reset_plan()
         result = await _call_phase(
             script, ctx, payload, PHASE_RESPONSE, settings.script_timeout
         )

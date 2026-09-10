@@ -7,6 +7,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+from starlette.testclient import TestClient
+
+from adapter.settings import Settings
+from tests.integration.conftest import ADAPTER_KEY
 
 ASYNC_SCRIPT = """
 PHASES = ['request', 'response', 'poll_request', 'poll_response']
@@ -95,6 +99,54 @@ def test_async_without_poll_phases_is_config_error(
     )
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "channel_config_error"
+
+
+def test_overlay_ref_wins_over_image_store(tmp_path, monkeypatch):
+    """An overlay dir shadows the same ref inside the image, end to end.
+
+    Proves the deploy story: drop a file on the mounted volume and the running
+    service serves it instead of the baked-in copy, no rebuild.
+    """
+    overlay = tmp_path / "overlay" / "volcengine_ark"
+    overlay.mkdir(parents=True)
+    # Same ref as the in-image script. The engine sanitizes script failures
+    # down to the exception type name, so raise a type the real script never
+    # raises: seeing it proves the overlay file is what got compiled.
+    (overlay / "images@v1.py").write_text(
+        "async def transform(ctx, payload, phase):\n    return 1 / 0\n",
+        encoding="utf-8",
+    )
+
+    from adapter.main import app
+
+    app.state.settings = Settings(
+        environment="dev",
+        adapter_key=ADAPTER_KEY,
+        adapter_key_required=True,
+        upstream_allow_private_network=True,
+        redis_url="",
+        minio_endpoint="",
+        script_overlay_dirs=str(tmp_path / "overlay"),
+    )
+    try:
+        with TestClient(app, raise_server_exceptions=False) as overlay_client:
+            resp = overlay_client.post(
+                "/v1/images/generations",
+                headers={
+                    "X-Adapter-Key": ADAPTER_KEY,
+                    "X-Upstream-Url": "https://ark.cn-beijing.volces.com/api/v3/images/generations",
+                    "X-Script-Ref": "volcengine_ark/images@v1",
+                    "Content-Type": "application/json",
+                },
+                json={"prompt": "cat"},
+            )
+    finally:
+        app.state.settings = None
+
+    assert resp.status_code == 500
+    body = resp.json()["error"]
+    assert body["code"] == "script_runtime_error"
+    assert "ZeroDivisionError" in body["message"]
 
 
 def test_script_ref_from_store(client, channel_headers, settings):
