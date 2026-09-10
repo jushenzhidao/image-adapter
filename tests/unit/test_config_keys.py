@@ -135,3 +135,15 @@ def test_dockerfile_copies_only_existing_paths() -> None:
     assert not missing, (
         f"Dockerfile copies paths that do not exist, so the build fails: {missing}"
     )
+
+
+def test_rate_limiting_is_off_until_a_deployment_turns_it_on() -> None:
+    """The limiter is the one setting that can shed traffic, so it must stay
+    opt-in: a default of True would let a deployment start rejecting requests
+    nobody agreed to reject.
+
+    This reads the class default rather than constructing ``Settings()``, which
+    would also pick up whatever the local ``.env`` happens to say -- a
+    deployment is free to enable the limiter without turning this test red.
+    """
+    assert Settings.model_fields["rate_limit_enabled"].default is False

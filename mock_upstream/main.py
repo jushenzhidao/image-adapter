@@ -1,8 +1,10 @@
-"""Mock upstream service (AC-16): three modes.
+"""Mock upstream service (AC-16): four modes.
 
 1. Sync text2img/chat endpoints (vendor-a style)
 2. Async Job submit + query endpoints (vendor-b style)
 3. AK-SK signature validation
+4. OpenAI-native images: /v1/images/generations (JSON) and /v1/images/edits
+   (multipart), the two-endpoint shape openai/images@v1 targets
 
 Returns real 1x1 PNG bytes for all image endpoints.
 """
@@ -18,6 +20,7 @@ import uuid
 from collections.abc import Callable
 
 from starlette.applications import Starlette
+from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
@@ -28,6 +31,10 @@ PNG_1X1 = base64.b64decode(
 )
 
 _jobs: dict[str, dict] = {}
+
+#: What the last OpenAI-shaped call looked like, so a manual E2E can assert on
+#: the wire shape (JSON vs multipart, which parts arrived) without a debugger.
+_openai_last: dict = {}
 
 
 def _verify_ak_sk(request: Request) -> bool:
@@ -101,6 +108,67 @@ async def vendor_a_asset(request: Request) -> Response:
     return Response(content=PNG_1X1, media_type="image/png")
 
 
+# Mode 4: OpenAI-native images. Two endpoints, split by transport -- JSON for
+# generations, multipart for edits -- which is exactly the shape
+# openai/images@v1 has to route between.
+async def openai_generations(request: Request) -> Response:
+    body = json.loads(await request.body() or b"{}")
+    _openai_last.clear()
+    _openai_last.update(
+        {
+            "endpoint": "generations",
+            "content_type": request.headers.get("content-type", ""),
+            "body": body,
+        }
+    )
+    return JSONResponse(
+        {
+            "created": int(time.time()),
+            "data": [{"b64_json": base64.b64encode(PNG_1X1).decode("ascii")}],
+            "usage": {"total_tokens": 100},
+        }
+    )
+
+
+async def openai_edits(request: Request) -> Response:
+    form = await request.form()
+    fields: dict[str, str] = {}
+    files: dict[str, list[dict]] = {}
+    for key in form:
+        for value in form.getlist(key):
+            if isinstance(value, UploadFile):
+                data = await value.read()
+                files.setdefault(key, []).append(
+                    {
+                        "filename": value.filename,
+                        "content_type": value.content_type,
+                        "bytes": len(data),
+                    }
+                )
+            else:
+                fields[key] = value
+    _openai_last.clear()
+    _openai_last.update(
+        {
+            "endpoint": "edits",
+            "content_type": request.headers.get("content-type", ""),
+            "fields": fields,
+            "files": files,
+        }
+    )
+    return JSONResponse(
+        {
+            "created": int(time.time()),
+            "data": [{"b64_json": base64.b64encode(PNG_1X1).decode("ascii")}],
+        }
+    )
+
+
+async def mock_last_openai(request: Request) -> Response:
+    """Inspection hook: what the last OpenAI-shaped call carried."""
+    return JSONResponse(_openai_last)
+
+
 # Vendor B: async Job-based endpoints
 async def vendor_b_chat_submit(request: Request) -> Response:
     if not _verify_ak_sk(request):
@@ -172,6 +240,9 @@ routes = [
     Route("/v2/text2img", vendor_a_text2img, methods=["POST"]),
     Route("/v2/img2img", vendor_a_img2img, methods=["POST"]),
     Route("/assets/sample.png", vendor_a_asset, methods=["GET"]),
+    Route("/v1/images/generations", openai_generations, methods=["POST"]),
+    Route("/v1/images/edits", openai_edits, methods=["POST"]),
+    Route("/mock/last-openai", mock_last_openai, methods=["GET"]),
     Route("/v1/chat/submit", vendor_b_chat_submit, methods=["POST"]),
     Route("/v1/images/submit", vendor_b_images_submit, methods=["POST"]),
     Route("/v1/jobs/{job_id:str}", vendor_b_job_status, methods=["GET"]),

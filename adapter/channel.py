@@ -21,10 +21,11 @@ declares only how to talk to that endpoint:
 
 from __future__ import annotations
 
-import json
+import re
 from dataclasses import dataclass, field
 
 from adapter.errors import ChannelConfigError
+from adapter.jsoncodec import loads as json_loads
 from adapter.settings import Settings
 from adapter.stage_spec import StageSpec
 from adapter.urlguard import check_url
@@ -132,36 +133,31 @@ class ChannelSpec:
         return self.stages.urls
 
 
+#: The four escapes X-Script defines. Anything else following a backslash keeps
+#: both characters, so a sequence the format does not define survives into the
+#: source unchanged rather than being silently eaten.
+_UNESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\"}
+_ESCAPE_RE = re.compile(r"\\(.)")
+
+
 def _unescape_inline(raw: str) -> str:
     r"""Turns a single-line header value back into Python source.
 
     HTTP forbids bare newlines in header values, so X-Script carries the two
     characters backslash-n where a line break belongs. Tabs and carriage
     returns get the same treatment; a literal backslash is written \\.
+
+    One regex pass instead of a character loop: the loop measured 0.345 ms on
+    an 8 KiB script against 0.026 ms here, and this runs on the event loop
+    before any handler work starts. The dot does not match a newline, so a
+    trailing lone backslash is left as-is -- which is what the loop did too.
     """
-    out: list[str] = []
-    i = 0
-    n = len(raw)
-    while i < n:
-        ch = raw[i]
-        if ch != "\\" or i + 1 >= n:
-            out.append(ch)
-            i += 1
-            continue
-        nxt = raw[i + 1]
-        if nxt == "n":
-            out.append("\n")
-        elif nxt == "t":
-            out.append("\t")
-        elif nxt == "r":
-            out.append("\r")
-        elif nxt == "\\":
-            out.append("\\")
-        else:
-            out.append(ch)
-            out.append(nxt)
-        i += 2
-    return "".join(out)
+
+    def replace(match: re.Match[str]) -> str:
+        char = match.group(1)
+        return _UNESCAPES.get(char, "\\" + char)
+
+    return _ESCAPE_RE.sub(replace, raw)
 
 
 def _first_present(headers, *names: str) -> tuple[str | None, str | None]:
@@ -213,8 +209,9 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
     options: dict = {}
     if options_raw:
         try:
-            parsed = json.loads(options_raw)
-        except json.JSONDecodeError:
+            parsed = json_loads(options_raw)
+        except ValueError:
+            # json.JSONDecodeError and orjson.JSONDecodeError both subclass it.
             raise ChannelConfigError(
                 "X-Channel-Options must be a JSON object", "X-Channel-Options"
             ) from None

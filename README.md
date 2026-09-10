@@ -102,10 +102,30 @@ async def transform(ctx, payload, phase):
 | `await ctx.image_data_uri(ref)` | 三态入参 → data URI，mime 由magic number 嗅探 |
 | `await ctx.image_url(ref)` | 三态入参 → 可公网访问 URL（必要时经 MinIO 中转） |
 | `ctx.is_url(s)` / `ctx.is_data_uri(s)` | 形态判断，写多分支转换时用 |
-| `ctx.emit(url=..., method=..., headers=..., query=..., form=..., raw=..., timeout=...)` | 覆盖本次上游调用的任意维度（轮询换端点、multipart 上传等） |
+| `ctx.emit(url=..., method=..., headers=..., query=..., body=..., form=..., files=..., raw=..., timeout=...)` | 覆盖本次上游调用的任意维度（轮询换端点、multipart 上传等） |
 | `ctx.key` | 上游凭证（`Authorization` 去掉 Bearer 后的值），签名计算时用 |
 | `await ctx.sleep(s)` | 异步等待（脚本内禁用 `import asyncio`） |
 | `ctx.logfire` | 追踪句柄，`with ctx.logfire.span('...')` |
+
+请求体有**三种形态**：脚本返回 dict 就得到 JSON，另外两种用 `emit()` 显式声明。
+
+| 形态 | 声明方式 | 文本字段来源 | 二进制部件 |
+|---|---|---|---|
+| JSON | 直接 `return dict` | 返回值 | — |
+| form-urlencoded | `emit(form={...})` | `form` | — |
+| multipart/form-data | `emit(files={...})` | 返回值（并与 `form` 合并） | `files` |
+
+`files` 的每个字段接受**一个部件** `("a.png", raw_bytes, "image/png")`，或**部件列表**（同名字段重复时用列表——OpenAI 的多图编辑拼作 `image[]`）。boundary 与 Content-Type 由引擎生成，脚本只交字节：
+
+```python
+ctx.emit(
+    url=f"{base}/edits",
+    files={"image[]": [("a.png", raw_a, "image/png"), ("b.png", raw_b, "image/png")]},
+)
+return {"prompt": "blend", "n": "2"}   # 这些成为 multipart 文本字段
+```
+
+字节一般来自 `await ctx.image_bytes(ref)`——三态入参（URL / data URI / 裸 base64）统一取原始字节，mime 由 `ctx.sniff_mime(bytes)` 嗅探。
 
 ## 安全模型
 
@@ -157,6 +177,32 @@ curl -s -X POST localhost:8080/v1/images/edits \
   -F response_format=url
 ```
 
+## OpenAI 原生上游（两通端点）
+
+OpenAI 把图片任务按**载体**拆成两个端点：`/v1/images/generations` 收 JSON，
+`/v1/images/edits` 收 multipart/form-data。适配器的规范 body 已把这一差异收敛到
+一个 `image` 字段，所以内置脚本 `openai/images@v1` 按它分流，渠道只声明**主端点**：
+
+| 客户端请求 | 打到上游 |
+|---|---|
+| 无 `image` | `POST {X-Upstream-Url}`，JSON |
+| 有 `image` | `POST {同服务的姊妹端点}`，multipart（`image[]` / `mask` 为文件部件） |
+
+姊妹端点由渠道 URL 的末段替换推出，host 与 query 保留（因此 Azure 的
+`api-version` 会一并带过去）；布局不匹配时用
+`X-Channel-Options: {"edits_url": "..."}` 直接指定。响应两个端点同形，原样透传，
+含计费依赖的 `usage`。
+
+```bash
+curl -s -X POST localhost:8080/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -H "X-Adapter-Key: dev-key" \
+  -H "X-Upstream-Url: https://api.openai.com/v1/images/generations" \
+  -H "X-Script-Ref: openai/images@v1" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d '{"model":"gpt-image-1","prompt":"一只白猫","image":"https://cdn.test/cat.png"}'
+```
+
 ## 项目结构
 
 ```
@@ -175,7 +221,7 @@ adapter/
     image_ref.py     #   下载 + 三形态互转
     storage.py       #   bytes -> URL（MinIO，缺失则降级 data URI）
     budget.py        #   ctx.remaining / ctx.deadline
-    plan.py          #   RequestPlan + ctx.emit()
+    plan.py          #   RequestPlan + ctx.emit()（JSON / form / multipart）
   script_source.py   # 来源策略：尺寸/哈希/白名单/SSRF（不含查找）
   scriptstore/       # 命名引用的可插拔后端
     ref.py           #   ref 语法（vendor_y/mj@v1.3）
@@ -188,6 +234,7 @@ adapter/
 script_store/        # 命名脚本库（默认后端，随镜像打包）
   manifest.json      # 可选：别名（@stable/@latest）+ 每版本 sha256
   volcengine_ark/images@v1.py
+  openai/images@v1.py  # OpenAI 原生：generations(JSON) / edits(multipart) 分流
 tests/               # 单元（沙箱/工具/组装/存储）+ 集成（真实 HTTP mock 上游）
 ```
 

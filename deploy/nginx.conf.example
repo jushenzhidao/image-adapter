@@ -1,0 +1,132 @@
+# Reference reverse-proxy configuration for the adapter.
+#
+# Not wired into docker-compose.yml on purpose. Whether this layer exists, and
+# what runs it, belongs to the platform the adapter is deployed onto; this file
+# is the set of decisions that layer then has to make, with the reasoning
+# attached so none of them gets dropped as "just a timeout".
+#
+# The dividing line
+# ----------------
+#   nginx  -> the SHAPE of the transport: sizes, timeouts, connection reuse,
+#             TLS, buffering, coarse admission. None of it needs to understand
+#             what the request means, and all of it is cheaper here because the
+#             work happens before a byte reaches Python.
+#   adapter -> the MEANING: the channel contract, the OpenAI error envelope,
+#             SSRF checks, script allowlists, per-credential rate limiting.
+#             Also the upstream response cap, which is outbound and therefore
+#             invisible to this layer.
+#
+# Keeping both is the point, not duplication: the proxy can be bypassed (an
+# internal caller, a debug port, a future deployment without one), so the
+# adapter has to hold its own limits, and the proxy refuses the expensive
+# cases before they cost anything.
+
+upstream adapter {
+    server 127.0.0.1:8080;
+
+    # Reusing the connection to the adapter removes a TCP handshake, an accept
+    # and a worker wakeup from every request. Requires the two directives in
+    # the location block below -- on its own this line does nothing.
+    keepalive 64;
+    keepalive_requests 10000;
+}
+
+# Coarse admission for a flood. The adapter rate-limits too, but it buckets by
+# the vendor credential it is proxying for, which this layer cannot see; this
+# one exists because it is the cheapest possible shed.
+limit_req_zone $binary_remote_addr zone=adapter_rl:16m rate=200r/s;
+limit_conn_zone $binary_remote_addr zone=adapter_conn:16m;
+
+server {
+    listen 80;
+    server_name _;
+
+    # TLS terminates here. The adapter speaks plain HTTP on the internal
+    # network -- don't make Python do TLS it does not have to.
+    # listen 443 ssl;
+    # ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    # ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    # MUST be >= the largest body you intend to accept, and should match the
+    # adapter's MAX_REQUEST_BYTES so the two agree. The adapter enforces the
+    # same ceiling itself (413 request_too_large) because it cannot assume this
+    # layer exists, but here the refusal happens before the body enters the
+    # Python process at all -- which is what makes it free.
+    #
+    # Size it for the JSON routes: base64 inflates an upload by 4/3, so a 20 MB
+    # image is ~27 MB on the wire, times however many references a request may
+    # carry.
+    client_max_body_size 64m;
+
+    # The channel contract rides in headers, and X-Script carries source code.
+    # h11 on the adapter side caps the whole header block at 16 KiB, so a larger
+    # one is refused there regardless; matching it here just makes it cheaper.
+    large_client_header_buffers 4 16k;
+
+    # A client that dribbles a body must not hold a connection open. Independent
+    # of the adapter's own upstream timeout, which is about the other direction.
+    client_body_timeout 30s;
+    client_header_timeout 15s;
+    send_timeout 300s;
+
+    location / {
+        limit_req zone=adapter_rl burst=400 nodelay;
+        limit_conn zone=adapter_conn 200;
+
+        proxy_pass http://adapter;
+        proxy_http_version 1.1;
+
+        # MUST together with `keepalive` above: without an empty Connection
+        # header nginx sends "Connection: close" upstream and the pool is
+        # pointless.
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # CRITICAL. The adapter's UPSTREAM_TIMEOUT is 180s because a 2K
+        # generation takes 27~82s against Ark. nginx's default is 60s: left
+        # alone it cuts the connection while the adapter is still waiting, so
+        # the caller gets a 504 while the upstream call keeps running and keeps
+        # burning quota. Keep this strictly above UPSTREAM_TIMEOUT.
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_connect_timeout 10s;
+
+        # MUST for /v1/chat/completions with stream=true. The adapter bridges a
+        # complete upstream response into SSE chunks; nginx's default buffering
+        # would accumulate them and release everything at the end, turning
+        # streaming back into one blocking response.
+        proxy_buffering off;
+        proxy_cache off;
+    }
+
+    # /health is probed on a timer by every orchestrator. Keep it out of the
+    # rate limiter, or a busy service starts reporting itself unhealthy.
+    location = /health {
+        access_log off;
+        proxy_pass http://adapter;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+
+    # The adapter answers every error with the OpenAI envelope, but this layer's
+    # own exits are HTML by default. An OpenAI SDK calling response.json() on
+    # that raises a parse error and loses the message entirely, so the two codes
+    # a client can actually provoke are rewritten into the same shape.
+    error_page 413 = @openai_413;
+    error_page 502 503 504 = @openai_upstream;
+
+    location @openai_413 {
+        internal;
+        default_type application/json;
+        return 413 '{"error":{"message":"Request body exceeds the proxy limit","type":"invalid_request_error","param":null,"code":"request_too_large"}}';
+    }
+
+    location @openai_upstream {
+        internal;
+        default_type application/json;
+        return 502 '{"error":{"message":"Adapter is unavailable","type":"server_error","param":null,"code":"upstream_unreachable"}}';
+    }
+}

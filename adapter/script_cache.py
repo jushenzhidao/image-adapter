@@ -246,8 +246,10 @@ class ScriptCache:
             return cached
 
         filename = f"<script:{source.origin}:{source.sha256[:12]}>"
-        scan_source(source.text, filename=filename)
-        code = compile(source.text, filename, "exec")
+        # scan_source hands back the AST it already parsed, so compiling from
+        # it avoids parsing the same text a second time.
+        tree = scan_source(source.text, filename=filename)
+        code = compile(tree, filename, "exec")
 
         namespace: dict[str, Any] = {"__builtins__": SAFE_BUILTINS}
         try:

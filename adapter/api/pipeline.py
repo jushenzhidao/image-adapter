@@ -15,16 +15,17 @@ from typing import Any
 
 import aiohttp
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from adapter.api.common import get_request_id, parse_json_body
 from adapter.channel import parse_channel
 from adapter.context import AdapterContext
 from adapter.errors import AdmissionError, ScriptSourceError
 from adapter.executor import execute
+from adapter.jsoncodec import JSONResponse
 from adapter.script_source import resolve_source
 from adapter.settings import Settings
 from adapter.stages import execute_staged
+from adapter.transport import read_capped
 
 
 def check_admission(request: Request, settings: Settings) -> None:
@@ -57,12 +58,14 @@ async def _fetch_remote_script(url: str, settings: Settings) -> str:
                     f"Script fetch failed with status {resp.status}",
                     code="script_fetch_failed",
                 )
-            raw = await resp.read()
-    if len(raw) > settings.max_script_bytes:
-        raise ScriptSourceError(
-            "Remote script exceeds the configured size limit",
-            code="script_too_large",
-        )
+            # Capped while reading: the size limit used to be applied only
+            # after the entire body had already been buffered.
+            raw = await read_capped(
+                resp,
+                settings.max_script_bytes,
+                lambda detail: ScriptSourceError(detail, code="script_too_large"),
+                label="Remote script",
+            )
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:

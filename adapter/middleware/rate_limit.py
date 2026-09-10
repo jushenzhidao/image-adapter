@@ -10,6 +10,7 @@ Written as raw ASGI rather than ``BaseHTTPMiddleware``; see
 
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Any
 
@@ -43,7 +44,12 @@ class RateLimitMiddleware:
             token = client[0] if client else "anon"
 
         window = int(time.time() // 60)
-        key = f"ratelimit:{token}:{window}"
+        # Hashed, never raw. The Authorization value is the upstream vendor's
+        # credential, and a Redis key name is not a secret store: it surfaces
+        # in KEYS/SCAN, MONITOR, the slow log and every RDB dump. A digest keeps
+        # the bucketing identical while keeping the credential out of all four.
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+        key = f"ratelimit:{digest}:{window}"
         limit = settings.rate_limit_per_minute
 
         count: int | None = None

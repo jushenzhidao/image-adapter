@@ -77,6 +77,92 @@ class TestDirStore:
             await DirStore(root).get(parse_ref("leak"))
 
 
+class TestSourceCache:
+    """The per-root read cache, and the hot-patching it must not break.
+
+    The cache exists because a stat costs 0.0026 ms where the read costs
+    3.22 ms, and that read was paid on *every* request rather than every miss.
+    Both halves need pinning: an unchanged file must be served without reading
+    it again, and any real edit must be visible on the very next read -- the
+    overlay roots exist precisely so a fix can ship without a rebuild.
+    """
+
+    ORIGINAL = "# original\n"  # same byte length as MODIFIED, on purpose
+    MODIFIED = "# modified\n"
+
+    @pytest.mark.asyncio
+    async def test_unchanged_file_is_served_without_reading_it_again(self, tmp_path):
+        """Rewrites the file behind a restored mtime and an identical size,
+        which is the one state the cache cannot tell from "nothing changed".
+        Getting the old text back is what proves the read was skipped."""
+        import os
+
+        path = tmp_path / "v" / "mj@v1.py"
+        path.parent.mkdir(parents=True)
+        path.write_text(self.ORIGINAL)
+        store = DirStore(tmp_path)
+        ref = parse_ref("v/mj@v1")
+        assert await store.get(ref) == self.ORIGINAL
+
+        before = path.stat()
+        path.write_text(self.MODIFIED)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert path.stat().st_size == before.st_size  # the test's own premise
+
+        assert await store.get(ref) == self.ORIGINAL
+
+    @pytest.mark.asyncio
+    async def test_an_edit_is_visible_on_the_next_read(self, tmp_path):
+        path = tmp_path / "v" / "mj@v1.py"
+        path.parent.mkdir(parents=True)
+        path.write_text(self.ORIGINAL)
+        store = DirStore(tmp_path)
+        ref = parse_ref("v/mj@v1")
+        assert await store.get(ref) == self.ORIGINAL
+
+        path.write_text("# redacted and considerably longer\n")
+        assert await store.get(ref) == "# redacted and considerably longer\n"
+
+    @pytest.mark.asyncio
+    async def test_same_size_edit_with_a_new_mtime_is_visible(self, tmp_path):
+        """Size alone would miss this; mtime alone would miss a filesystem with
+        coarse timestamps. Comparing both is what makes the cache safe."""
+        import os
+
+        path = tmp_path / "v" / "mj@v1.py"
+        path.parent.mkdir(parents=True)
+        path.write_text(self.ORIGINAL)
+        store = DirStore(tmp_path)
+        ref = parse_ref("v/mj@v1")
+        assert await store.get(ref) == self.ORIGINAL
+
+        before = path.stat()
+        path.write_text(self.MODIFIED)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+        assert path.stat().st_size == before.st_size
+
+        assert await store.get(ref) == self.MODIFIED
+
+    @pytest.mark.asyncio
+    async def test_a_file_that_appears_later_is_found(self, tmp_path):
+        """A miss must never be cached: mounting an overlay volume after
+        start-up has to take effect, and that is the same code path."""
+        (tmp_path / "v").mkdir()
+        store = DirStore(tmp_path)
+        ref = parse_ref("v/mj@v1")
+
+        assert await store.get(ref) is None
+        (tmp_path / "v" / "mj@v1.py").write_text("# appeared\n")
+        assert await store.get(ref) == "# appeared\n"
+
+    @pytest.mark.asyncio
+    async def test_a_directory_at_the_ref_path_is_a_miss_not_an_error(self, tmp_path):
+        """The read cache replaced an is_file() check with a single stat, so
+        the "not a regular file" decision has to survive the rewrite."""
+        (tmp_path / "v" / "mj.py").mkdir(parents=True)
+        assert await DirStore(tmp_path).get(parse_ref("v/mj")) is None
+
+
 class TestChainPrecedence:
     @pytest.mark.asyncio
     async def test_overlay_wins_and_image_is_the_fallback(self, tmp_path):

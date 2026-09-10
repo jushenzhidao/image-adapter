@@ -4,7 +4,13 @@ version = "1.0.0"
 description = "OpenAI Images protocol adapter for heterogeneous upstreams"
 requires-python = ">=3.13"
 dependencies = [
-    "starlette>=1.6.0",
+    # 上界不是保守，是补 FastAPI 的一个洞：fastapi 0.141.1 对 starlette 只声明
+    # `starlette>=0.46.0`，没有上界，所以不加约束的话 `pip install -e .` 会把未来的
+    # starlette 2.x 静默拉进来 —— 而我们在用它的具体行为（testclient、Request.form()、
+    # 异常处理器签名）。生产锁在 requirements.txt，这里只是给开发安装兜底。
+    "starlette>=1.6.0,<2",
+    # 其余依赖不加上界：requirements.txt 是唯一的锁定来源（== 精确），
+    # 在生产与 CI 中一律走它；在这里重复上界只会制造两处需要同步的版本区间。
     "fastapi>=0.141.0",
     "python-multipart>=0.0.20",
     "uvicorn>=0.52.4",
@@ -23,7 +29,7 @@ dependencies = [
 test = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "httpx>=0.28.1",
+    "httpx2>=2.0.0",
 ]
 
 [build-system]

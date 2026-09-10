@@ -1,0 +1,68 @@
+name: Dependency audit
+
+# 依赖审计独立于发版，且刻意**不作为发版门禁**。理由值得写清楚，否则很容易被
+# 「顺手挪进 release.yml 当 gate」改掉：
+#
+#   1. 公告与提交无关。审计的对象是 requirements.txt，而新公告的出现不依赖于本次
+#      提交改了任何东西 —— 把它做成 gate，等于让一个跟本次提交无关的第三方公告
+#      挡住发布。
+#   2. 挡住发布并不能降低暴露面。有漏洞的版本本来就已经在 lock 里、已经在跑，
+#      拦下发版只会让**别的**修复也发不出去（compose 引用的 :latest 只在发版成功时前移）。
+#      结果是"什么都不发"，而不是"发了个更安全的"。
+#   3. 只挂在 push 上会漏。没有 push 就没有检查，而公告是按自己的节奏来的 ——
+#      定时任务才是这类审计的主要触发方式。
+#
+# 所以定位是**发现问题**而不是**拦住动作**：红了就在 Actions 里可见，由人决定
+# 是升级、还是记录接受风险。若将来要升级成硬门禁，把下面的步骤搬进 release.yml
+# 的 "Run tests" 之后即可，命令不用改。
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 每周一 03:17 UTC（避开整点：整点的 runner 排队最挤）。
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      # 版本钉死：这是 CI 里的执行体，跟随上游漂移没有收益，只有供应链风险。
+      # 已知 2.10.1；升级时改这一行即可（漏洞库来自 OSV/PyPI，与工具版本无关）。
+      - name: Install pip-audit
+        run: pip install pip-audit==2.10.1
+
+      # 直接审计 lock 文件而不是当前环境：requirements.txt 才是生产依赖的唯一事实来源，
+      # 且它与「本地是否装全」无关（本地 venv 就缺 httptools/uvloop，但这不影响判定）。
+      #
+      # `--no-deps --disable-pip` 不是可选优化，是让这条命令**能在本地原样复现**的关键：
+      # 默认形态会为解析依赖临时新建 venv（走 ensurepip），受限环境（沙箱、精简 CI 镜像）
+      # 会直接崩。requirements.txt 是完整的 pinned 闭包（含全部传递依赖），跳过解析不损失
+      # 覆盖面；少了 `--disable-pip` 就退回临时 venv、本地无法复核，而无法复核的门禁等于没有。
+      # 已验证：对含 starlette==0.37.1 的假 lock 退出码 1 并列出公告，对真 lock 退出码 0。
+      - name: Audit requirements.txt
+        run: pip-audit --requirement requirements.txt --no-deps --disable-pip
+
+      # 审计通过不代表可以忘了它：把结论写进 step summary，便于回溯"上次核查是哪天"。
+      - name: Record result
+        if: always()
+        run: |
+          {
+            echo "### 依赖审计 ${{ job.status }}"
+            echo ""
+            echo "- 对象：\`requirements.txt\`（生产镜像按此文件安装）"
+            echo "- 工具：pip-audit 2.10.1，漏洞库为 OSV / PyPI 公告"
+            echo "- 提交：\`${{ github.sha }}\`"
+            echo ""
+            echo "本地复核同一条命令：\`pip-audit --requirement requirements.txt\`"
+          } >> "$GITHUB_STEP_SUMMARY"

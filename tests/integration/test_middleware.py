@@ -12,6 +12,8 @@ covered properly in test_error_envelope.py.
 
 from __future__ import annotations
 
+import re
+
 
 def test_health_is_public(client):
     resp = client.get("/health")
@@ -83,3 +85,30 @@ def test_rate_limit_never_blocks_health(client, monkeypatch):
     _force_limit(monkeypatch, per_minute=0)
     for _ in range(3):
         assert client.get("/health").status_code == 200
+
+
+def test_rate_limit_key_carries_no_credential(client, monkeypatch):
+    """The limiter buckets by Authorization, and that value IS the upstream
+    vendor's credential. Using it as a Redis key name would publish the
+    credential into KEYS/SCAN, MONITOR, the slow log and every RDB dump, so the
+    key must be a digest."""
+    from adapter.middleware import rate_limit
+
+    _force_limit(monkeypatch, per_minute=100)
+    client.post(
+        "/v1/images/generations",
+        json={"prompt": "x"},
+        headers={
+            "X-Adapter-Key": "test-adapter-key",
+            "Authorization": "Bearer ark-SUPERSECRET-abcdef",
+        },
+    )
+
+    keys = list(rate_limit._local_counters)
+    rate_limit._local_counters.clear()
+
+    assert keys, "the request should have been counted"
+    for key in keys:
+        assert "SUPERSECRET" not in key
+        assert "Bearer" not in key
+        assert re.fullmatch(r"ratelimit:[0-9a-f]{16}:\d+", key), key

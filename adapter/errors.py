@@ -7,7 +7,7 @@ not exist here: the control plane resolved those before calling us.
 
 from __future__ import annotations
 
-from starlette.responses import JSONResponse
+from adapter.jsoncodec import JSONResponse
 
 
 class AdapterError(Exception):
@@ -44,6 +44,26 @@ class InvalidRequestError(AdapterError):
         self, message: str, param: str | None = None, code: str = "invalid_request"
     ) -> None:
         super().__init__(400, message, "invalid_request_error", param, code)
+
+
+class PayloadTooLargeError(AdapterError):
+    """The request body is over the configured ceiling.
+
+    A distinct code rather than a generic invalid_request, because a control
+    plane should be able to tell "this request can never fit" apart from "this
+    request is malformed" and stop retrying. 413 also matches what a reverse
+    proxy returns for the same condition, so the client sees one shape either
+    way -- except that this one carries the OpenAI envelope.
+    """
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(
+            413,
+            f"Request body exceeds the {limit} byte limit",
+            "invalid_request_error",
+            None,
+            "request_too_large",
+        )
 
 
 class AdmissionError(AdapterError):

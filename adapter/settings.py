@@ -97,6 +97,23 @@ class Settings(BaseSettings):
     http_dns_cache_ttl: int = 300
     http_keepalive_timeout: float = 30.0
 
+    # Hard ceiling on a single upstream response body. Every reply is buffered
+    # in full -- one buffer per in-flight request, see ``executor._do_upstream``
+    # -- so this is the value that bounds worker memory: concurrency x this
+    # number is the worst case. A layer-decomposition reply carries up to 11
+    # images and measures 10~30 MB, so the default leaves headroom while still
+    # refusing a body that could only be a mistake or an attack.
+    max_upstream_bytes: int = 64 * 1024 * 1024
+
+    # Hard ceiling on ONE inbound request body. Starlette's ``Request.body()``
+    # and ``Request.form()`` both accumulate with no limit of their own -- the
+    # multipart route accepts up to 64 files and reads each into memory -- so
+    # without this a caller decides how much of a worker's memory to consume.
+    # A reverse proxy refuses this earlier and for free (client_max_body_size),
+    # and in a deployment that has one it should; this setting exists because
+    # the adapter cannot assume a proxy is in front of it. Keep the two aligned.
+    max_request_bytes: int = 64 * 1024 * 1024
+
     # --- Image assets ------------------------------------------------------
     # Client-supplied images (URL or base64) are untrusted and unbounded, so
     # both the download and the decode are capped.
@@ -114,6 +131,11 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "adapter-temp"
     minio_secure: bool = False
+    # Per-host HTTP connection pool for object storage. minio-py's own default
+    # is 10, which sits below the concurrency this service reaches; size it to
+    # roughly the uploads expected in flight per worker. Only consulted when
+    # MINIO_ENDPOINT is set, since storage is otherwise absent entirely.
+    minio_pool_size: int = 20
 
     # --- Middleware --------------------------------------------------------
     rate_limit_enabled: bool = False

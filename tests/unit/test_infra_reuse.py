@@ -61,3 +61,33 @@ def test_unconfigured_client_property_stays_none():
     """An injected None plus no endpoint must not accidentally build anything."""
     core = _core(Settings(minio_endpoint=""), storage=None)
     assert core.storage is None
+
+
+def test_storage_pool_size_is_configured_not_left_to_the_library_default():
+    """minio-py's own default is 10 connections per host, which sits below the
+    concurrency this service reaches. urllib3 does not wait for a free
+    connection: it opens an extra one and discards it on release, so an
+    undersized pool silently costs a TCP+TLS handshake per upload -- the exact
+    cost that sharing the client exists to remove.
+    """
+    storage = build_storage(
+        Settings(minio_endpoint="s3.example", minio_pool_size=42)
+    )
+    assert storage._http.connection_pool_kw["maxsize"] == 42
+
+
+def test_supplying_a_pool_keeps_the_libraries_timeouts_and_retries():
+    """Passing ``http_client`` replaces minio-py's PoolManager wholesale, so
+    every one of its parameters has to be restated. Dropping them would be a
+    silent behaviour change rather than a missing feature: urllib3's own
+    default timeout is None, i.e. wait forever.
+    """
+    storage = build_storage(Settings(minio_endpoint="s3.example"))
+    kw = storage._http.connection_pool_kw
+
+    assert kw["timeout"].connect_timeout == 300.0
+    assert kw["timeout"].read_timeout == 300.0
+    assert kw["cert_reqs"] == "CERT_REQUIRED"
+    assert kw["ca_certs"]
+    assert kw["retries"].total == 5
+    assert kw["retries"].backoff_factor == 0.2

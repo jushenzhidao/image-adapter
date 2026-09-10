@@ -109,6 +109,14 @@ class TTLCache:
             self._bytes = 0
 
 
+#: Object-storage timeout, matching minio-py's own default
+#: (``Timeout(connect=300, read=300)``). Declared here rather than inlined so
+#: the restatement stays honest: supplying ``http_client`` replaces minio-py's
+#: PoolManager wholesale, so every one of its parameters has to be written out
+#: again, and a silently different timeout would be a behaviour change.
+_MINIO_TIMEOUT = 300.0
+
+
 def build_cache(settings: Settings) -> Any:
     """Redis when configured, otherwise a bounded in-process TTL cache."""
     if settings.redis_url:
@@ -129,13 +137,37 @@ def build_storage(settings: Settings) -> Any | None:
     """
     if not settings.minio_endpoint:
         return None
+
+    import os
+
+    import certifi
+    import urllib3
     from minio import Minio
+
+    # The pool size is supplied rather than left to minio-py, whose default of
+    # 10 connections per host is the one number here that is too small for how
+    # this service is used. urllib3 does not make a caller wait for a free
+    # connection: it opens an extra one and discards it on release, logging
+    # "Connection pool is full" each time. Past 10 concurrent uploads the
+    # sharing above therefore stops buying anything, and every upload pays its
+    # own TCP+TLS handshake -- the exact cost it exists to remove.
+    pool = urllib3.PoolManager(
+        timeout=urllib3.Timeout(connect=_MINIO_TIMEOUT, read=_MINIO_TIMEOUT),
+        maxsize=settings.minio_pool_size,
+        # minio-py's cert_check=True default, restated.
+        cert_reqs="CERT_REQUIRED",
+        ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
+        retries=urllib3.Retry(
+            total=5, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504]
+        ),
+    )
 
     return Minio(
         settings.minio_endpoint,
         access_key=settings.minio_access_key,
         secret_key=settings.minio_secret_key,
         secure=settings.minio_secure,
+        http_client=pool,
     )
 
 

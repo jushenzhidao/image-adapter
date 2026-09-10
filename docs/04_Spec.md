@@ -73,7 +73,7 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | 可观测 | logfire | pip 安装后回填 | OTel 标准；`logfire.instrument_fastapi(app)`，**capture_headers=False**（渠道头含凭据与脚本源码） |
 | 配置 | pydantic-settings | pip 安装后回填 | 环境变量类型安全 |
 | 热重载 | watchdog | pip 安装后回填 | 跨平台文件监听 |
-| 测试 | pytest + pytest-asyncio + httpx(ASGI TestClient) | pip 安装后回填 | 异步测试 |
+| 测试 | pytest + pytest-asyncio + httpx2(ASGI TestClient) | pip 安装后回填 | 异步测试；starlette 1.6 起以 httpx2 取代 httpx |
 | 部署 | Docker + Docker Compose | - | 卷挂载热更新 |
 | 图标库 | 不适用（纯 API 服务，无 UI）；任何文档/日志输出禁止 emoji | - | P0-1 |
 
@@ -150,6 +150,13 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | AC-30 | 批量放大 | When n=2 且 `STAGES` 含 3 级，系统必须按 `concurrency`(默认 3) 限并发，且 `adapter_stage_upstream_calls_total` 如实记录实际上游调用次数（BR-015） | P1 |
 | AC-31 | 输入跳过 | If 某级在 `request` 钩子中返回 `ctx.SKIP` 且入参缺失（如文生图无入图），系统必须跳过该级继续执行，不得报错 | P0 |
 
+### 9.2 v1.2 上游请求载体与 OpenAI 原生端点
+
+| 编号 | 功能 | EARS 验收标准 | 优先级 |
+|------|------|---------------|--------|
+| AC-32 | multipart 载体 | When 脚本在 `request` 相位调用 `ctx.emit(files={...})`，系统必须以 `multipart/form-data` 发起上游调用：返回值（与 `form`）作文本字段、`files` 作二进制部件（文件名/字节/类型），boundary 与 Content-Type 由引擎生成，且不得残留会缺失 boundary 的 Content-Type；`files` 的字段值接受单部件或部件列表，非 bytes 必须报错 | P0 |
+| AC-33 | OpenAI 原生两端点 | When 渠道 `X-Upstream-Url` 指向 generations 且请求含 `image`，脚本 `openai/images@v1` 必须改打同服务的 edits 姊妹端点（末段替换、保留 host 与 query，或按 `X-Channel-Options.edits_url`）并以上传文件的 multipart 发送（多图拼 `image[]`、`mask` 独立部件）；无 `image` 时保持 JSON 打 generations；响应与 `usage` 原样透传 | P0 |
+
 ## 10. 边界与约束
 
 - 单文件 ≤ 300 行；分层 routes → services(调度/引擎/级联) → infra(ctx/存储/缓存)，依赖只向下（code-organization 标准）
@@ -170,7 +177,7 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | 03_技术架构 §3.4 黑名单含 Subscript/Await | ast | 误封禁会导致所有正常脚本（下标/await）无法加载 | 沙箱只禁危险 import/调用/dunder 属性访问，不禁 Subscript/Await |
 | watchdog 回调在子线程，直接操作 asyncio 对象崩溃 | watchdog+asyncio | 线程边界 | 回调用 `loop.call_soon_threadsafe` 或仅做线程安全的 dict pop |
 | gunicorn UvicornWorker 下模块缓存为进程级 | gunicorn | 各 Worker 独立缓存 | 热重载靠每 Worker 各自的 watchdog 监听，无需跨进程同步 |
-| httpx/TestClient 测 SSE 需逐行读取 | pytest | SSE 非 JSON | 测试中按行解析 `data: ` 前缀 |
+| httpx2/TestClient 测 SSE 需逐行读取 | pytest | SSE 非 JSON | 测试中按行解析 `data: ` 前缀 |
 | 级联脚本被 30s 沙箱超时腰斩 | asyncio+stages | 30s 是墙钟，级联绝大部分时间在等上游 | 分层预算：声明 `STAGES` 后按总预算计，单次转换钩子仍 30s（BR-011） |
 | 各级超时相加溢出总预算 | stages | 每级独立 timeout 累加可远超总预算 | 每级实际超时取 `min(stage_timeout, ctx.remaining)` |
 | Pillow 同步调用阻塞事件循环 | Pillow+asyncio | resize/convert 是 CPU 密集同步操作 | `ctx.image` 内部走 `asyncio.to_thread`，不在事件循环里直接调 PIL |
@@ -276,6 +283,9 @@ curl -s -X POST localhost:8080/v1/images -H "Content-Type: application/json" \
 | 2026-09-09 | 级联收敛为「模块级 `STAGES` + phase 分发」，撤销 `orchestrate` 钩子、`ctx.upstream()`、YAML `pipelines` 三项设计 | 上游 URL 由 channel 头单值提供，跨上游编排无处落地；复用既有 `transform` 单一入口即可表达线性级联，不引入第二套执行路径 | 03_技术架构 §3.8/§7、04_Spec §2.1/§9.1/§10 |
 | 2026-09-09 | **AC-22~29、AC-31 实现落地**（AC-30 并发/计费未做）；新增 `degraded` phase | 降级时手上的中间产物是级间交接形状，直接返回会给出残缺 body，需脚本重新塑形 | 新增 `adapter/{budget,stages,stage_spec,transport}.py`、`adapter/utils/imageops.py`；改 `executor/context/channel/script_cache/errors/settings/api.pipeline` |
 | 2026-09-09 | `executor.py` 拆出 `transport.py`、`channel.py` 拆出 `stage_spec.py` | 两文件在加入级联后均超出 §10 的 300 行/文件约束 | executor 350→263、channel 356→246 |
+| 2026-09-10 | **AC-32/33 实现落地**：`ctx.emit(files=)` multipart 载体（`ctxapi/plan.py` 归一化 + `transport.build_multipart`）；新增内置脚本 `openai/images@v1`（generations JSON / edits multipart 分流）；mock 上游补 OpenAI 原生两端点与自省端点 | OpenAI 按载体拆两端点，JSON body 无法表达文件上传；沿用「厂商差异留在脚本、引擎只补协议无关原语」的分工，不把 OpenAI 语义写进引擎 | `ctxapi/plan.py`、`transport.py`、`script_store/openai/images@v1.py`、`mock_upstream/main.py`；新增 `tests/unit/test_emit_files.py`(10)、`tests/integration/test_openai_images_script.py`(11) |
+| 2026-09-10 | 新增依赖审计工作流 `deps-audit.yml`；`anyio` 4.15.0→4.15.1；`pyproject.toml` 给 starlette 加上界 `>=1.6.0,<2` | 原先 CI 只有测试、无依赖审计，公告只能靠人工发现；且 fastapi 对 starlette 只声明 `>=0.46.0` 无上界，走 pyproject 安装会静默拉入未来大版本 | 新增 `.github/workflows/deps-audit.yml`；改 `requirements.txt`、`pyproject.toml`；**release.yml 未改**（审计刻意不作发版门禁） |
+| 2026-09-10 | 测试依赖 `httpx` → `httpx2`（2.12.0） | starlette 1.6.0 的 `TestClient` 已优先导入 `httpx2`、回落到 `httpx` 时发弃用警告（"install httpx2 instead"）；httpx 稳定版停在 0.28.1（2024-12-06）且 issues/discussions 已关闭，Pydantic 以 `httpx2` 接管延续 | `pyproject.toml` 测试 extra、`requirements.txt`（+`httpcore2`/`truststore`，−`httpx`/`httpcore`）；**生产端 HTTP 客户端仍是 aiohttp，不在本次范围** |
 
 ---
 

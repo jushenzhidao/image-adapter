@@ -8,30 +8,19 @@ decorator cannot reach: router-level 404/405 and request validation.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import uuid
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from adapter.errors import InvalidRequestError
+from adapter.jsoncodec import JSON_LIBRARY, JSONResponse, loads
 
 logger = logging.getLogger(__name__)
 
-try:  # pragma: no cover - depends on the environment
-    import orjson
-
-    def _loads(raw: bytes) -> object:
-        return orjson.loads(raw)
-
-    JSON_PARSER = "orjson"
-except ImportError:  # pragma: no cover
-
-    def _loads(raw: bytes) -> object:
-        return json.loads(raw)
-
-    JSON_PARSER = "json"
+#: Which encoder actually parses and renders JSON. Reported once at startup so
+#: a deployment can tell at a glance whether the fast path is live.
+JSON_PARSER = JSON_LIBRARY
 
 # Below this size parsing costs less than the thread hand-off, so small
 # requests stay inline. Above it the parse is pure CPU on the event loop: a
@@ -44,9 +33,9 @@ async def parse_json_body(request: Request) -> dict:
     raw = await request.body()
     try:
         if len(raw) <= _INLINE_PARSE_LIMIT:
-            body = _loads(raw)
+            body = loads(raw)
         else:
-            body = await asyncio.to_thread(_loads, raw)
+            body = await asyncio.to_thread(loads, raw)
     except ValueError:
         # json.JSONDecodeError and orjson.JSONDecodeError both subclass this.
         raise InvalidRequestError("Request body must be valid JSON") from None

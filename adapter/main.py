@@ -37,6 +37,7 @@ from adapter.api.responses import responses_handler
 from adapter.context import build_cache, build_storage
 from adapter.error_handlers import install_error_handlers
 from adapter.logfire_setup import init_logfire, resolve_service_version
+from adapter.middleware.body_limit import BodyLimitMiddleware
 from adapter.middleware.cors import build_cors_middleware
 from adapter.middleware.logging import LoggingMiddleware
 from adapter.middleware.rate_limit import RateLimitMiddleware
@@ -174,10 +175,14 @@ async def lifespan(app: FastAPI):
     await app.state.state_store.close()
 
 
+# Outermost first. The body limit sits innermost on purpose: it must not
+# short-circuit ahead of the rate limiter, or an oversized upload would be a
+# way to hammer the service without ever being counted.
 middleware = [
     build_cors_middleware(settings),
     Middleware(LoggingMiddleware),
     Middleware(RateLimitMiddleware),
+    Middleware(BodyLimitMiddleware),
 ]
 
 app = FastAPI(

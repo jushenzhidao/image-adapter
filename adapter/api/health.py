@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
+from adapter.jsoncodec import JSONResponse
 from adapter.state_store import StateStore
 
 # The probe runs on a timer; a hung object store must not hold a worker.

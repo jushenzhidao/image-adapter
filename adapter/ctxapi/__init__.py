@@ -31,7 +31,7 @@ from adapter.ctxapi.base import CtxMixin, NeedsCodec, NeedsStorage
 from adapter.ctxapi.budget import BudgetMixin
 from adapter.ctxapi.codec import CodecMixin
 from adapter.ctxapi.image_ref import ImageRefMixin
-from adapter.ctxapi.plan import PlanMixin, RequestPlan
+from adapter.ctxapi.plan import FilePart, PlanMixin, RequestPlan
 from adapter.ctxapi.storage import StorageMixin
 
 #: Every mixin composed into ``AdapterContext``, in MRO order. Registering a
@@ -49,6 +49,7 @@ __all__ = [
     "BudgetMixin",
     "CodecMixin",
     "CtxMixin",
+    "FilePart",
     "ImageRefMixin",
     "NeedsCodec",
     "NeedsStorage",

@@ -1,5 +1,14 @@
 {
   "scripts": {
+    "openai/images": {
+      "latest": "v1",
+      "aliases": {
+        "stable": "v1"
+      },
+      "digests": {
+        "v1": "87b9856dea14a44f7e4949b68393273935052fcccad34d9d87bb91f6722e6b26"
+      }
+    },
     "volcengine_ark/images": {
       "latest": "v1",
       "aliases": {

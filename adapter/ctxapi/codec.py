@@ -22,6 +22,18 @@ _MAGIC: tuple[tuple[bytes, str], ...] = (
 )
 
 
+def _bare_base64(value: str) -> str:
+    """The base64 payload of a data URI, or the value unchanged.
+
+    Shared with ``image_ref.image_b64``, which hands this payload straight back
+    instead of re-encoding it -- so the no-prefix path must not copy, or the
+    saving that change exists for would be handed back at the door.
+    """
+    if value.startswith("data:") and ";base64," in value:
+        return value.split(";base64,", 1)[1]
+    return value
+
+
 class CodecMixin(CtxMixin):
     """Encoding helpers a script uses to move bytes into a vendor payload."""
 
@@ -31,10 +43,8 @@ class CodecMixin(CtxMixin):
 
     def decode_b64(self, value: str) -> bytes:
         """Accepts bare base64 or a data URI."""
-        if value.startswith("data:") and ";base64," in value:
-            value = value.split(";base64,", 1)[1]
         try:
-            return base64.b64decode(value, validate=True)
+            return base64.b64decode(_bare_base64(value), validate=True)
         except (binascii.Error, ValueError) as exc:
             raise InvalidRequestError(
                 "Image is not valid base64", param="image"

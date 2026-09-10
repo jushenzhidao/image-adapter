@@ -43,6 +43,7 @@ from adapter.transport import (
     build_request,
     parse_body,
     raise_for_status,
+    read_capped,
 )
 
 PHASE_AUTH = "auth"
@@ -106,7 +107,16 @@ async def _do_upstream(
     with logfire.span("upstream_call", method=method, url=url, timeout=timeout):
         try:
             async with ctx.http.request(method, url, **kwargs) as resp:
-                raw = await resp.read()
+                # Bounded read: the whole body is buffered, so an unbounded one
+                # is a direct path into this worker's memory.
+                raw = await read_capped(
+                    resp,
+                    settings.max_upstream_bytes,
+                    lambda detail: UpstreamError(
+                        detail, code="upstream_body_too_large", status=502
+                    ),
+                    label="Upstream response",
+                )
                 status = resp.status
                 content_type = resp.headers.get("Content-Type", "")
                 reply_headers = dict(resp.headers)
