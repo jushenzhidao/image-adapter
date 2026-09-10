@@ -61,6 +61,34 @@ jobs:
           docker push "$IMAGE:${{ steps.ver.outputs.version }}"
           docker push "$IMAGE:latest"
 
+      - name: Build changelog
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.ver.outputs.tag }}'
+          REPO_URL='https://github.com/${{ github.repository }}'
+          # --generate-notes relies on merged pull requests, and this repo pushes
+          # straight to main, so it emitted nothing but a compare link. Build the
+          # list from commits instead, which works with or without PRs.
+          #
+          # TAG^ peels the annotated tag to its commit and takes the first
+          # parent, so describe returns the PREVIOUS version tag, not this one.
+          PREV=''
+          if PREV="$(git describe --tags --abbrev=0 --match 'v*.*.*' "${TAG}^" 2>/dev/null)"; then
+            RANGE="${PREV}..${TAG}"
+          else
+            RANGE="${TAG}"   # first tagged release: list everything reachable
+          fi
+          {
+            if [ -n "$PREV" ]; then
+              printf '**Full changelog**: %s/compare/%s...%s\n\n' "$REPO_URL" "$PREV" "$TAG"
+              printf '## Changes since %s\n\n' "$PREV"
+            else
+              printf '## Initial release\n\n'
+            fi
+            git log --no-merges --pretty='- %s (%h)' "$RANGE"
+          } > CHANGELOG.md
+          cat CHANGELOG.md
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -68,15 +96,18 @@ jobs:
           set -euo pipefail
           gh release create '${{ steps.ver.outputs.tag }}' \
             --title '${{ steps.ver.outputs.tag }}' \
-            --generate-notes
+            --notes-file CHANGELOG.md
 
-      - name: Make container package public
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh api --method PATCH \
-            -H 'Accept: application/vnd.github+json' \
-            "users/${{ github.repository_owner }}/packages/container/$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')/visibility" \
-            -f visibility=public
+      # Package visibility is deliberately NOT automated here. The documented
+      # routes (PATCH /user/packages/{type}/{name} and the org equivalent) need a
+      # classic PAT with write:packages, because GITHUB_TOKEN cannot administer
+      # user-scoped packages -- the previous attempt at this called an
+      # undocumented path, returned 404 on every run, and hid it behind
+      # continue-on-error. Visibility is a one-time manual setting that persists
+      # across pushes, so verify it by hand after the first release:
+      #
+      #   anonymous pull proves it, no credentials needed:
+      #     TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:OWNER/NAME:pull&service=ghcr.io" \
+      #       | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+      #     curl -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOKEN" \
+      #       https://ghcr.io/v2/OWNER/NAME/manifests/latest   # 200 = public
