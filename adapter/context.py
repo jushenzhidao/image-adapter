@@ -339,8 +339,6 @@ class AdapterContext:
             logger.warning("[dev] MinIO not configured; returning a data URI")
             return self.data_uri(data, mime=f"image/{ext}")
 
-        from minio.error import S3Error
-
         key = f"temp/{self.request_id}/{uuid.uuid4()}.{ext}"
         try:
             self.storage.put_object(
@@ -351,7 +349,12 @@ class AdapterContext:
                 key,
                 expires=timedelta(seconds=self.settings.temp_image_ttl),
             )
-        except S3Error as exc:
+        except Exception as exc:
+            # The SDK raises a wide zoo: S3Error for XML error replies, but
+            # also InvalidResponseError (an nginx 404 page is not XML) and
+            # connection-level errors. Any of them means the object store is
+            # unusable, and the documented behaviour is to degrade to a data
+            # URI rather than fail the request.
             logger.error("MinIO upload failed (%s); falling back to a data URI", exc)
             return self.data_uri(data, mime=f"image/{ext}")
 

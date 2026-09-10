@@ -131,6 +131,19 @@ LOGFIRE_TOKEN="" .venv/bin/python -m pytest tests/integration -q
 2. **批量生成**：暂不支持 `n > 1`（需在适配器层聚合多次调用）
 3. **图片有效期**：生成的 URL 有效期 86400 秒（24小时）
 
+### 4. Seedream 5.0 pro 专属（2026-09-09 实测）
+
+- **图层拆分**：请求带 `"layer_decomposition": true` + 恰好 1 张输入图（prompt 可留空自动识别
+  主体），返回 底图(1 张 jpeg) + 最多 16 个透明 PNG 图层；`data[]` 每项额外携带
+  `z_index` / `name` / `description` / `bounding_box`（absolute 像素 + 0-1000 归一化坐标）。
+  脚本已通过 PASSTHROUGH 透传该参数，多图响应与元数据原样返回客户端。
+- **pro 不支持** `sequential_image_generation`（组图为 5.0-lite / 4.5 / 4.0 能力），
+  详见 script_store/volcengine_ark/images@v1.py 头部约束清单。
+- **`size` 支持 `1k` 档位**（直通不升级），计费约为 2K 的 1/4（实测 1K ≈ 4k tokens/张，
+  2K ≈ 16k tokens/张）；图层拆分按返回张数计费（11 张 ≈ 42k tokens）。
+- **usage 透传**：脚本 response 相位转发 ark 的 `usage`（`generated_images` 对图层拆分
+  即返回张数，控制面计费依赖此字段）。
+
 ## 参考文档
 - 官方文档: https://console.volcengine.com/ark/region:cn-beijing/docs/82379/1541523
 - 模型名称: `doubao-seedream-5-0-260128`
