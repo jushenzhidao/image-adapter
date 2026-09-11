@@ -248,6 +248,13 @@ def test_an_unknown_role_is_refused(client, vendor):
     )
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["code"] == "unsupported_parameter"
+    # The refusal names the offending role and the ones that would work. It must
+    # not blame multi-turn: that *is* accepted here, so the old wording
+    # ("turns a single user turn into one image") described a rule this channel
+    # no longer has and pointed the caller at the wrong fix.
+    message = resp.json()["error"]["message"]
+    assert "not a role this channel accepts" in message
+    assert "'usre'" in message and "assistant, developer, system, user" in message
 
 
 def test_an_unknown_content_part_is_refused(client, vendor):
@@ -465,6 +472,12 @@ def test_responses_unknown_role_is_refused(client, vendor):
     )
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["code"] == "unsupported_parameter"
+    # One wording serves both doors, so the two cannot drift apart.
+    message = resp.json()["error"]["message"]
+    assert message == (
+        "'input[0].role' is not a role this channel accepts: 'usre' "
+        "(expected one of assistant, developer, system, user)"
+    )
 
 
 def test_responses_input_folds_and_output_carries_the_image(client, vendor):

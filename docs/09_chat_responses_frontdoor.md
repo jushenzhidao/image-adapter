@@ -79,9 +79,11 @@ chat 请求体里没有 `prompt`，脚本 `payload.get("prompt", "")` 取到空�
 
 三条可核查的理由：
 
-1. `validate_images_body` 会拒绝 `response_format` 不是 `url`/`b64_json` 的值
-   （`api/images.py:70-74`）。chat 的 `response_format` 是 `{"type": ...}`（结构化输出控制），
-   原样透传**必然 400**；
+1. chat 的 `response_format` 是 `{"type": ...}`（结构化输出控制），与图片契约的
+   `url`/`b64_json` **同名不同义**，映射即错。规范校验（`api/images.py`）自 2026-09-11 起
+   把非法值判为「未指定」并**静默丢弃**、不再 400 ⇒ 原样透传不会再报错，
+   但会变成「调用方以为自己发出的控制被无声抹掉」——正是本前门要消灭的失败模式。
+   丢弃该字段的决定必须由前门**显式**做出，不靠校验兜底；
 2. **`openai/images@v1` 的文生图路径整体转发客户端 body**
    （`script_store/openai/images@v1.py:229`：`return dict(payload)`，注释写的就是
    "the canonical body is already the generations body"）。因此**残留任何一个 chat 专有字段

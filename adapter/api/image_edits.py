@@ -9,6 +9,8 @@ canonical images body and hand it to the same pipeline:
     image=@a.png (file)   ->     image: "<data URI>"
     image[]=@a,@b         ->     image: ["<data URI>", ...]
     mask=@m.png           ->     mask:  "<data URI>"
+    image= (empty part)   ->     <key omitted>  (text-to-image)
+    mask=  (empty part)   ->     <key omitted>  (nothing to mask)
     prompt=redraw the sky ->     prompt: "redraw the sky"
     n=2                   ->     n: 2            (int)
     n=abc                 ->     n: 1            (unparsable -> one image)
@@ -18,7 +20,15 @@ Uploads become data URIs rather than bare base64 so the mime type survives:
 ctx.image_url() and friends can then serve any upstream shape without
 re-sniffing. Validation is deliberately not duplicated — the normalised body
 goes through the same validate_images_body() as the JSON route, so both
-endpoints accept and reject exactly the same requests.
+endpoints accept and reject alike.
+
+One transport difference is real, and belongs here rather than in the shared
+validator: on multipart, an **empty part** is how the carrier reports that
+nothing was attached. HTML submits an untouched file input as a zero-length
+part, and a client whose file read failed does the same, so an empty `image`
+part means "no image" — the same thing `image: []` / `null` mean on the JSON
+door, and a text-to-image request must not come back a 400 over it. On the JSON
+door `""` is a value the caller typed, which is why that door still refuses it.
 """
 
 from __future__ import annotations
@@ -70,11 +80,18 @@ def _sniff_mime(data: bytes, declared: str | None) -> str:
     return "application/octet-stream"
 
 
-async def _read_upload(upload: UploadFile, param: str, max_bytes: int) -> str:
-    """One uploaded file -> data URI, size-capped."""
+async def _read_upload(upload: UploadFile, param: str, max_bytes: int) -> str | None:
+    """One uploaded file -> data URI, size-capped; None when it carries nothing.
+
+    None is the "no reference" answer, not a failure: a zero-length part is the
+    multipart spelling of "nothing was attached" (an untouched file input, or a
+    read that came back empty), which is the same statement `image: []` makes on
+    the JSON door. Failing the request over it would turn a text-to-image
+    request into a 400, so the caller decides what an empty field means.
+    """
     data = await upload.read()
     if not data:
-        raise InvalidRequestError(f"'{param}' must not be empty", param=param)
+        return None
     if len(data) > max_bytes:
         raise InvalidRequestError(
             f"'{param}' exceeds the {max_bytes} byte limit", param=param
@@ -119,18 +136,25 @@ async def normalise_edits_form(request: Request, max_bytes: int) -> dict:
             field = key[:-2] if key.endswith("[]") else key
 
             if field in FILE_FIELDS:
-                refs = [
-                    await _read_upload(v, field, max_bytes)
-                    for v in values
-                    if isinstance(v, UploadFile)
-                ]
-                # A string in a file field is still a usable reference: some
-                # clients post a URL where the spec wants an upload.
-                refs += [v.strip() for v in values if isinstance(v, str) and v.strip()]
+                refs: list[str] = []
+                for value in values:
+                    if isinstance(value, UploadFile):
+                        ref = await _read_upload(value, field, max_bytes)
+                        if ref:
+                            refs.append(ref)
+                    elif isinstance(value, str) and value.strip():
+                        # A string in a file field is still a usable reference:
+                        # some clients post a URL where the spec wants an upload.
+                        refs.append(value.strip())
                 if not refs:
-                    raise InvalidRequestError(
-                        f"'{field}' must be a file or a reference string", param=field
-                    )
+                    # The field carried nothing, so it was not really set: an
+                    # unfilled file input and `image=` both land here, and
+                    # `null` / `[]` say the same on the JSON door. Left out of
+                    # the body entirely -- rather than set to empty -- so
+                    # validate_images_body() reads an absent image, which is
+                    # text-to-image for `image` and "no mask" for `mask`, and so
+                    # a verbatim-forwarding script never sees the argument.
+                    continue
                 # mask is single-valued upstream; image collapses to a scalar
                 # when there is one reference so scripts see the same shape
                 # the JSON route produces.

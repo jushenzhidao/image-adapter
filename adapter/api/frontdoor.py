@@ -54,6 +54,10 @@ from adapter.errors import InvalidRequestError
 #: `developer` is OpenAI's newer spelling of `system`.
 _INSTRUCTION_ROLES = frozenset({"system", "developer"})
 
+#: Every role either door acts on, spelled out for the refusal below. Derived
+#: rather than hard-coded so a new instruction role cannot leave the hint stale.
+_ROLE_HINT = ", ".join(sorted({"user", "assistant"} | _INSTRUCTION_ROLES))
+
 #: Part types that carry text, and those that carry an image, across the whole
 #: OpenAI family. chat spells them `text` / `image_url`; responses spells the
 #: same two things `input_text` / `input_image`. Accepting either spelling on
@@ -235,8 +239,8 @@ def messages_to_canonical(body: dict) -> dict:
             continue
         else:
             raise InvalidRequestError(
-                "This channel turns a single user turn into one image; "
-                f"'{where}.role' is {role!r}.",
+                f"'{where}.role' is not a role this channel accepts: {role!r} "
+                f"(expected one of {_ROLE_HINT})",
                 param=f"{where}.role",
                 code=_UNSUPPORTED,
             )
@@ -336,8 +340,8 @@ def input_to_canonical(body: dict, prior: object = None) -> dict:
                     continue
                 if role not in (None, "user"):
                     raise InvalidRequestError(
-                        "This channel turns a single user turn into one image; "
-                        f"'{where}.role' is {role!r}.",
+                        f"'{where}.role' is not a role this channel accepts: "
+                        f"{role!r} (expected one of {_ROLE_HINT})",
                         param=f"{where}.role",
                         code=_UNSUPPORTED,
                     )

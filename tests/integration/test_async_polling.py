@@ -157,14 +157,15 @@ def test_script_ref_from_store(client, channel_headers, settings):
         "X-Script-Ref": "volcengine_ark/images@v1",
         "Content-Type": "application/json",
     }
-    # No upstream call is made when validation fails first; use a bad payload
-    # to stop at validation and prove the ref resolved (a missing ref would
-    # produce script_not_found before validation ordering matters). `n` is no
-    # longer usable here -- it is normalised rather than refused.
+    # No upstream call is made when validation fails first; use a payload that
+    # is still refused to stop at validation and prove the ref resolved (a
+    # missing ref would produce script_not_found before validation ordering
+    # matters). `n` and `response_format` are no longer usable here -- both are
+    # normalised rather than refused; a mask with no image still is not.
     resp = client.post(
         "/v1/images/generations",
         headers=headers,
-        json={"prompt": "cat", "response_format": "hologram"},
+        json={"prompt": "cat", "mask": "data:image/png;base64,AAAA"},
     )
     assert resp.status_code == 400
-    assert resp.json()["error"]["param"] == "response_format"
+    assert resp.json()["error"]["param"] == "mask"

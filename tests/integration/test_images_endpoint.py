@@ -32,14 +32,21 @@ def test_images_bad_n_is_normalised_rather_than_refused(client, channel_headers)
     assert resp.status_code != 400, resp.text
 
 
-def test_images_validation_bad_response_format(client, channel_headers):
+def test_images_bad_response_format_is_normalised_rather_than_refused(
+    client, channel_headers
+):
+    """A junk `response_format` no longer fails the request.
+
+    Same shape of proof as the `n` case above: the upstream here does not
+    resolve, so any non-400 shows validation let the call through. What the key
+    becomes is pinned in tests/unit/test_images_validation.py.
+    """
     resp = client.post(
         "/v1/images/generations",
         headers=channel_headers(IMAGES_SCRIPT, FAKE_UPSTREAM),
         json={"prompt": "cat", "response_format": "hologram"},
     )
-    assert resp.status_code == 400
-    assert resp.json()["error"]["param"] == "response_format"
+    assert resp.status_code != 400, resp.text
 
 
 def test_images_requires_script_header(client, channel_headers):

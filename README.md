@@ -4,7 +4,7 @@
 
 **以 `/v1/images/generations` 为唯一规范格式。** 文生图与图生图走同一个端点：带上 `image`（可选 `mask`）即图生图，`image` 支持 URL、data URI、裸 base64 三种形态，脚本侧用 `ctx.image_*` 统一转成上游要的那一种。
 
-`image` 传 `null` 或 `[]` **等同于不传**（即文生图）：该键会被**删除**而不是报错——留着它会被脚本原样转发给上游，而厂商不接受该参数。同理，`n` 不可用时**归一化为 1**而非拒绝整个请求。两者都是"能修就修"，不是放宽校验：真正含糊的输入（空字符串、没有 prompt 又没有图、非法 `response_format`）仍然报 400。
+`image` 传 `null` 或 `[]` **等同于不传**（即文生图）：该键会被**删除**而不是报错——留着它会被脚本原样转发给上游，而厂商不接受该参数。同理，`n` 不可用时**归一化为 1**；`response_format` 不是 `url`/`b64_json` 时（含 `null`、空串、chat 形态的 `{"type": ...}`）**判为「未指定」并删除该键**，由渠道自己的输出形态作答。三个字段都是「客户端没想认真说」的情形，各有安全读法：无图 / 一张图 / 渠道的输出形态。这是"能修就修"，不是放宽校验——真正含糊的输入（`image` 空字符串、没有 prompt 又没有图、`mask` 没有 image）仍然报 400。
 
 `/v1/images/edits` 只是它的 **multipart 前门**：OpenAI 把 edits 拆出去是载体差异（multipart 文件上传 vs JSON），不是语义差异，所以该路由不含任何适配逻辑，只做一次形态改写后汇入同一条管道——脚本永远只需实现一套契约。
 
@@ -19,11 +19,14 @@ OpenAI 类型配置、最终用户打过来的四个端点全部兼容，脚本�
 | `image[]=@a.png&image[]=@b.png` | `image: ["data:...", "data:..."]` |
 | `mask=@m.png` | `mask: "data:image/png;base64,..."` |
 | `image=https://cdn/a.png`（文本） | `image: "https://cdn/a.png"` |
+| `image=`（空 part／空文件） | 该键被**删除**（即文生图） |
 | `n=2` | `n: 2`（转 int） |
 | `n=abc`（无法解析） | `n: 1`（归一化，不报错） |
 | 厂商私有字段 | 原样透传为字符串 |
 
-上传文件转成 data URI 而非裸 base64，mime 由**magic number 嗅探**得出（SDK 常把 PNG 声明成 `application/octet-stream`），因此 `ctx.image_*` 后续无需再嗅探。校验不重复实现——改写后的 body 走 generations 同一个 `validate_images_body()`，两个端点接受与拒绝的请求完全一致。
+上传文件转成 data URI 而非裸 base64，mime 由 **magic number 嗅探**得出（SDK 常把 PNG 声明成 `application/octet-stream`），因此 `ctx.image_*` 后续无需再嗅探。改写的 body 仍走 generations 同一个 `validate_images_body()`，不做第二套校验。
+
+只有一处按载体区分：**multipart 分不清「字段没传」和「字段传了空值」**——HTML 未选文件就是提交一个长度 0 的 part，SDK 读到空文件也一样，这是载体本身的歧义，所以本门把它按「没传」处理（等同于 JSON 门的 `image: []`／`null`，即文生图），而不是报 400。JSON 与 chat／responses 门能表达这个区别，`image: ""` 这种**调用方主动写的空值**在那里仍然是 400。
 
 ## 职责边界
 
@@ -215,6 +218,7 @@ OpenAI 把图片任务按**载体**拆成两个端点：`/v1/images/generations`
 | `url` | `data:` URI 或 `b64_json` | 落对象存储换回真链接（**没配存储则原样返回**） |
 | `b64_json` | 链接（`http` 或 `data:`） | 取回 / 解码后重新编码 |
 | 不传 | 任意 | 不干预，原样透传 |
+| 非法值（`null`／`""`／`{"type":...}`） | 任意 | 同「不传」：该键在准入校验阶段已被删除，不报 400 |
 
 这正是 `docs/04_Spec.md` 的 AC-03 / AC-04（BR-007 / BR-008）。两点要清楚：
 `response_format=b64_json` 且上游只给链接时会发生下载，那个 host 必须在渠道的

@@ -228,18 +228,85 @@ def test_response_carries_created_and_trace_headers(client, channel_headers, ven
 # --- validation is shared with the JSON route -----------------------------
 
 
-def test_empty_upload_is_rejected(client, channel_headers, vendor):
+def test_empty_upload_falls_through_to_text_to_image(client, channel_headers, vendor):
+    """An empty file part is "nothing attached", not a malformed reference.
+
+    SDKs submit a zero-length part when the file read came back empty, and HTML
+    submits one for an untouched file input. Both mean the caller sent no image
+    -- the same statement `image: []` makes on the JSON door -- so the request
+    must reach the vendor as text-to-image instead of failing on the transport.
+    The key is dropped rather than blanked: a script that forwards the body
+    verbatim would otherwise hand the vendor an argument it refuses.
+    """
     resp = _post(
         client,
         _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
         files={"image": ("a.png", io.BytesIO(b""), "image/png")},
         data={"prompt": "x"},
     )
+    assert resp.status_code == 200, resp.text
+    assert "image" not in _Vendor.received
+    assert _Vendor.received["prompt"] == "x"
+
+
+def test_empty_image_text_field_falls_through_too(client, channel_headers, vendor):
+    """`image=` arrives as a string part, and means the same as an empty file."""
+    resp = _post(
+        client,
+        _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
+        data={"prompt": "x", "image": ""},
+    )
+    assert resp.status_code == 200, resp.text
+    assert "image" not in _Vendor.received
+
+
+def test_empty_upload_still_needs_a_prompt(client, channel_headers, vendor):
+    """Text-to-image and "nothing at all" stay distinguishable on this door.
+
+    Dropping the empty image makes this a generation request, and a generation
+    request without a prompt has nothing to generate from -- the shared
+    validator decides that, exactly as it does for `image: []` on the JSON door.
+    """
+    resp = _post(
+        client,
+        _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
+        files={"image": ("a.png", io.BytesIO(b""), "image/png")},
+        data={"prompt": "  "},
+    )
     assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["param"] == "image"
+    assert resp.json()["error"]["param"] == "prompt"
+
+
+def test_a_usable_reference_survives_an_empty_sibling(client, channel_headers, vendor):
+    """Repeated parts are independent: one empty does not lose the other."""
+    resp = _post(
+        client,
+        _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
+        files=[
+            ("image", ("a.png", io.BytesIO(b""), "image/png")),
+            ("image", _png("b.png")),
+        ],
+        data={"prompt": "x"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _Vendor.received["image"] == PNG_DATA_URI
+
+
+def test_empty_mask_upload_is_dropped(client, channel_headers, vendor):
+    """`mask: null` is an unset mask on the JSON door; an empty part is the same."""
+    resp = _post(
+        client,
+        _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
+        files={"image": _png(), "mask": ("m.png", io.BytesIO(b""), "image/png")},
+        data={"prompt": "x"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert "mask" not in _Vendor.received
+    assert _Vendor.received["image"] == PNG_DATA_URI
 
 
 def test_non_image_upload_is_rejected(client, channel_headers, vendor):
+    """Bytes that are not an image stay a refusal: the part is not empty."""
     resp = _post(
         client,
         _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
@@ -268,15 +335,37 @@ def test_non_integer_n_falls_back_to_one(client, channel_headers, vendor):
 
 
 def test_shared_validator_still_applies(client, channel_headers, vendor):
-    """A bad response_format is caught by validate_images_body on this door too."""
+    """The normalisation is the shared validator's, not this door's own.
+
+    `response_format=webp` is unusable, so validate_images_body() drops the key
+    before any script sees it -- this door must produce the canonical body the
+    JSON door produces. Asserted on what the *vendor* received, because that is
+    the contract the rewrite has to preserve.
+    """
     resp = _post(
         client,
         _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
         files={"image": _png()},
         data={"prompt": "x", "response_format": "webp"},
     )
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["param"] == "response_format"
+    assert resp.status_code == 200, resp.text
+    assert "response_format" not in _Vendor.received
+
+
+def test_an_unset_response_format_stays_unspecified(client, channel_headers, vendor):
+    """`response_format=` is how a form spells null, and null means "unset".
+
+    The whole field is dropped rather than forwarded blank: the channel's own
+    default shape is the answer, exactly as when the field is absent.
+    """
+    resp = _post(
+        client,
+        _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
+        files={"image": _png()},
+        data={"prompt": "x", "response_format": ""},
+    )
+    assert resp.status_code == 200, resp.text
+    assert "response_format" not in _Vendor.received
 
 
 def test_mask_without_image_is_rejected(client, channel_headers, vendor):
