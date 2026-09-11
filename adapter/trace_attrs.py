@@ -65,6 +65,16 @@ than stringified. That is also what keeps an unvalidated ``prompt`` out of the
 trace: a non-string prompt is accepted whenever an image is present (an
 image-only request needs no prompt), and ``str()`` on a nested object would
 dump it into the span.
+
+One further case is worth naming, because it is the one this context was
+missing longest: a request that never reaches ``execute`` at all. Admission,
+body parsing, validation, channel parsing and script loading can each refuse
+before any of the spans below exist, and those refusals used to leave behind
+nothing but an HTTP status. ``record_ingress_failure`` writes the client
+context onto an ``ingress_failed`` span for that case -- carrying the
+attributes that were *readable when the request died* and no others, so one
+refused before its body was parsed does not appear to have carried a prompt.
+The GenAI identity fields are left off: no model call happened.
 """
 
 from __future__ import annotations
@@ -73,6 +83,8 @@ import contextlib
 import time
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
+
+import logfire
 
 if TYPE_CHECKING:
     from logfire import LogfireSpan
@@ -135,7 +147,7 @@ def _split_refs(value: object) -> tuple[list[str], int, int]:
     return urls[:URL_COUNT_LIMIT], inline, dropped
 
 
-def summarise_request(payload: object) -> dict[str, Any]:
+def summarise_request(payload: object, *, genai: bool = True) -> dict[str, Any]:
     """The tracing attributes for one canonical client body.
 
     ``payload`` is the body the pipeline hands to the executor: already folded
@@ -143,11 +155,19 @@ def summarise_request(payload: object) -> dict[str, Any]:
     validated. Wrong-shaped input is still tolerated -- see the module
     docstring -- so an unrecognised payload yields no attributes rather than an
     exception.
+
+    ``genai=False`` withholds the GenAI identity fields. It exists for a span
+    describing a request that was refused *before* any upstream call, where
+    ``gen_ai.request.model`` would assert a model call that never happened --
+    and, through Logfire's exporter defaulting, mint a matching
+    ``gen_ai.response.model`` to go with it.
     """
     if not isinstance(payload, dict):
         return {}
 
-    attrs: dict[str, Any] = {"gen_ai.operation.name": OPERATION_IMAGE_GENERATION}
+    attrs: dict[str, Any] = {}
+    if genai:
+        attrs["gen_ai.operation.name"] = OPERATION_IMAGE_GENERATION
 
     prompt = payload.get("prompt")
     if isinstance(prompt, str) and prompt:
@@ -173,7 +193,8 @@ def summarise_request(payload: object) -> dict[str, Any]:
         # it is the reason a channel whose script takes the model from its own
         # options (`volcengine_ark`, which drops the body's) will show the
         # client's routing label in that column, not its access point.
-        attrs["gen_ai.request.model"] = model[:MODEL_LIMIT]
+        if genai:
+            attrs["gen_ai.request.model"] = model[:MODEL_LIMIT]
 
     for field in ("image", "mask"):
         value = payload.get(field)
@@ -259,6 +280,38 @@ def record_result(span: LogfireSpan, result: object) -> None:
     """
     for key, value in summarise_result(result).items():
         span.set_attribute(key, value)
+
+
+def record_ingress_failure(
+    endpoint: str, stage: str, payload: object, exc: Exception
+) -> None:
+    """Reports a request a front door refused before ``execute`` ever ran.
+
+    The counterpart of ``record_result``: that one answers "where is the
+    picture" for a call that succeeded, this one answers "what was asked for"
+    for a call that never reached the upstream. Between them, a request leaves
+    a span carrying its prompt however far it got.
+
+    ``stage`` names how far it *did* get -- ``admission`` / ``body`` /
+    ``validation`` / ``channel`` / ``script`` -- and is the honest half of this
+    function. The context is summarised from the payload as it stood when the
+    request died, so one refused at admission carries no ``prompt`` at all
+    rather than an empty one. The attribute set is the root span's minus
+    ``gen_ai.*``, and is *sparse by outcome* rather than uniformly present.
+
+    A refusal at the front door is not a model call, so the GenAI identity
+    fields stay off; claiming otherwise would put a fiction in the one place an
+    incident gets read from.
+    """
+    attrs: dict[str, Any] = {"endpoint": endpoint, "stage": stage}
+    status = getattr(exc, "status", None)
+    if status is not None:
+        attrs["status"] = status
+    attrs["error_code"] = getattr(exc, "code", None) or "error"
+    attrs.update(summarise_request(payload, genai=False))
+
+    with logfire.span("ingress_failed", **attrs):
+        pass
 
 
 # --- span timing -----------------------------------------------------------

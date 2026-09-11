@@ -19,12 +19,13 @@ from starlette.requests import Request
 from adapter.api.common import get_request_id, parse_json_body
 from adapter.channel import parse_channel
 from adapter.context import AdapterContext
-from adapter.errors import AdmissionError, ScriptSourceError
+from adapter.errors import AdapterError, AdmissionError, ScriptSourceError
 from adapter.executor import execute
 from adapter.jsoncodec import JSONResponse
 from adapter.script_source import resolve_source
 from adapter.settings import Settings
 from adapter.stages import execute_staged
+from adapter.trace_attrs import record_ingress_failure
 from adapter.transport import read_capped
 
 
@@ -109,26 +110,47 @@ async def adapt(
     form after normalising it, so both image routes share one pipeline.
     """
     settings: Settings = request.app.state.settings
-    check_admission(request, settings)
+    payload: dict | None = body
+    stage = "admission"
+    # Everything up to the script is a front door, and each step can refuse the
+    # request before `execute` ever runs. None of those refusals used to carry
+    # the client's prompt -- the one thing a content-policy 400 leaves
+    # unactionable -- so they are recorded here, while the payload is still in
+    # scope. `stage` says how far the request got, because an attribute that
+    # was never readable must not look like one that was.
+    try:
+        check_admission(request, settings)
 
-    request_id = get_request_id(request)
-    payload = body if body is not None else await parse_json_body(request)
-    if prepare is not None:
-        outcome = prepare(payload)
-        if inspect.isawaitable(outcome):
-            await outcome
-    channel = parse_channel(request.headers, settings)
+        stage = "body"
+        request_id = get_request_id(request)
+        if payload is None:
+            payload = await parse_json_body(request)
 
-    async def fetch(url: str) -> str:
-        return await _fetch_remote_script(url, settings)
+        stage = "validation"
+        if prepare is not None:
+            outcome = prepare(payload)
+            if inspect.isawaitable(outcome):
+                await outcome
 
-    source = await resolve_source(
-        channel,
-        settings,
-        fetch=fetch,
-        store=getattr(request.app.state, "script_store", None),
-    )
-    script = request.app.state.script_cache.load(source)
+        stage = "channel"
+        channel = parse_channel(request.headers, settings)
+
+        async def fetch(url: str) -> str:
+            return await _fetch_remote_script(url, settings)
+
+        stage = "script"
+        source = await resolve_source(
+            channel,
+            settings,
+            fetch=fetch,
+            store=getattr(request.app.state, "script_store", None),
+        )
+        script = request.app.state.script_cache.load(source)
+    except AdapterError as exc:
+        # AdapterError and nothing wider: CancelledError is a BaseException and
+        # has to keep travelling, or the phase cap silently stops working.
+        record_ingress_failure(endpoint, stage, payload, exc)
+        raise
 
     ctx = AdapterContext(
         request_id=request_id,
