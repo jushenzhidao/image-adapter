@@ -117,8 +117,8 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | AC-02 | images 批量 | When n=2 且上游不支持批量，系统必须内部聚合调用 2 次并返回 `len(data)==2` | P0 |
 | AC-03 | 输出统一 | If response_format=b64_json 且上游返回 URL，系统必须下载后编码为 b64_json（BR-007） | P0 |
 | AC-04 | 输出统一 | If response_format=url 且上游返回二进制，系统必须上传到当前 `STORAGE_BACKEND` 指向的对象存储并返回其 URL（minio 为预签名、fal 为公网长期）（BR-008）。无对象存储时不得为此失败请求，也不得把 data URI 冒充 url：退回上游自身的形态（通常为 b64_json） | P0 |
-| AC-05 | chat 文本 | When 纯文本 messages 请求，系统必须返回标准 ChatCompletion 结构（choices[0].message.content 非空） | P0 |
-| AC-06 | chat Vision | When messages 含 image_url，系统必须下载图片并按上游要求编码后重组请求 | P0 |
+| AC-05 | chat 文本 | When 纯文本 messages 请求，系统必须返回标准 ChatCompletion 结构（`choices[0].message.content` 非空；content 为 `type:image_url` 的 parts 数组同样算满足） | P0 |
+| AC-06 | chat Vision | When messages 含 image_url，系统必须把该图折入规范 `image` 并送达上游（**下载与否由脚本决定**，三态透传是合法实现） | P0 |
 | AC-07 | 流式桥接 | When stream=true 且上游非流式，系统必须拆分为合法 SSE chunk 流并以 `data: [DONE]` 结束 | P0 |
 | AC-08 | responses 工具 | When tools 含 image_generation，系统必须编排文本模型优化 prompt → 文生图 → 返回 output 数组含 message + image_generation_call | P0 |
 | AC-09 | responses 状态链 | When 携带 previous_response_id，系统必须从 Redis 取回历史上下文拼接；响应后写入新上下文 | P0 |
@@ -277,6 +277,7 @@ curl -s -X POST localhost:8080/v1/images -H "Content-Type: application/json" \
 | 2026-09-04 | v1.0 初版，锁定三端点完整骨架 + Mock 上游方案 | 用户确认 | 全部 |
 | 2026-09-04 | 修正 03_技术架构 §3.4 沙箱黑名单（移除 Subscript/Await） | 原设计会误杀全部合法脚本 | sandbox.py |
 | 2026-09-04 | aioredis → redis.asyncio | 包已废弃 | context/中间件 |
+| 2026-09-11 | chat / responses 改为「规范契约前门」（新增 `api/frontdoor.py`）：**路由按请求 path 折叠请求、封装响应**，脚本零改动；AC-05 / AC-06 措辞随之修订 | chat / responses 打图片脚本时请求体里没有 `prompt`，脚本发出空文本 part，上游报 `parts[0].data ... oneof` 未初始化（文案不提 `prompt`，极难定位） | api/chat.py、api/responses.py、api/frontdoor.py、utils/sse.py、script_store/google/images@v1.py（空 prompt 本地 400） |
 | 2026-09-09 | 新增 v1.1 级联范围（§2.1）、AC-22~31（§9.1）、级联已知坑 7 条 | 需支持「前处理+生成+后处理」「生成+超分」类级联 | engine.py/context.py/scripts |
 | 2026-09-09 | BR-003 缩小适用范围为纯转换钩子；新增 BR-011~016 | 单一 30s 墙钟超时会腰斩所有级联请求 | 02_业务架构 §6/§6.1 |
 | 2026-09-09 | ctx 新增 `image`/`stage`/`emit()`/`deadline`/`remaining`/`SKIP` | 前处理需图像操作、级间需传产物、各级需共享预算 | 03_技术架构 §3.5.1 |

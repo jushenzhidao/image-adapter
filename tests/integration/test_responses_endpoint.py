@@ -11,7 +11,7 @@ import pytest
 RESPONSES_SCRIPT = """
 async def transform(ctx, payload, phase):
     if phase == 'request':
-        return {'ask': payload['input']}
+        return {'ask': payload['prompt']}
     return {
         'output': [{
             'type': 'message',

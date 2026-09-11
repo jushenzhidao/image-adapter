@@ -6,6 +6,11 @@
 
 `/v1/images/edits` 只是它的 **multipart 前门**：OpenAI 把 edits 拆出去是载体差异（multipart 文件上传 vs JSON），不是语义差异，所以该路由不含任何适配逻辑，只做一次形态改写后汇入同一条管道——脚本永远只需实现一套契约。
 
+`/v1/chat/completions` 与 `/v1/responses` 是同一契约的**另外两个前门**（`adapter/api/frontdoor.py`）：前者把
+`messages` 折成 `prompt` + `image`，再把规范响应的 `data[]` 封装成 `choices[0].message.content`；后者折 `input`、
+封 `output[]`。**判定依据是请求打到的 path** —— 不靠渠道开关，也不需要脚本自述接受哪种请求体。于是渠道按
+OpenAI 类型配置、最终用户打过来的四个端点全部兼容，脚本侧一行不用改。
+
 | multipart/form-data | 规范 JSON |
 |---|---|
 | `image=@a.png`（文件） | `image: "data:image/png;base64,..."` |
@@ -255,6 +260,9 @@ adapter/
   api/pipeline.py    # 各端点共用的请求路径
   api/images.py      # 规范格式：generations（校验逻辑的唯一来源）
   api/image_edits.py # multipart 前门：改写形态后汇入 images
+  api/frontdoor.py   # chat / responses 前门：折叠进规范体 + 出口封装（纯函数）
+  api/chat.py        # /v1/chat/completions（前门 + SSE 桥）
+  api/responses.py   # /v1/responses（前门 + 状态链）
 script_store/        # 命名脚本库（默认后端，随镜像打包）
   manifest.json      # 可选：别名（@stable/@latest）+ 每版本 sha256
   volcengine_ark/images@v1.py

@@ -33,6 +33,15 @@ This vendor differs from the OpenAI-shaped ones in four ways the script absorbs:
 4. The response phase cannot see the client's request body, so
    `response_format` travels through a module-level table keyed by request_id.
 
+A missing prompt is refused locally instead of forwarded. An empty text part is
+a proto3 zero value, so the gateway drops it and the Part arrives with no oneof
+member set; the vendor then answers "parts[0].data: required oneof field 'data'
+must have one initialized field" (measured 2026-09-11), which names neither
+`prompt` nor "empty" and reads like a field-spelling bug. This includes the
+image-only request, which /v1/images/generations permits by design: this
+upstream draws from a text instruction, so an image reference alone gives it
+nothing to do.
+
 A 200 is not success upstream: safety blocks, refusals and "no image" all arrive
 as a normal response with no image parts. Those are turned into client-visible
 errors via ctx.fail() (adapter/ctxapi/fault.py) instead of a 500 or a silent
@@ -403,6 +412,15 @@ async def transform(ctx, payload, phase):
     model = caps["model"]
     ctx.emit(url=_model_url(ctx.upstream_url, model))
 
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        ctx.fail(
+            "'prompt' is required: this upstream generates from a text "
+            "instruction, so an image reference alone leaves it nothing to do",
+            param="prompt",
+            code="missing_prompt",
+        )
+
     n = payload.get("n", 1)
     if isinstance(n, int) and not isinstance(n, bool) and n > 1:
         ctx.fail(
@@ -463,7 +481,7 @@ async def transform(ctx, payload, phase):
         if block:
             config.update(block)
 
-    text_part = {"text": payload.get("prompt", "")}
+    text_part = {"text": prompt}
     if refs and ctx.options.get("image_text_order") == "text_last":
         parts = ref_parts + [text_part]
     else:

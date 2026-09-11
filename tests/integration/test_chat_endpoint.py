@@ -11,7 +11,7 @@ import pytest
 CHAT_SCRIPT = """
 async def transform(ctx, payload, phase):
     if phase == 'request':
-        return {'q': payload['messages'][-1]['content']}
+        return {'q': payload['prompt']}
     return {
         'id': 'chatcmpl-test1',
         'model': 'vendor-chat',
