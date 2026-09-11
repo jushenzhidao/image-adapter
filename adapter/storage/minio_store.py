@@ -42,33 +42,47 @@ class MinioStore:
         return self._client
 
     async def put(self, data: bytes, *, key: str, content_type: str) -> StoredObject:
-        url = await asyncio.to_thread(self._put_and_presign, data, key, content_type)
-        ttl = self._settings.temp_image_ttl
+        url = await asyncio.to_thread(self._put_and_url, data, key, content_type)
+        return self._describe(key, url)
+
+    def _describe(self, key: str, url: str) -> StoredObject:
+        """How a presigned result is reported: this URL *does* expire.
+
+        Split out because the URL's lifetime is the entire difference between
+        the two minio flavours, and each backend is the authoritative place to
+        state it (see ``MinioPublicStore._describe``).
+        """
         return StoredObject(
             url=url,
             key=key,
             visibility="presigned",
-            expires_at=time.time() + ttl,
+            expires_at=time.time() + self._settings.temp_image_ttl,
         )
 
-    def _put_and_presign(self, data: bytes, key: str, content_type: str) -> str:
+    def _put_and_url(self, data: bytes, key: str, content_type: str) -> str:
         """Blocking half of ``put``; runs in a worker thread.
 
-        The upload and the presign share one thread hop because they share a
-        bucket and a key: splitting them would pay for the hop twice.
+        Upload and URL share one thread hop because they share a bucket and a
+        key: splitting them would pay for the hop twice. The S3 call itself is
+        a separate method so the anonymous-read variant
+        (``MinioPublicStore``) can reuse it and replace only the URL built
+        afterwards.
         """
-        bucket = self._settings.minio_bucket
+        self._upload(data, key, content_type)
+        return self._client.presigned_get_object(
+            self._settings.minio_bucket,
+            key,
+            expires=timedelta(seconds=self._settings.temp_image_ttl),
+        )
+
+    def _upload(self, data: bytes, key: str, content_type: str) -> None:
+        """The put_object half, shared by every minio flavour."""
         self._client.put_object(
-            bucket,
+            self._settings.minio_bucket,
             key,
             io.BytesIO(data),
             len(data),
             content_type=content_type,
-        )
-        return self._client.presigned_get_object(
-            bucket,
-            key,
-            expires=timedelta(seconds=self._settings.temp_image_ttl),
         )
 
     async def ping(self) -> bool:

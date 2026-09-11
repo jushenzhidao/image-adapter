@@ -61,11 +61,32 @@ def test_aliases_resolve_to_the_base_model():
 
 def test_a_gateway_suffix_still_finds_the_base_model():
     """The regression that motivated the table: '-preview' used to miss entirely
-    and silently fall back to another model's capabilities."""
+    and silently fall back to another model's capabilities.
+
+    Uses a spelling that is NOT listed. Once an id has an entry of its own it is
+    matched first and forwarded verbatim -- see the next test for why one is.
+    """
+    caps = lookup("google", "gemini-3.1-flash-lite-image-preview", REPO_ROOTS)
+    assert caps is not None
+    assert caps["model"] == "gemini-3.1-flash-lite-image"
+
+
+def test_a_listed_suffixed_id_is_forwarded_verbatim():
+    """Measured 2026-09-11 against api.chatfire.cn: that gateway answers the bare
+    `gemini-3.1-flash-image` with 503 "no available channel for
+    gemini-3-pro-image" (the message names a post-mapping model, so it reads
+    like a bug on our side) while the `-preview` spelling returns an image.
+
+    So the suffix must not be stripped for a name the gateway's channels are
+    actually keyed on. Listing the id is what makes the loader match it before
+    the suffix loop, and that is the only difference between this test and the
+    one above.
+    """
     caps = lookup("google", "gemini-3.1-flash-image-preview", REPO_ROOTS)
     assert caps is not None
-    assert caps["model"] == "gemini-3.1-flash-image"
+    assert caps["model"] == "gemini-3.1-flash-image-preview"
     assert caps["tiers"] == ["512", "1K", "2K", "4K"]
+    assert caps["kind"] == "generate"
 
 
 def test_no_model_falls_back_to_the_declared_default():
@@ -86,6 +107,7 @@ def test_known_models_lists_the_shipped_ones():
         "gemini-2.5-flash-image",
         "gemini-3-pro-image",
         "gemini-3.1-flash-image",
+        "gemini-3.1-flash-image-preview",
         "gemini-3.1-flash-lite-image",
     )
 

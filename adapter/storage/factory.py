@@ -13,11 +13,14 @@ at startup. The translation layer stays capability-agnostic, so no
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from adapter.settings import Settings
 from adapter.storage.base import ObjectStore
 from adapter.storage.fal_store import FalStore, build_client
+from adapter.storage.fallback_store import FallbackStore
+from adapter.storage.minio_public_store import MinioPublicStore
 from adapter.storage.minio_store import MinioStore
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,7 @@ _MINIO_TIMEOUT = 300.0
 #: identical at the call site and only one of them deserves an operator.
 _REQUIRED_KEY: dict[str, str] = {
     "minio": "MINIO_ENDPOINT",
+    "minio_public": "MINIO_ENDPOINT",
     "fal": "FAL_KEY",
 }
 
@@ -60,6 +64,16 @@ def storage_configured(settings: Settings) -> bool:
 
 
 def _build_minio(settings: Settings, http: Any = None) -> ObjectStore | None:
+    """The presigned flavour: one client per process, or None when unconfigured."""
+    return _minio_store(settings, MinioStore)
+
+
+def _build_minio_public(settings: Settings, http: Any = None) -> ObjectStore | None:
+    """The anonymous-read flavour of the same bucket."""
+    return _minio_store(settings, MinioPublicStore)
+
+
+def _minio_store(settings: Settings, store_cls: type) -> ObjectStore | None:
     """One Minio client per process, or None when it is not configured.
 
     Building one per request (which ``ContextCore.storage`` used to do) throws
@@ -67,6 +81,9 @@ def _build_minio(settings: Settings, http: Any = None) -> ObjectStore | None:
     handshake and a bucket-region lookup. The client is thread-safe and holds
     no request state, so sharing it is safe. ``MinioStore.put`` calls it
     through ``asyncio.to_thread`` because the SDK is synchronous.
+
+    Shared by both minio flavours -- they differ only in the URL they hand
+    back, and the pool configuration below must not drift between them.
 
     ``http`` is accepted and ignored: the parameter exists so every builder has
     one signature, and this SDK carries its own urllib3 pool.
@@ -105,7 +122,7 @@ def _build_minio(settings: Settings, http: Any = None) -> ObjectStore | None:
         secure=settings.minio_secure,
         http_client=pool,
     )
-    return MinioStore(client, settings)
+    return store_cls(client, settings)
 
 
 def _build_fal(settings: Settings, http: Any = None) -> ObjectStore | None:
@@ -124,6 +141,7 @@ def _build_fal(settings: Settings, http: Any = None) -> ObjectStore | None:
 #: or None when unconfigured.
 _BUILDERS: dict[str, Callable[[Settings, Any], ObjectStore | None]] = {
     "minio": _build_minio,
+    "minio_public": _build_minio_public,
     "fal": _build_fal,
 }
 
@@ -133,12 +151,49 @@ def build_storage(settings: Settings, http: Any = None) -> ObjectStore | None:
 
     Returns None when the backend is unconfigured or unknown, which is the
     documented degradation: an absent store must never fail a request.
+
+    ``STORAGE_FALLBACK_BACKEND`` wraps the primary in a ``FallbackStore``. The
+    fallback is built from the same settings, so it needs its own credential
+    (FAL_KEY for fal) -- an unconfigured fallback is reported and dropped rather
+    than quietly ignored, because "failover" that never fires is worse than none.
     """
-    builder = _BUILDERS.get(settings.storage_backend)
+    primary = _build_one(settings.storage_backend, settings, http)
+    if primary is None:
+        return None
+
+    fallback = settings.storage_fallback_backend.strip()
+    if not fallback:
+        return primary
+
+    secondary = _build_one(fallback, settings, http)
+    if secondary is None:
+        logger.warning(
+            "STORAGE_FALLBACK_BACKEND=%s is not configured (%s is unset); "
+            "%s will serve alone",
+            fallback,
+            _REQUIRED_KEY.get(fallback, "its endpoint"),
+            primary.name,
+        )
+        return primary
+
+    logger.info(
+        "object storage: %s, falling back to %s for %ss after a failure",
+        primary.name,
+        secondary.name,
+        settings.storage_failover_cooldown,
+    )
+    return FallbackStore(
+        primary, secondary, cooldown=settings.storage_failover_cooldown
+    )
+
+
+def _build_one(name: str, settings: Settings, http: Any) -> ObjectStore | None:
+    """One backend by name, or None when it has no builder or no config."""
+    builder = _BUILDERS.get(name)
     if builder is None:
         logger.error(
             "storage_backend=%r has no builder; continuing without object storage",
-            settings.storage_backend,
+            name,
         )
         return None
     return builder(settings, http)

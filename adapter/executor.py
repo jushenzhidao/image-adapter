@@ -104,9 +104,17 @@ async def _do_upstream(
         timeout = budget.cap(timeout)
     kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
 
-    with logfire.span("upstream_call", method=method, url=url, timeout=timeout):
+    with logfire.span("upstream_call", method=method, url=url, timeout=timeout) as span:
         try:
             async with ctx.http.request(method, url, **kwargs) as resp:
+                # Status and headers are available as soon as the response
+                # line is in, so they are captured before the body: a reply we
+                # then refuse to read in full is still attributed to its code.
+                status = resp.status
+                content_type = resp.headers.get("Content-Type", "")
+                reply_headers = dict(resp.headers)
+                span.set_attribute("status", status)
+
                 # Bounded read: the whole body is buffered, so an unbounded one
                 # is a direct path into this worker's memory.
                 raw = await read_capped(
@@ -117,9 +125,6 @@ async def _do_upstream(
                     ),
                     label="Upstream response",
                 )
-                status = resp.status
-                content_type = resp.headers.get("Content-Type", "")
-                reply_headers = dict(resp.headers)
         except TimeoutError:
             # Which limit actually bit matters to the caller: an exhausted
             # budget means the whole request is over, while a stage timeout

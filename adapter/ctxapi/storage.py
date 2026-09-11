@@ -3,11 +3,15 @@
 Everything backend-specific lives in ``adapter.storage``; this mixin owns only
 the two things the engine decides:
 
-  * **the key convention** -- ``temp/<request-id>/<uuid>.<ext>``. Grouping by
-    request id keeps one request's objects together for an operator looking at
-    a bucket, and the uuid stops a second upload of identical bytes from
-    overwriting the first, which matters because the two may need different
-    lifetimes. A backend with no directories flattens it; see ``FalStore.put``.
+  * **the key convention** --
+    ``<prefix>/<yyyymmdd>/<request-id>/<uuid>.<ext>``. Grouping by request id
+    keeps one request's objects together for an operator looking at a bucket,
+    and the uuid stops a second upload of identical bytes from overwriting the
+    first, which matters because the two may need different lifetimes. The date
+    segment and the configurable prefix exist so a bucket lifecycle rule can
+    expire a day at a time and an operator can find an upload by when it
+    happened. A backend with no directories flattens the whole thing; see
+    ``FalStore.put``.
   * **the degradation contract** -- storage is an accelerator, so an absent or
     failing store must not fail the request. The caller gets a data URI and a
     log line instead.
@@ -23,6 +27,7 @@ them.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 
 from adapter.ctxapi.base import NeedsCodec
@@ -52,7 +57,7 @@ class StorageMixin(NeedsCodec):
             )
             return self.data_uri(data, mime=mime)
 
-        key = f"temp/{self.request_id}/{uuid.uuid4().hex}.{ext}"
+        key = self._temp_key(ext)
         try:
             stored = await store.put(data, key=key, content_type=mime)
         except Exception as exc:  # noqa: BLE001 - see the degradation contract
@@ -83,3 +88,16 @@ class StorageMixin(NeedsCodec):
             return self.data_uri(data, mime=mime)
 
         return stored.url
+
+    def _temp_key(self, ext: str) -> str:
+        """``<prefix>/<yyyymmdd>/<request-id>/<uuid>.<ext>``.
+
+        The date is the process's local date, so ``TZ`` decides where the
+        midnight boundary falls -- UTC in a container unless the deployment
+        says otherwise. That is deliberate: an operator reading the bucket
+        wants the date their own clock showed, and there is no client timezone
+        to derive one from.
+        """
+        prefix = self.settings.storage_key_prefix.strip("/") or "temp"
+        day = time.strftime("%Y%m%d")
+        return f"{prefix}/{day}/{self.request_id}/{uuid.uuid4().hex}.{ext}"

@@ -304,9 +304,10 @@ STORAGE_BACKEND=minio            # 对象存储后端：minio（预签名，会�
 MINIO_ENDPOINT=                  # 空 = data URI 降级（STORAGE_BACKEND=minio 时）
 FAL_KEY=                         # 空 = data URI 降级（STORAGE_BACKEND=fal 时）
 LOGFIRE_TOKEN=                   # 空 = 仅本地
-SCRIPT_TIMEOUT=30
-UPSTREAM_TIMEOUT=180
-POLL_TIMEOUT_DEFAULT=300
+SCRIPT_TIMEOUT=30            # 单个 transform() 调用的墙钟上限（不含等上游的时间）
+UPSTREAM_TIMEOUT=180         # 单次上游 HTTP 调用；等待出图看的就是这一项
+POLL_TIMEOUT_DEFAULT=120     # 异步 Job 轮询的总时长（不是单次轮询的间隔）
+STAGE_BUDGET_DEFAULT=300     # 多级级联的总预算，上限 STAGE_BUDGET_MAX=600
 ```
 
 ## 响应头

@@ -19,7 +19,9 @@ from adapter.channel import ChannelSpec
 from adapter.context import AdapterContext
 from adapter.settings import Settings
 from adapter.storage import (
+    FallbackStore,
     FalStore,
+    MinioPublicStore,
     MinioStore,
     StoredObject,
     build_storage,
@@ -47,6 +49,8 @@ def test_an_unknown_backend_fails_at_startup_instead_of_falling_back():
     [
         ("minio", {"minio_endpoint": ""}, "MINIO_ENDPOINT"),
         ("minio", {"minio_endpoint": "s3.example"}, None),
+        ("minio_public", {"minio_endpoint": ""}, "MINIO_ENDPOINT"),
+        ("minio_public", {"minio_endpoint": "s3.example"}, None),
         ("fal", {"fal_key": ""}, "FAL_KEY"),
         ("fal", {"fal_key": "k"}, None),
     ],
@@ -109,10 +113,12 @@ def test_the_shared_session_reaches_the_backend_that_needs_it(monkeypatch):
 class _FakeMinio:
     """The slice of minio-py this backend uses. Records what it was asked."""
 
-    def __init__(self, bucket_exists: bool = True) -> None:
+    def __init__(self, bucket_exists: bool = True, policy: str | None = None) -> None:
         self.objects: list[dict] = []
         self.presigns: list[tuple] = []
+        self.policy_reads: list[str] = []
         self._bucket_exists = bucket_exists
+        self._policy = policy
 
     def put_object(self, bucket, key, data, length, content_type=None):
         self.objects.append(
@@ -131,6 +137,13 @@ class _FakeMinio:
 
     def bucket_exists(self, bucket):
         return self._bucket_exists
+
+    def get_bucket_policy(self, bucket):
+        self.policy_reads.append(bucket)
+        if self._policy is None:
+            # What minio-py raises when the bucket has no policy at all.
+            raise RuntimeError("NoSuchBucketPolicy")
+        return self._policy
 
 
 def _minio_store(client: _FakeMinio, **overrides) -> MinioStore:
@@ -354,8 +367,44 @@ async def test_upload_uses_a_request_scoped_key_with_the_sniffed_extension():
 
     assert url == "https://cdn.test/x.png"
     key, content_type = store.calls[0]
-    assert key.startswith("temp/req-42/") and key.endswith(".webp")
+    # <prefix>/<yyyymmdd>/<request-id>/<uuid>.<ext>
+    prefix, day, request_id, name = key.split("/")
+    assert prefix == "temp"
+    assert day == time.strftime("%Y%m%d")
+    assert request_id == "req-42"
+    assert name.endswith(".webp")
     assert content_type == "image/webp"
+
+
+async def test_upload_puts_the_day_in_the_key_so_a_lifecycle_rule_can_use_it():
+    """The date has to be a stable path segment, else a bucket rule cannot
+    expire a day at a time and nobody can find an upload by when it happened."""
+    store = _RecordingStore()
+
+    await _ctx(store).upload_temp_image(PNG, ext="png")
+
+    key = store.calls[0][0]
+    assert key.split("/")[1] == time.strftime("%Y%m%d")
+
+
+async def test_upload_takes_the_key_prefix_from_settings():
+    """A deployment that already addresses its bucket through a convention of
+    its own (cdn/...) should not have to change the engine to keep it."""
+    store = _RecordingStore()
+
+    await _ctx(store, storage_key_prefix="cdn").upload_temp_image(PNG, ext="png")
+
+    assert store.calls[0][0].startswith("cdn/")
+
+
+async def test_an_empty_key_prefix_still_yields_a_usable_key():
+    """Empty or "/"-only would otherwise produce "//20260911/...", which some
+    S3 implementations treat as a different (empty) bucket path."""
+    store = _RecordingStore()
+
+    for value in ("", "/", "///"):
+        await _ctx(store, storage_key_prefix=value).upload_temp_image(PNG, ext="png")
+        assert store.calls[-1][0].startswith("temp/")
 
 
 async def test_upload_returns_a_data_uri_when_no_store_is_configured():
@@ -382,3 +431,330 @@ async def test_a_non_url_result_degrades_rather_than_reaching_a_client():
     url = await _ctx(store).upload_temp_image(PNG, ext="png")
 
     assert url.startswith("data:image/png;base64,")
+
+
+# --- minio_public: the same bucket, read anonymously -----------------------
+
+
+def _public_store(client: _FakeMinio, **overrides) -> MinioPublicStore:
+    overrides.setdefault("minio_endpoint", "s3.example")
+    overrides.setdefault("minio_bucket", "adapter-temp")
+    return MinioPublicStore(client, Settings(storage_backend="minio_public", **overrides))
+
+
+def test_minio_public_backend_builds_a_public_store():
+    store = build_storage(
+        Settings(storage_backend="minio_public", minio_endpoint="s3.example")
+    )
+
+    assert isinstance(store, MinioPublicStore)
+    # The name is what /health reports and what selected it, so it must match.
+    assert store.name == "minio_public"
+
+
+async def test_minio_public_returns_an_unsigned_url_that_never_expires():
+    """The whole point of this flavour: no signature, so no expiry to reach."""
+    client = _FakeMinio()
+
+    stored = await _public_store(client).put(
+        PNG, key="temp/req-1/x.png", content_type="image/png"
+    )
+
+    assert stored.url == "http://s3.example/adapter-temp/temp/req-1/x.png"
+    assert "X-Amz-Signature" not in stored.url
+    assert stored.visibility == "public"
+    assert stored.expires_at is None
+    # Signing is the thing being avoided, so it must not happen at all -- not
+    # merely be left out of the URL afterwards.
+    assert client.presigns == []
+    # The bytes still travel the same S3 call as the presigned flavour.
+    assert client.objects[0]["data"] == PNG
+    assert client.objects[0]["content_type"] == "image/png"
+
+
+async def test_minio_public_prefers_the_configured_origin():
+    """A bucket behind a CDN is addressed by that host, not by the S3 endpoint
+    -- which is why the override exists rather than always deriving."""
+    client = _FakeMinio()
+
+    stored = await _public_store(
+        client, minio_public_base_url="https://cdn.example/img/"
+    ).put(PNG, key="temp/req-1/x.png", content_type="image/png")
+
+    # A trailing slash on the override must not produce a doubled one.
+    assert stored.url == "https://cdn.example/img/temp/req-1/x.png"
+
+
+async def test_minio_public_url_is_https_when_the_endpoint_is_secure():
+    stored = await _public_store(_FakeMinio(), minio_secure=True).put(
+        PNG, key="k.png", content_type="image/png"
+    )
+
+    assert stored.url == "https://s3.example/adapter-temp/k.png"
+
+
+async def test_minio_public_ping_fails_when_the_bucket_has_no_policy():
+    """Uploads would succeed and every link would 403 at the caller. That is
+    the worst failure available here: the write path reports nothing wrong, so
+    the health probe is the only place it can surface."""
+    store = _public_store(_FakeMinio(policy=None))
+
+    assert await store.ping() is False
+
+
+async def test_minio_public_ping_still_requires_the_bucket_itself():
+    store = _public_store(_FakeMinio(bucket_exists=False, policy="{}"))
+
+    assert await store.ping() is False
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        # The three spellings of "everyone".
+        '{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject"}]}',
+        '{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject"]}]}',
+        '{"Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":"s3:*"}]}',
+        # A single statement may be an object rather than a list.
+        '{"Statement":{"Effect":"Allow","Principal":"*","Action":"*"}}',
+    ],
+)
+async def test_minio_public_ping_accepts_policies_that_allow_anonymous_reads(policy):
+    assert await _public_store(_FakeMinio(policy=policy)).ping() is True
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        # Deny is not Allow, whatever else it says.
+        '{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject"}]}',
+        # A named principal is not the anonymous one.
+        (
+            '{"Statement":[{"Effect":"Allow","Principal":'
+            '{"AWS":"arn:aws:iam::1:root"},"Action":"s3:GetObject"}]}'
+        ),
+        # Allow, everyone, but the wrong verb.
+        '{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject"}]}',
+        "not json at all",
+        "{}",
+        '{"Statement":[]}',
+    ],
+)
+async def test_minio_public_ping_rejects_policies_that_do_not_grant_reads(policy):
+    assert await _public_store(_FakeMinio(policy=policy)).ping() is False
+
+
+async def test_minio_public_ping_skips_the_policy_when_an_origin_is_configured():
+    """With a CDN in front the URLs do not address the bucket at all, so its
+    policy says nothing about whether they resolve -- asserting on it would
+    call a working deployment degraded."""
+    client = _FakeMinio(policy=None)
+    store = _public_store(client, minio_public_base_url="https://cdn.example")
+
+    assert await store.ping() is True
+    assert client.policy_reads == []
+
+
+# --- failover: the primary behind a negative cache -------------------------
+
+
+class _StubStore:
+    """A port implementation that fails on demand, for failover tests."""
+
+    def __init__(self, name: str, *, put_error=None, ping_ok: bool = True) -> None:
+        self.name = name
+        self.puts: list[str] = []
+        self.pings = 0
+        self.put_error = put_error
+        self.ping_ok = ping_ok
+
+    async def put(self, data: bytes, *, key: str, content_type: str) -> StoredObject:
+        self.puts.append(key)
+        if self.put_error is not None:
+            raise self.put_error
+        return StoredObject(
+            url=f"https://{self.name}.test/{key}", key=key, visibility="presigned"
+        )
+
+    async def ping(self) -> bool:
+        self.pings += 1
+        return self.ping_ok
+
+
+class _Clock:
+    """A monotonic clock a test can move, so no test has to sleep."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _failover(primary, secondary, *, cooldown: float = 30.0, clock=None) -> FallbackStore:
+    return FallbackStore(primary, secondary, cooldown=cooldown, clock=clock or _Clock())
+
+
+async def test_failover_uses_the_primary_when_it_works():
+    primary, secondary = _StubStore("primary"), _StubStore("secondary")
+
+    stored = await _failover(primary, secondary).put(
+        PNG, key="k.png", content_type="image/png"
+    )
+
+    assert stored.url.startswith("https://primary.test/")
+    assert secondary.puts == [], "the fallback must not be touched on the happy path"
+
+
+async def test_failover_uses_the_secondary_when_the_primary_fails():
+    primary = _StubStore("primary", put_error=RuntimeError("refused"))
+    secondary = _StubStore("secondary")
+
+    stored = await _failover(primary, secondary).put(
+        PNG, key="k.png", content_type="image/png"
+    )
+
+    assert stored.url.startswith("https://secondary.test/")
+
+
+async def test_a_parked_primary_is_not_retried_inside_the_cooldown():
+    """The whole point of the negative cache: a refused connection costs ~6s,
+    so retrying a dead primary on every upload would roughly double the
+    latency of every request while it is down."""
+    clock = _Clock()
+    primary = _StubStore("primary", put_error=RuntimeError("refused"))
+    secondary = _StubStore("secondary")
+    store = _failover(primary, secondary, cooldown=30.0, clock=clock)
+
+    for i in range(3):
+        await store.put(PNG, key=f"{i}.png", content_type="image/png")
+
+    assert len(primary.puts) == 1, "the parked primary was retried"
+    assert len(secondary.puts) == 3, "every upload must still be stored"
+
+
+async def test_the_primary_is_retried_once_the_cooldown_expires():
+    clock = _Clock()
+    primary = _StubStore("primary", put_error=RuntimeError("refused"))
+    store = _failover(primary, _StubStore("secondary"), cooldown=30.0, clock=clock)
+
+    await store.put(PNG, key="1.png", content_type="image/png")
+    clock.advance(31)
+    await store.put(PNG, key="2.png", content_type="image/png")
+
+    assert len(primary.puts) == 2, "the park must expire, not persist"
+
+
+async def test_a_recovered_primary_serves_again_and_the_fallback_stands_down():
+    clock = _Clock()
+    primary = _StubStore("primary", put_error=RuntimeError("refused"))
+    secondary = _StubStore("secondary")
+    store = _failover(primary, secondary, cooldown=30.0, clock=clock)
+
+    await store.put(PNG, key="1.png", content_type="image/png")  # parks
+    clock.advance(31)
+    primary.put_error = None
+    stored = await store.put(PNG, key="2.png", content_type="image/png")
+
+    assert stored.url.startswith("https://primary.test/")
+    assert len(secondary.puts) == 1, "the fallback should not be used after recovery"
+
+
+async def test_both_failing_propagates_so_the_caller_can_degrade():
+    """StorageMixin is the layer that turns a failure into a data URI; hiding it
+    here would conceal that both stores are down."""
+    primary = _StubStore("primary", put_error=RuntimeError("primary down"))
+    secondary = _StubStore("secondary", put_error=RuntimeError("secondary down"))
+
+    with pytest.raises(RuntimeError, match="secondary down"):
+        await _failover(primary, secondary).put(
+            PNG, key="k.png", content_type="image/png"
+        )
+
+
+async def test_failover_ping_is_true_when_either_side_can_serve():
+    assert (
+        await _failover(_StubStore("p", ping_ok=False), _StubStore("s")).ping() is True
+    )
+
+
+async def test_failover_ping_is_false_only_when_both_are_down():
+    down = _StubStore("p", ping_ok=False)
+    also_down = _StubStore("s", ping_ok=False)
+
+    assert await _failover(down, also_down).ping() is False
+
+
+async def test_failover_ping_probes_the_primary_even_while_it_is_parked():
+    """Finding out whether the primary came back is what a probe is for, and in
+    a monitored deployment it is what clears the park."""
+    clock = _Clock()
+    primary = _StubStore("primary", put_error=RuntimeError("down"))
+    store = _failover(primary, _StubStore("secondary"), cooldown=300.0, clock=clock)
+    await store.put(PNG, key="k.png", content_type="image/png")  # parks for 300s
+
+    await store.ping()
+
+    assert primary.pings == 1, "the park must not suppress the probe"
+
+
+def test_failover_name_names_both_halves():
+    """Log lines have to say which backend served, so neither may be implicit."""
+    store = _failover(_StubStore("minio"), _StubStore("fal"))
+
+    assert store.name == "minio+fal"
+
+
+def test_the_fallback_defaults_to_off():
+    assert Settings().storage_fallback_backend == ""
+    assert Settings().storage_failover_cooldown == 30
+
+
+def test_a_self_fallback_is_rejected_at_startup():
+    """It would look like failover in the config and in logs while trying the
+    same backend twice."""
+    with pytest.raises(ValidationError):
+        Settings(storage_backend="minio", storage_fallback_backend="minio")
+
+
+def test_build_storage_wraps_the_primary_when_a_fallback_is_configured():
+    # minio -> minio_public on purpose: it exercises the wiring without
+    # dragging the fal SDK into a unit test.
+    store = build_storage(
+        Settings(
+            storage_backend="minio",
+            minio_endpoint="s3.example",
+            storage_fallback_backend="minio_public",
+        )
+    )
+
+    assert isinstance(store, FallbackStore)
+    assert store.name == "minio+minio_public"
+
+
+def test_an_unconfigured_fallback_leaves_the_primary_alone():
+    """Failover that can never fire is worse than none, so it is reported and
+    dropped rather than quietly wrapped around nothing."""
+    store = build_storage(
+        Settings(
+            storage_backend="minio",
+            minio_endpoint="s3.example",
+            storage_fallback_backend="fal",
+            fal_key="",
+        )
+    )
+
+    assert isinstance(store, MinioStore)
+    assert not isinstance(store, FallbackStore)
+
+
+def test_no_fallback_configured_leaves_the_primary_unwrapped():
+    store = build_storage(
+        Settings(storage_backend="minio", minio_endpoint="s3.example")
+    )
+
+    assert isinstance(store, MinioStore)
+    assert not isinstance(store, FallbackStore)

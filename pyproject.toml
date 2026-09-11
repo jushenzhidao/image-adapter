@@ -31,11 +31,18 @@ test = [
     "pytest-asyncio>=1.4.0",
     "httpx2>=2.0.0",
 ]
-# Object-storage backends that are not installed by default. fal-client pulls in
-# httpx, httpx-sse, msgpack, websockets, aiofiles and asyncstdlib; the last four
-# serve its queue/streaming/realtime model-calling paths, none of which this
-# adapter uses. Installing it only where STORAGE_BACKEND=fal keeps that weight
-# off every other deployment -- and off every image build that only needs minio.
+# fal-client pulls in httpx, httpx-sse, msgpack, websockets, aiofiles and
+# asyncstdlib; the last four serve its queue/streaming/realtime model-calling
+# paths, none of which this adapter uses.
+#
+# The extra is kept for a dev install (`pip install -e '.[fal]'`), but it is no
+# longer the only route: `requirements.txt` now lists fal-client too, so the
+# Docker image carries it unconditionally. That was deliberate -- switching a
+# deployment to STORAGE_BACKEND=fal is an env change, and without the SDK
+# already in the image it makes the container fail to start (build_client
+# raises ImportError and build_storage is called unguarded in the lifespan).
+# The weight is therefore paid by every image now; the alternative was making
+# a config switch require a rebuild.
 fal = [
     "fal-client>=1.0.1",
 ]

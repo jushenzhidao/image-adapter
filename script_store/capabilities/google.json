@@ -42,7 +42,33 @@
       "accepts": ["prompt", "image", "size", "response_format"],
       "ignores": ["n", "quality", "watermark", "mask"]
     },
-    "gemini-3-pro-image": {
+    "gemini-3.1-flash-image-preview": {
+    "kind": "generate",
+    "tiers": [
+      "512",
+      "1K",
+      "2K",
+      "4K"
+    ],
+    "wide": true,
+    "outputs": [
+      "image"
+    ],
+    "async": false,
+    "accepts": [
+      "prompt",
+      "image",
+      "size",
+      "response_format"
+    ],
+    "ignores": [
+      "n",
+      "quality",
+      "watermark",
+      "mask"
+    ]
+  },
+  "gemini-3-pro-image": {
       "kind": "generate",
       "tiers": ["1K", "2K", "4K"],
       "wide": true,
@@ -57,7 +83,8 @@
     "wide": "accepts the extreme ratios (1:4, 4:1, 1:8, 8:1); false means they must fall back to a nearer ratio.",
     "shared": "vendor-wide facts merged into every model entry by the loader, so a list shared by the whole family is written once.",
     "ratios": "every ratio the family documents, as vendor-spelled strings (\"16:9\").",
-    "kind": "generate | format | enhance | erase | watermark | beauty. Lets a script pick defaults and lets an orchestrator reason about a chain.",
+    "suffixes": "server-side suffixes a gateway may append to a stable id; the loader strips one to find the base entry. A spelling listed under `models` is matched BEFORE stripping and is therefore forwarded VERBATIM -- which is how a gateway whose channels are keyed on the suffixed name gets served. Measured 2026-09-11 against api.chatfire.cn: the bare `gemini-3.1-flash-image` is answered 503 \"no available channel for gemini-3-pro-image\" (the message names a post-mapping model, so it looks like a bug on our side), while `gemini-3.1-flash-image-preview` returns an image. Hence the preview id has its own entry.",
+  "kind": "generate | format | enhance | erase | watermark | beauty. Lets a script pick defaults and lets an orchestrator reason about a chain.",
     "outputs": "what one call produces (image | mask | text). An orchestrator uses it to check a chain is satisfiable - no consumer yet.",
     "async": "the upstream answers with a task id instead of a result (needs X-Async polling).",
     "accepts": "OpenAI-contract fields this model actually uses.",

@@ -383,6 +383,26 @@ def test_url_response_format_without_storage_falls_back_to_base64(client, vendor
     assert "url" not in item
 
 
+def test_a_listed_suffixed_id_reaches_the_upstream_verbatim(client, vendor):
+    """Measured live 2026-09-11, and the reason the table lists this id.
+
+    api.chatfire.cn answers the bare `gemini-3.1-flash-image` with 503 "no
+    available channel for gemini-3-pro-image" -- the message names a
+    post-mapping model, so the failure looks like ours -- while
+    `gemini-3.1-flash-image-preview` returns an image. Suffix-stripping would
+    turn the spelling the channels are keyed on into one they do not serve.
+    """
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"model": "gemini-3.1-flash-image-preview", "prompt": "a fox"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    call = _call()
+    assert call["path"] == "/v1beta/models/gemini-3.1-flash-image-preview:generateContent"
+
+
 def test_channel_options_can_pin_the_config_style_and_ratio(client, vendor):
     resp = client.post(
         "/v1/images/generations",
