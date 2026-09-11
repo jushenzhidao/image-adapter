@@ -147,3 +147,29 @@ def test_rate_limiting_is_off_until_a_deployment_turns_it_on() -> None:
     deployment is free to enable the limiter without turning this test red.
     """
     assert Settings.model_fields["rate_limit_enabled"].default is False
+
+
+def test_the_action_bounds_stay_under_the_phase_bound() -> None:
+    """The action bounds exist to *name* a failure, not to police one.
+
+    ``image_download_timeout`` / ``storage_upload_timeout`` do not keep a request
+    from running away -- ``script_timeout`` does that -- they only have to fire
+    *first*, so a slow fetch is reported as a fetch rather than as the script
+    running long. A bound at or above ``script_timeout`` can never fire first,
+    and the misattribution they were added to fix comes back silently: the code
+    is still there, every test still passes, and the error names the wrong layer
+    again. That is what this guards.
+
+    Read from the class defaults rather than a constructed ``Settings``, which
+    would also pick up whatever the local ``.env`` happens to say -- a deployment
+    is free to move all three together.
+    """
+    fields = Settings.model_fields
+    phase = fields["script_timeout"].default
+    for name in ("image_download_timeout", "storage_upload_timeout"):
+        bound = fields[name].default
+        assert bound < phase, (
+            f"{name} ({bound}s) must stay below script_timeout ({phase}s), "
+            "otherwise it can never fire first and its failure is reported as "
+            "script_timeout -- the wrong layer"
+        )

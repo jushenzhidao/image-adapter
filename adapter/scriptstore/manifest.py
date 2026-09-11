@@ -7,6 +7,18 @@ cannot express:
   * **aliases** — a moving label such as ``stable`` or ``latest`` that points
     at a concrete version. Channels can say ``vendor/mj@stable`` and be moved
     forward by editing one file instead of every channel header.
+
+    Moving one forward takes effect on the next **process start**, not on the
+    next request: this file is read once, in ``DirStore.__init__``, and the store
+    is built once at startup. That is the opposite of the script text itself,
+    which is re-read whenever its ``(mtime_ns, size)`` changes -- so a hot-fixed
+    script in an overlay directory needs no restart while an alias edit does.
+    An operator who has learned the first behaviour will get this one wrong, so
+    it is worth stating twice: **edit the manifest, restart the process.**
+
+    Aliases only rewrite a ref that *has* a version. ``@v1`` is passed through
+    untouched, which is what makes pinning a real escape valve -- and why a
+    version must never be written as an alias for another one.
   * **digests** — the expected sha256 per version, so a root can be audited.
     A mismatch is refused rather than silently served.
 

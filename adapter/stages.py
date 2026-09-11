@@ -41,6 +41,7 @@ from adapter.executor import (
 )
 from adapter.script_cache import PHASE_DEGRADED, CompiledScript
 from adapter.settings import Settings
+from adapter.trace_attrs import phase_summary, record_result, summarise_request
 
 
 class StageOutcome:
@@ -197,13 +198,17 @@ async def execute_staged(
     payload: Any = client_payload
     last_artefact: Any = None
 
+    # Same client context as the single-call path (adapter.trace_attrs): a
+    # cascade has no `adapt` span, so without this a staged channel's failures
+    # would be the only ones in the trace with no prompt to read.
     with logfire.span(
         "cascade",
         endpoint=ctx.endpoint,
         script_sha256=script.sha256[:12],
         stages=list(stages),
         budget_s=budget.total,
-    ):
+        **summarise_request(client_payload),
+    ) as cascade_span, phase_summary(cascade_span, ctx):
         # The auth phase is cascade-wide, not per stage: one credential serves
         # every call, and the headers it emits survive each stage's plan reset
         # because the engine re-applies them on every outbound call.
@@ -253,6 +258,14 @@ async def execute_staged(
                 ctx.stage[stage] = artefact
                 last_artefact = artefact
                 payload = artefact
+
+        # The artefact the cascade is about to return. Taken here because a
+        # span cannot be written to once it is closed, and it is the last
+        # stage's output that carries the image. A cascade that degrades and is
+        # then reshaped by the `degraded` phase therefore reports the link of
+        # the image it fell back to, which is the one the caller receives.
+        if last_artefact is not None:
+            record_result(cascade_span, last_artefact)
 
     if last_artefact is None:
         raise ScriptRuntimeError(

@@ -71,21 +71,56 @@ class Settings(BaseSettings):
     upstream_host_allowlist: str = ""
 
     # --- Timeouts ----------------------------------------------------------
-    # Four bounds apply to one request and they are kept separate on purpose:
+    # Six bounds apply to one request and they are kept separate on purpose:
     # which one fired is what the caller sees, so merging them would make the
     # error code lie (AC-27).
     #
-    #   script_timeout        each transform() call       504 script_timeout
-    #   upstream_timeout      one upstream HTTP call      504 upstream_timeout
-    #   poll_timeout_default  one async job, all polls    504 poll_timeout
-    #   stage_budget_default  the whole cascade           504 pipeline_timeout
+    #   script_timeout         each transform() call       504 script_timeout
+    #   upstream_timeout       one upstream HTTP call      504 upstream_timeout
+    #   poll_timeout_default   one async job, all polls    504 poll_timeout
+    #   stage_budget_default   the whole cascade           504 pipeline_timeout
+    #   image_download_timeout one client image fetch      504 image_download_timeout
+    #   storage_upload_timeout one object-store upload     degrades (see below)
     #
     # Only upstream_timeout bounds waiting on the vendor, so that is the knob
     # for a slow model. script_timeout bounds the script function itself and
     # does NOT include that wait, so a slow generation never needs it raised.
+    #
+    # The last two are a different kind of bound: not a phase and not a
+    # generation, but one action a script performs *inside* a phase. They exist
+    # because script_timeout was carrying that job by accident -- an
+    # unreachable client image ate the entire phase budget and then reported
+    # `script_timeout`, which names the wrong layer and sends the reader to the
+    # vendor. They are short for the same reason: fetching a reference image is
+    # not a generation.
+    #
+    # They bound the action, never the phase. A phase that performs several
+    # actions can still reach script_timeout, and that stays the honest answer
+    # for "the script itself ran too long".
 
     # Wall clock for one transform() call, enforced by _call_phase.
     script_timeout: float = 30.0
+    # Wall clock for one image fetch (ctx.download_image). Its job is
+    # *attribution*, not policing: what stops a request running away is the
+    # phase cap (script_timeout), and this bound only has to fire *first* so the
+    # failure is reported as a download rather than as the script running long.
+    #
+    # That is why it sits just under script_timeout instead of far below it. Too
+    # short and it fails work the phase would have finished: a 20 MB image -- the
+    # hard per-image cap -- needs 20s at 1 MB/s, so a 15s bound turns legitimate
+    # slow fetches into 504s. Too long (>= script_timeout) and it can never fire
+    # first, so the misattribution this exists to fix comes back silently. Keep
+    # the two related when either moves; tests/unit/test_config_keys.py asserts
+    # the ordering.
+    image_download_timeout: float = 25.0
+    # Wall clock for one object-store upload (ctx.upload_temp_image). Same
+    # attribution job as the download bound, and the same reason for sitting
+    # just under script_timeout. It clears the fal backend's measured 21.97s
+    # outlier against a ~1.6s median, so it only fires on an upload that is
+    # genuinely wedged. A timeout here degrades to a data URI exactly like every
+    # other storage failure -- the store is an accelerator -- and the trace
+    # carries `storage_upload_timeout` as the reason.
+    storage_upload_timeout: float = 25.0
     # Default wall clock for one outbound HTTP call, and the value that
     # decides how long a generation may take. The shipped .env raises it to
     # 180s because a 2K Ark generation measures 27~82s. A script may override
@@ -127,6 +162,17 @@ class Settings(BaseSettings):
     http_pool_limit_per_host: int = 20
     http_dns_cache_ttl: int = 300
     http_keepalive_timeout: float = 30.0
+
+    # --- Concurrent materialisation ----------------------------------------
+    # How many per-item calls one ctx fan-out may have in flight. This is a
+    # ceiling on *our* fan-out, not a throttle on the vendor: the pool above is
+    # a per-worker resource limit, so exceeding it queues inside aiohttp and the
+    # queued time is charged to the action's own timeout (adapter/utils/fanout).
+    #
+    # Three because a multi-reference edit is two to four images and that is the
+    # only fan-out today; the request-phase budget (script_timeout) is what the
+    # larger N is really bounded by, so a big cap would buy nothing.
+    fanout_concurrency: int = 3
 
     # Hard ceiling on a single upstream response body. Every reply is buffered
     # in full -- one buffer per in-flight request, see ``executor._do_upstream``

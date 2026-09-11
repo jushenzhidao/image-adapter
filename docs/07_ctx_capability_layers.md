@@ -539,10 +539,85 @@ X-Stage-Timeout: total=300                    # 总预算，已有机制
 **因此本项目那条"未做项"——`ctx.gather()`（单请求并发多上游）——优先级正式下调**：它不是"待补的能力"，  
 而是**被刻意排除的设计**。真需要并发，说明该由控制面拆成多个请求去做（它才有重试与额度语义）。
 
+#### 14.2.1 排除到哪里为止：并发生成调用 ❌ / 并发素材物化 ✅
+
+上面那条排除有个容易误伤的范围，这里划清楚。**被排除的是"一次请求内并发发起多个上游生成
+调用"**（`ctx.gather()` 的本义：`n>1` 扇出、多级并行、DAG）。**不属于**排除范围的是
+**素材物化（materialization）**——把一次请求已经在手上的 N 个素材搬进来或搬出去：
+
+| 动作 | 例子 | 属于被排除的"编排"吗 |
+| --- | --- | --- |
+| 读入站素材 | N 张客户端图片的下载 / base64 解码 | ❌ 不是 |
+| 取出站产物 | 上游已返回的 N 个 `data[]` 逐项取回、落存储 | ❌ 不是 |
+| 写素材 | N 张图的 `upload_temp_image`（re-host、`response_format=url`） | ❌ 不是 |
+| **并发生成调用** | `n>1` 扇出、多级并行、DAG | ✅ **是，仍然排除** |
+
+判据是机械的三条，**缺一不可**：
+
+1. **不产生额外的上游生成调用**。并发的是客户端的入站素材，或**已经计过费**的产物搬运
+   —— 上游调用次数与计费口径（`n × len(STAGES)`）都不因并发改变。
+2. **失败语义不变**。仍是"任一子任务失败即整体失败"，错误码与串行时逐个一致。
+   这一条把并发化限定在**本来就 fail-fast 的路径**上，不引入"局部成功、部分计费"。
+3. **并发度有上限**。受 `fanout_concurrency`（默认 3）约束；
+   注意它**不是** `docs/04_Spec.md` AC-30 里那个给"`n` 次上游调用"用的 `concurrency`，
+   两者服务的是不同对象，别合并成一个配置项。
+
+#### 14.2.2 承载点：`ctx.fanout`（✅ 已实施 2026-09-12）
+
+脚本**自己拿不到并发**：`sandbox.ALLOWED_STDLIB` 是纯 stdlib 白名单且排除 `asyncio`，
+`adapter.*` 内部也不可导入（实测 `import asyncio` / `concurrent.futures` / `anyio` / `httpx`
+全部 `Forbidden import`）。所以并发物化只能由框架借出这一个入口：
+
+```python
+results = await ctx.fanout(items, work)      # work: async (item) -> value
+```
+
+- **保序**：`results[i]` 属于 `items[i]`，与完成顺序无关。
+- **限量**：同时在飞不超过 `fanout_concurrency`。
+- **失败语义不变**：按**输入顺序**重抛最早的失败并保留其类型 ⇒ 脚本 `ctx.fail()` 的 400 仍是 400。
+  ⚠️ 不能用 `asyncio.TaskGroup`：它把子任务的异常包进 `ExceptionGroup`，而 `_call_phase` 的
+  `except AdapterError` 匹配不到 ⇒ **400 变 500**（实测）。这就是必须用
+  `gather(return_exceptions=True)` 的原因。
+- `work` **允许闭包**（可捕获 `ctx` 与局部量）—— 否则"先下载再 re-host"这类两步操作无法表达。
+- **空列表不调用任何东西；单项走串行路径** ⇒ N=1 与旧行为逐字节相同。
+
+实现：`adapter/utils/fanout.py`（原语）+ `adapter/ctxapi/fanout.py`（门面）。
+8 项单测，并做过**变异自证**：退回串行 / 去掉上限 / 按完成序收集，三种错法都会报红。
+首个消费者是 `openai/images@v2`（**`v1` 原样不动**，`latest` 前移到 v2、`stable` 留在 v1）。
+
+**§14.2 的结论不变**：不做并发生成调用、不做 DAG、`stages.py` 级联仍严格串行、
+`ctx.gather()` 仍是"被刻意排除的设计"。本节只是把**排除到哪里为止**写出来，
+免得下一个人把"不并发"读成"连 N 张图的输入都不能一起取"。
+
+两条实现约束（实测得出，写在这里免得重踩）：
+
+- **禁止用 `asyncio.TaskGroup` 做扇出**。它会把脚本 `ctx.fail()` 抛出的 `AdapterError` 包进
+  `ExceptionGroup`，而 `executor._call_phase` 的 `except AdapterError` 匹配不到 → 落到
+  `except Exception` → `ScriptRuntimeError` → **该报 400 的变成 500**。并且脚本侧无法用
+  `except*` 解包（`_call_phase` 在引擎里，不在脚本沙箱内）。必须用
+  `asyncio.gather(..., return_exceptions=True)` 再手动挑出首个 `AdapterError` 重抛。
+- **有共享可变状态的循环不能直接并发**。`google/images@v1` 的 `inline_total_max_bytes` 额度单元
+  （`allowance`）是"读后写"，且写入点都在 `await` 之后；直接并发会让**哪张图被 inline 变成
+  非确定行为**，护栏失效。这类只能拆成**两阶段**：并发阶段只做 I/O，额度分配仍按输入顺序串行。
+
+> 顺带纠正一处措辞：`script_store/openai/images@v1.py` 里那句
+> "The adapter never fans out to several upstream calls" 把"下载产物"和"调用上游"当成了同一件事。
+> 该处串行的真实理由是它属于**素材物化**而当时没有并发设施，不是它"像上游调用"。
+
 ### 14.3 代价与边界（诚实说清楚）
 
 - **延迟叠加**是串行的固有代价。缓解手段是**总预算控制**（`X-Stage-Timeout` 的 cascade budget）  
-  与**尽早降级**，而不是加并发。
+  与**尽早降级**，而不是加并发。唯一的例外是 §14.2.1 的素材物化：那里的并发压的是*等待*，
+  不是编排；但它也**不改变各级延迟相加**这条算式，只是把同一级内的 N 次 I/O 折叠成一次等待。
+- **素材物化的并发只压缩 I/O 等待，压不动 CPU**：`binascii` **不释放 GIL**（实测见 `docs/06`），
+  base64 编解码仍然串行占着 event loop，因此收益上限 ≈ **(N−1)/N × 网络等待时长**
+  ——低 RTT 同域时接近零，跨境大图时才明显。**先测收益再动手**，别把"加上 `gather`"当成优化。
+- **后端差异决定并发是否真有效**：fal 侧是一次 `await client.upload(...)`（`FalStore.put`），
+  实测一次 1603ms 的 `put` 期间事件循环 tick 了 139 次 ⇒ **未阻塞**；4 路并发 `put` wall 6198ms
+  vs 串行 10719ms（比值 0.58）。minio-py 是**同步库**，`MinioStore.put` 走 `asyncio.to_thread`，
+  并发有效但占用默认线程池 `min(32, cpu+4)`。**存储后端不是"上游"**，两者都不受
+  `HTTP_POOL_LIMIT_PER_HOST` 约束——那个池只管 `ctx.http`。这两组数字来自本地报告
+  `reports/2026-09-11_fal-object-storage/`（**该目录未入库**，所以结论写在这里）。
 - 上游只支持异步时，**转同步会占用一个 worker 连接最长 `poll timeout`**。所以：
   - 异步上游的 `poll` 间隔别太小（默认 2~3s 足够），`timeout` 要显式给（默认 300s 可能不够）；
   - 这类渠道的并发上限要按"单请求占用时长"折算，而 `HTTP_POOL_LIMIT_PER_HOST` 是 per-worker 的资源上限，  

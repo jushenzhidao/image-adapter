@@ -85,13 +85,21 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # CRITICAL. The adapter's UPSTREAM_TIMEOUT is 180s because a 2K
-        # generation takes 27~82s against Ark. nginx's default is 60s: left
-        # alone it cuts the connection while the adapter is still waiting, so
-        # the caller gets a 504 while the upstream call keeps running and keeps
-        # burning quota. Keep this strictly above UPSTREAM_TIMEOUT.
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        # CRITICAL, and the ORDERING is the point:
+        #     nginx  >  GUNICORN_TIMEOUT  >  UPSTREAM_TIMEOUT
+        # nginx's default is 60s: left alone it cuts the connection while the
+        # adapter is still waiting, so the caller gets a 504 while the upstream
+        # call keeps running and keeps burning quota. The general rule is that
+        # whichever layer gives up first is the one the caller sees -- and it is
+        # usually not the one that knows why. nginx therefore sits ABOVE
+        # gunicorn, so a reaped worker's own error reaches the caller instead of
+        # an nginx-generated 504 that hides which layer failed.
+        #
+        # Sized for the shipped .env: UPSTREAM_TIMEOUT=600 (a 2K generation
+        # measures 27~82s against Ark, so 60s truncates slow successes) and
+        # GUNICORN_TIMEOUT=960. Raise this whenever those move.
+        proxy_read_timeout 1000s;
+        proxy_send_timeout 1000s;
         proxy_connect_timeout 10s;
 
         # MUST for /v1/chat/completions with stream=true. The adapter bridges a

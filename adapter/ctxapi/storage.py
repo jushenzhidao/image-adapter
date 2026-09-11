@@ -27,11 +27,13 @@ them.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
 
 from adapter.ctxapi.base import NeedsCodec
+from adapter.trace_attrs import span_elapsed_ms
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,21 @@ class StorageMixin(NeedsCodec):
         -- the returned URL is public and does not expire, because fal's
         retention is account-level policy. A caller that has to be able to
         stop an object being readable needs an ACL, not a shorter TTL.
+
+        Bounded by ``storage_upload_timeout``, and a timeout degrades exactly
+        like every other backend failure -- the store is an accelerator, so a
+        wedged upload returns a data URI instead of failing the request. The
+        bound buys the *attribution*: without it the upload runs into the phase
+        cap and is reported as ``script_timeout``, and on the fal backend the
+        degradation leaves no trace at all.
+
+        The guard around the store stays ``except Exception`` on purpose. A
+        wider ``except BaseException`` would swallow the task's cancellation --
+        which is how the phase cap arrives -- and a phase that swallows it keeps
+        running and then returns normally, so ``script_timeout`` would quietly
+        stop working. The inner ``asyncio.timeout`` is what makes a timeout
+        visible to this guard: it converts the cancellation into a
+        ``TimeoutError``, which *is* an ``Exception``.
         """
         store = self.storage
         mime = f"image/{ext}"
@@ -59,8 +76,34 @@ class StorageMixin(NeedsCodec):
             return self.data_uri(data, mime=mime)
 
         key = self._temp_key(ext)
+        # The upload gets its own span because it is the slowest thing a script
+        # does that is not the upstream call: the fal backend measured a 21.97 s
+        # outlier against a ~1.6 s median, and the 30 s phase cap is under 1.4x
+        # that outlier. Without this span, a request the cap killed reports only
+        # the phase it died in.
         try:
-            stored = await store.put(data, key=key, content_type=mime)
+            with self.logfire.span(
+                "storage_put", store=store.name, bytes=len(data), ext=ext
+            ) as span, span_elapsed_ms(span):
+                # A second guard, deliberately. The outer one turns any failure
+                # into a data URI, so the exception never reaches the span and a
+                # degraded upload would read as a clean one -- and for the fal
+                # backend that degradation is otherwise invisible to the caller.
+                try:
+                    async with asyncio.timeout(
+                        self.settings.storage_upload_timeout
+                    ):
+                        stored = await store.put(data, key=key, content_type=mime)
+                except Exception as exc:  # noqa: BLE001 - re-raised unchanged
+                    span.set_attribute("outcome", "error")
+                    span.set_attribute(
+                        "error_code",
+                        "storage_upload_timeout"
+                        if isinstance(exc, TimeoutError)
+                        else type(exc).__name__,
+                    )
+                    raise
+                span.set_attribute("outcome", "ok")
         except Exception as exc:  # noqa: BLE001 - see the degradation contract
             # The backends raise a wide zoo between them: S3Error and
             # InvalidResponseError from minio-py (an nginx 404 page is not

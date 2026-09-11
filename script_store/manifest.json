@@ -1,30 +1,33 @@
 {
   "scripts": {
     "openai/images": {
-      "latest": "v1",
+      "latest": "v2",
       "aliases": {
         "stable": "v1"
       },
       "digests": {
-        "v1": "d392b782ee003ac6f0aa7c1f4b62b4e7510fbe5ab0e662c3a2912cf46f22f872"
+        "v1": "d392b782ee003ac6f0aa7c1f4b62b4e7510fbe5ab0e662c3a2912cf46f22f872",
+        "v2": "ca4b79447106b064cc513a5b88a67c437dc9c2c33db54916605f21a433c43f27"
       }
     },
     "volcengine_ark/images": {
-      "latest": "v1",
+      "latest": "v2",
       "aliases": {
-        "stable": "v1"
+        "stable": "v2"
       },
       "digests": {
-        "v1": "aea29194912d20de8b0e5178918139773eae734f745a84f52d025609e57d206d"
+        "v1": "aea29194912d20de8b0e5178918139773eae734f745a84f52d025609e57d206d",
+        "v2": "170051d7b5d59937b850b96ce0a03e45783e403e23ff48971c39c31fcfc254d4"
       }
     },
     "google/images": {
-      "latest": "v1",
+      "latest": "v2",
       "aliases": {
         "stable": "v1"
       },
       "digests": {
-        "v1": "6937809539e5351cedfe32407e81cff305358adf774b23b752dc0914768d3210"
+        "v1": "6937809539e5351cedfe32407e81cff305358adf774b23b752dc0914768d3210",
+        "v2": "63d410905043d63758a560dece5505f276acbd627ad1b4d45648c802591b940c"
       }
     }
   }

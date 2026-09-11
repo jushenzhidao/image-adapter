@@ -303,6 +303,22 @@ tests/               # 单元（沙箱/工具/组装/存储）+ 集成（真实 
 要强校验就打开 `SCRIPT_PIN_MANIFEST_DIGESTS=true`。清单损坏（非法 JSON、
 结构不对）只记 warning 并按「无清单」处理，不会连带其它 ref 一起失败。
 
+⚠️ **改清单要重启，改脚本不用** —— 两者语义不同，别把脚本的热改经验套到清单上：
+
+| 改什么 | 何时生效 | 原因 |
+|---|---|---|
+| 挂载目录里的**脚本 `.py`** | **立即**，无需重启 | 读取缓存按 `(mtime_ns, size)` 校验，改文件即换缓存键 |
+| `manifest.json`（别名 / 摘要） | **必须重启**（或滚动发布） | 清单在 `DirStore.__init__` 里 `load_manifest` 读一次，而 store 是进程启动时建一次的 |
+
+实测：同一进程内把 `stable` 从 `v1` 改成 `v2`，`@stable` 仍然解析到 `v1`；
+新建 store 实例后才变成 `v2`。要**不重启**换版本，只有两条路 —— 改渠道头的
+`X-Script-Ref` 指向具体版本（如 `@v2`），或把脚本放进 overlay 目录。
+
+别名只影响**带版本号的 ref**：`@stable` / `@latest` 会被查表改写，而 `@v1` 这种
+具体版本**原样透传**（`Manifest.resolve` 只在 `ref.version` 是别名时才改写）。
+这就是「钉住旧版本」的逃生阀 —— `@v1` 永远指向 v1 那个文件，
+无论别名怎么前移，也**绝不要**把 `v1` 写成指向 `v2` 的别名。
+
 ## 关键环境变量
 
 ```bash
@@ -323,6 +339,9 @@ SCRIPT_TIMEOUT=30            # 单个 transform() 调用的墙钟上限（不含
 UPSTREAM_TIMEOUT=180         # 单次上游 HTTP 调用；等待出图看的就是这一项
 POLL_TIMEOUT_DEFAULT=120     # 异步 Job 轮询的总时长（不是单次轮询的间隔）
 STAGE_BUDGET_DEFAULT=300     # 多级级联的总预算，上限 STAGE_BUDGET_MAX=600
+IMAGE_DOWNLOAD_TIMEOUT=25    # 单次客户端图片下载；紧贴 SCRIPT_TIMEOUT 下方，只负责「报自己」不是「掐时间」
+STORAGE_UPLOAD_TIMEOUT=25    # 单次对象存储上传；超时按既有契约降级成 data URI
+FANOUT_CONCURRENCY=3         # 单请求内并发物化条数（ctx.fanout：N 张图下载 / 取回 / 上传）
 ```
 
 ## 响应头

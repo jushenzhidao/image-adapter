@@ -5,7 +5,7 @@ so each new helper edited the same file that owns request lifecycle and infra
 handles. The helpers change far more often than the lifecycle does, so they
 now live in one module per concern and the context is assembled from them:
 
-    class AdapterContext(CodecMixin, ImageRefMixin, StorageMixin,
+    class AdapterContext(CodecMixin, ImageRefMixin, StorageMixin, FanoutMixin,
                          BudgetMixin, PlanMixin, ContextCore)
 
 Composition rules that keep this extensible without surprises:
@@ -31,6 +31,7 @@ from adapter.ctxapi.base import CtxMixin, NeedsCodec, NeedsStorage
 from adapter.ctxapi.budget import BudgetMixin
 from adapter.ctxapi.caps import CapsMixin
 from adapter.ctxapi.codec import CodecMixin
+from adapter.ctxapi.fanout import FanoutMixin
 from adapter.ctxapi.fault import FaultMixin
 from adapter.ctxapi.image_ref import ImageRefMixin
 from adapter.ctxapi.mapping import MappingMixin
@@ -45,6 +46,7 @@ CTX_MIXINS = (
     CodecMixin,
     ImageRefMixin,
     StorageMixin,
+    FanoutMixin,
     BudgetMixin,
     PlanMixin,
     FaultMixin,
@@ -56,6 +58,7 @@ __all__ = [
     "CapsMixin",
     "CodecMixin",
     "CtxMixin",
+    "FanoutMixin",
     "FaultMixin",
     "FilePart",
     "ImageRefMixin",

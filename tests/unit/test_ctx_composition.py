@@ -33,6 +33,7 @@ SCRIPT_API = (
     "sniff_mime",
     "download_image",
     "upload_temp_image",
+    "fanout",
     "image_bytes",
     "image_b64",
     "image_data_uri",

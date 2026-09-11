@@ -26,6 +26,7 @@ from adapter.ctxapi import (
     BudgetMixin,
     CapsMixin,
     CodecMixin,
+    FanoutMixin,
     FaultMixin,
     ImageRefMixin,
     MappingMixin,
@@ -154,6 +155,14 @@ class ContextCore:
 
         self.plan = RequestPlan()
 
+        # Wall clock per script phase, accumulated by ``executor._call_phase``
+        # so the request span can report where the time went
+        # (``adapter.trace_attrs.phase_summary``). Summed rather than sampled
+        # because the polled phases run in a loop, and counted because a sum
+        # alone cannot tell one long call from many short ones.
+        self.phase_ms: dict[str, float] = {}
+        self.phase_calls: dict[str, int] = {}
+
         # Cascade state. Both stay inert on the single-stage path: `_budget` is
         # attached by the stage runner, and `stage` is the read-only record of
         # what earlier stages produced.
@@ -172,6 +181,17 @@ class ContextCore:
         self._storage = storage
 
         self.logfire = logfire_module
+
+    # --- instrumentation ---------------------------------------------------
+
+    def record_phase(self, phase: str, elapsed_ms: float) -> None:
+        """Accumulates one script phase's wall clock. Engine-facing.
+
+        Not a script helper: a script may call it, but no part of the contract
+        depends on it, and the only reader is the span reporting the request.
+        """
+        self.phase_ms[phase] = self.phase_ms.get(phase, 0.0) + elapsed_ms
+        self.phase_calls[phase] = self.phase_calls.get(phase, 0) + 1
 
     # --- infra handles -----------------------------------------------------
 
@@ -236,6 +256,7 @@ class AdapterContext(
     CodecMixin,
     ImageRefMixin,
     StorageMixin,
+    FanoutMixin,
     BudgetMixin,
     PlanMixin,
     FaultMixin,

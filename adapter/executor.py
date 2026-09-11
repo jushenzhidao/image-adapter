@@ -38,6 +38,12 @@ from adapter.errors import (
 )
 from adapter.script_cache import CompiledScript
 from adapter.settings import Settings
+from adapter.trace_attrs import (
+    phase_summary,
+    record_result,
+    span_elapsed_ms,
+    summarise_request,
+)
 from adapter.transport import (
     UpstreamReply,
     build_request,
@@ -53,6 +59,28 @@ PHASE_POLL_REQUEST = "poll_request"
 PHASE_POLL_RESPONSE = "poll_response"
 
 
+def _note_phase(
+    span: Any,
+    ctx: AdapterContext,
+    phase: str,
+    started: float,
+    outcome: str,
+    error_code: str | None,
+) -> None:
+    """Closes the books on one phase: the span, then the request's tally.
+
+    ``outcome`` is what separates "the script ran for 28 s" from "the cap cut it
+    off at 30 s", which the error code alone cannot say -- both end as a 504
+    naming the phase.
+    """
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    span.set_attribute("elapsed_ms", round(elapsed_ms, 1))
+    span.set_attribute("outcome", outcome)
+    if error_code is not None:
+        span.set_attribute("error_code", error_code)
+    ctx.record_phase(phase, elapsed_ms)
+
+
 async def _call_phase(
     script: CompiledScript,
     ctx: AdapterContext,
@@ -60,18 +88,37 @@ async def _call_phase(
     phase: str,
     timeout: float,
 ) -> Any:
-    """Runs one phase with a wall-clock cap, normalizing script failures."""
-    try:
-        result = script.transform(ctx, payload, phase)
-        if inspect.isawaitable(result):
-            result = await asyncio.wait_for(result, timeout=timeout)
-    except TimeoutError:
-        raise ScriptTimeoutError(phase, timeout) from None
-    except AdapterError:
-        raise
-    except Exception as exc:
-        raise ScriptRuntimeError(phase, type(exc).__name__) from exc
-    return result
+    """Runs one phase with a wall-clock cap, normalizing script failures.
+
+    Publishes the ``script_phase`` span that docs/03 §5.2 already promises. The
+    timeout error names the phase but never says how long it ran or whether the
+    cap is what stopped it, and with several phases in one request (a cascade
+    multiplies them) that gap is the difference between reading a trace and
+    guessing at one.
+    """
+    started = time.monotonic()
+    outcome = "ok"
+    error_code: str | None = None
+
+    with logfire.span("script_phase", phase=phase, timeout=timeout) as span:
+        try:
+            result = script.transform(ctx, payload, phase)
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, timeout=timeout)
+        except TimeoutError:
+            outcome, error_code = "timeout", "script_timeout"
+            raise ScriptTimeoutError(phase, timeout) from None
+        except AdapterError as exc:
+            # A script-reported failure is a real outcome, not a defect: record
+            # which one so the span distinguishes a 400 from a crash.
+            outcome, error_code = "error", exc.code
+            raise
+        except Exception as exc:
+            outcome, error_code = "error", type(exc).__name__
+            raise ScriptRuntimeError(phase, type(exc).__name__) from exc
+        finally:
+            _note_phase(span, ctx, phase, started, outcome, error_code)
+        return result
 
 
 def _phase_supported(script: CompiledScript, phase: str) -> bool:
@@ -104,7 +151,9 @@ async def _do_upstream(
         timeout = budget.cap(timeout)
     kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
 
-    with logfire.span("upstream_call", method=method, url=url, timeout=timeout) as span:
+    with logfire.span(
+        "upstream_call", method=method, url=url, timeout=timeout
+    ) as span, span_elapsed_ms(span):
         try:
             async with ctx.http.request(method, url, **kwargs) as resp:
                 # Status and headers are available as soon as the response
@@ -125,6 +174,10 @@ async def _do_upstream(
                     ),
                     label="Upstream response",
                 )
+                # Set only once the body was actually read, on the same rule as
+                # `status`: an absent size says "we never got the bytes", which
+                # must stay distinguishable from a genuinely empty reply.
+                span.set_attribute("response_bytes", len(raw))
         except TimeoutError:
             # Which limit actually bit matters to the caller: an exhausted
             # budget means the whole request is over, while a stage timeout
@@ -222,6 +275,12 @@ async def execute(
     stage: str | None = None,
 ) -> Any:
     """Runs the full adaptation pipeline and returns the client-facing result."""
+    # The client's prompt and reference images go on in the constructor, not
+    # after the call: an attribute written before a failure survives it, and a
+    # vendor refusal is the case where it is needed (see adapter.trace_attrs).
+    # Read off the body as the pipeline handed it over, before the request
+    # phase runs, so a script that mutates the body in place cannot change
+    # what the trace says the client sent.
     with logfire.span(
         "adapt",
         endpoint=ctx.endpoint,
@@ -230,7 +289,8 @@ async def execute(
         upstream_url=channel.upstream_url,
         is_async=channel.async_spec.enabled,
         stage=stage,
-    ):
+        **summarise_request(client_payload),
+    ) as span, phase_summary(span, ctx):
         if _phase_supported(script, PHASE_AUTH):
             emitted = await _call_phase(
                 script, ctx, client_payload, PHASE_AUTH, settings.script_timeout
@@ -274,5 +334,9 @@ async def execute(
             raise ScriptRuntimeError(
                 PHASE_RESPONSE, "must return a JSON object or array"
             )
+        # The image links in the reply go on now, while the span is still open:
+        # "the request succeeded but where is the picture" is the other half of
+        # the incident this context exists for.
+        record_result(span, result)
         return result
 
