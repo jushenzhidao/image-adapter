@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -124,6 +125,17 @@ class Settings(BaseSettings):
     # has to be on pixel count, not byte count.
     max_image_pixels: int = 50_000_000
 
+    # --- Object storage ----------------------------------------------------
+    # Which store the engine uploads to. A name, not an address, because the
+    # backends differ in protocol rather than only in URL: minio is S3 and
+    # returns a presigned URL that expires, fal is a two-step HTTP upload that
+    # returns a public one that does not. Code that needs the difference reads
+    # StoredObject.visibility, never this field.
+    #
+    # A Literal so a typo fails at startup. `extra="ignore"` would otherwise
+    # turn "STORAGE_BACKND=fal" into a silent fallback to minio.
+    storage_backend: Literal["minio", "fal"] = "minio"
+
     # --- Infra (empty = graceful degradation) ------------------------------
     redis_url: str = ""
     minio_endpoint: str = ""
@@ -136,6 +148,11 @@ class Settings(BaseSettings):
     # roughly the uploads expected in flight per worker. Only consulted when
     # MINIO_ENDPOINT is set, since storage is otherwise absent entirely.
     minio_pool_size: int = 20
+    # fal.ai CDN credential, used only when STORAGE_BACKEND=fal. Injected into
+    # the SDK explicitly rather than left to fal-client's own environment
+    # lookup, so an inherited FAL_KEY cannot silently become the credential
+    # this process uploads with.
+    fal_key: str = ""
 
     # --- Middleware --------------------------------------------------------
     rate_limit_enabled: bool = False
@@ -177,6 +194,19 @@ class Settings(BaseSettings):
         return tuple(
             p.strip() for p in self.script_overlay_dirs.split(",") if p.strip()
         )
+
+    @property
+    def capability_roots(self) -> tuple[Path, ...]:
+        """Capability-table roots, in the script store's own precedence order.
+
+        Overlay first, image store last: a deployment hot-fixes a measured table
+        from a mounted volume without rebuilding the image, exactly as it can for
+        a script. Each root gets the ``capabilities/`` subdirectory so a table
+        travels next to the scripts it describes.
+        """
+        roots = [Path(p) for p in self.script_overlay_list]
+        roots.append(Path(self.script_ref_dir))
+        return tuple(root / "capabilities" for root in roots)
 
     @property
     def remote_host_set(self) -> frozenset[str]:

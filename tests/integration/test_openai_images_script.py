@@ -1,11 +1,13 @@
 """The openai/images@v1 script, end to end.
 
-The script solves one problem: OpenAI exposes two endpoints split by transport
-(JSON generations, multipart edits), and the adapter's canonical body carries
-that split in a single field. These tests drive the *shipped* script by ref and
-read the wire form off a real local server, so what is asserted is what OpenAI
-would actually receive -- JSON for text-to-image, multipart with image file
-parts for everything else.
+The script solves two problems. Outbound, OpenAI exposes two endpoints split by
+transport (JSON generations, multipart edits), and the adapter's canonical body
+carries that split in a single field. Inbound, OpenAI-compatible gateways are
+unequal about `response_format`: some honour it, some hand back a data URI under
+`url`, some ignore it and return `b64_json`. These tests drive the *shipped*
+script by ref and read both directions off a real local server, so what is
+asserted is what OpenAI would actually receive and what the caller would
+actually get back.
 
 A stdlib HTTP server stands in for the vendor and parses multipart with the
 email package, which keeps the assertions independent of whichever multipart
@@ -15,6 +17,7 @@ implementation the adapter happens to use.
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import json
 import threading
@@ -32,6 +35,13 @@ PNG_DATA_URI = f"data:image/png;base64,{PNG_B64}"
 
 GEN_PATH = "/v1/images/generations"
 EDIT_PATH = "/v1/images/edits"
+
+#: What the vendor answers with unless a test says otherwise.
+DEFAULT_RESPONSE = {
+    "created": 1712345678,
+    "data": [{"b64_json": PNG_B64}],
+    "usage": {"total_tokens": 7},
+}
 
 
 def _parse_multipart(content_type: str, body: bytes) -> dict:
@@ -60,6 +70,10 @@ def _parse_multipart(content_type: str, body: bytes) -> dict:
 
 class _Vendor(BaseHTTPRequestHandler):
     requests: list[dict] = []
+    #: Counts asset fetches. A conversion that needs no download must not make
+    #: one, and a counter proves that where reading the log would not.
+    gets: int = 0
+    response: dict = DEFAULT_RESPONSE
 
     def _body(self) -> bytes:
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -67,6 +81,7 @@ class _Vendor(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # The asset a URL-shaped client image is downloaded from.
+        _Vendor.gets += 1
         self.send_response(200)
         self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(PNG_1X1)))
@@ -83,13 +98,7 @@ class _Vendor(BaseHTTPRequestHandler):
             record["body"] = json.loads(raw or b"{}")
         _Vendor.requests.append(record)
 
-        payload = json.dumps(
-            {
-                "created": 1712345678,
-                "data": [{"b64_json": PNG_B64}],
-                "usage": {"total_tokens": 7},
-            }
-        ).encode()
+        payload = json.dumps(_Vendor.response).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -105,6 +114,8 @@ def vendor():
     server = HTTPServer(("127.0.0.1", 0), _Vendor)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     _Vendor.requests = []
+    _Vendor.gets = 0
+    _Vendor.response = copy.deepcopy(DEFAULT_RESPONSE)
     yield f"http://127.0.0.1:{server.server_port}"
     server.shutdown()
     server.server_close()
@@ -310,3 +321,193 @@ def test_a_non_image_path_falls_back_to_the_sibling_segment(client, vendor):
     )
     assert resp.status_code == 200, resp.text
     assert _last()["path"] == "/v1/edits"
+
+
+# --- output shape: the caller's response_format is delivered, not forwarded --
+
+
+def test_url_against_a_b64_upstream_without_storage_passes_through(client, vendor):
+    """The upstream ignored response_format and there is nowhere to re-host it.
+
+    The missing object storage is our configuration gap, so the upstream's own
+    answer is passed through instead of failing the request. What must not
+    happen is a `url` key invented around the base64.
+    """
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox", "response_format": "url"},
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["data"][0]
+    assert item["b64_json"] == PNG_B64
+    assert "url" not in item
+    assert _Vendor.gets == 0
+
+
+def test_url_against_a_data_uri_upstream_without_storage_passes_through(
+    client, vendor
+):
+    """The upstream's `url` was already a data URI; without storage it stands.
+
+    Conversion would need object storage; the honest fallback is to return
+    what the upstream said rather than to 502 or to dress it up.
+    """
+    _Vendor.response = {
+        "created": 1712345678,
+        "data": [{"url": PNG_DATA_URI, "width": 1}],
+    }
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox", "response_format": "url"},
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["data"][0]
+    assert item["url"] == PNG_DATA_URI
+    assert item["width"] == 1
+    assert _Vendor.gets == 0
+
+
+def test_a_data_uri_upstream_becomes_a_link_when_storage_is_configured(
+    client, vendor, storage
+):
+    """The gateway shape the adapter exists for, with a working object store.
+
+    Measured against subdirect.aicodexvip.top: it answers response_format=url
+    with a data URI. With storage configured the caller gets the link it asked
+    for, and the bytes come from decoding that data URI rather than a download.
+    """
+    _Vendor.response = {
+        "created": 1712345678,
+        "data": [{"url": PNG_DATA_URI, "width": 1}],
+    }
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox", "response_format": "url"},
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["data"][0]
+    assert item["url"].startswith("https://cdn.test/")
+    assert item["width"] == 1
+    assert len(storage.puts) == 1
+    key, content_type, raw = storage.puts[0]
+    assert raw == PNG_1X1
+    assert key.startswith("temp/") and key.endswith(".png")
+    # The port carries the type through to the backend so the object is served
+    # inline rather than as a download.
+    assert content_type == "image/png"
+    assert _Vendor.gets == 0
+
+
+def test_an_item_with_no_payload_is_an_upstream_error(client, vendor):
+    """Neither carrier present: nothing to convert and nothing to hand back."""
+    _Vendor.response = {
+        "created": 1712345678,
+        "data": [{"revised_prompt": "a fox"}],
+    }
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox", "response_format": "b64_json"},
+    )
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["error"]["code"] == "upstream_error"
+
+
+def test_a_data_uri_under_url_becomes_b64_json_when_that_was_asked_for(
+    client, vendor
+):
+    """The gateway's `url` was a data URI all along; b64_json is what was asked."""
+    _Vendor.response = {
+        "created": 1712345678,
+        "data": [
+            {
+                "revised_prompt": "a fox",
+                "url": PNG_DATA_URI,
+                "width": 1,
+                "height": 1,
+            }
+        ],
+        "usage": {"total_tokens": 7},
+    }
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox", "response_format": "b64_json"},
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["data"][0]
+    assert item["b64_json"] == PNG_B64
+    assert "url" not in item
+    # Vendor extras ride along: the response is a superset, like the request.
+    assert item["revised_prompt"] == "a fox"
+    assert item["width"] == 1 and item["height"] == 1
+    # A data URI already is the image, so nothing should have been fetched.
+    assert _Vendor.gets == 0
+
+
+def test_a_link_from_the_upstream_is_fetched_for_b64_json(client, vendor):
+    """b64_json against a link-answering upstream: download, then encode."""
+    _Vendor.response = {
+        "created": 1712345678,
+        "data": [{"url": f"{vendor}/assets/a.png"}],
+    }
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox", "response_format": "b64_json"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"][0]["b64_json"] == PNG_B64
+    assert _Vendor.gets == 1
+
+
+def test_a_link_is_passed_through_untouched_for_url(client, vendor):
+    """An upstream that honours response_format costs us no work at all."""
+    link = f"{vendor}/assets/a.png"
+    _Vendor.response = {"created": 1712345678, "data": [{"url": link}]}
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox", "response_format": "url"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"][0]["url"] == link
+    assert _Vendor.gets == 0
+
+
+def test_silence_means_pass_through(client, vendor):
+    """No response_format: the upstream's own shape is the answer.
+
+    The front door defaults the *field* to url for validation only. Reading
+    that as an instruction here would send an un-asked-for image to object
+    storage -- and 502 without it -- instead of riding through as it always
+    has.
+    """
+    _Vendor.response = {"created": 1712345678, "data": [{"url": PNG_DATA_URI}]}
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"][0]["url"] == PNG_DATA_URI
+
+
+def test_the_edits_front_door_normalises_the_response_too(client, vendor):
+    """One pipeline, two transports: the response phase is not route-specific."""
+    _Vendor.response = {"created": 1712345678, "data": [{"url": PNG_DATA_URI}]}
+    headers = _headers(vendor)
+    # httpx sets the multipart Content-Type (with its boundary) itself.
+    headers.pop("Content-Type")
+    resp = client.post(
+        EDIT_PATH,
+        headers=headers,
+        files={"image": ("cat.png", io.BytesIO(PNG_1X1), "image/png")},
+        data={"prompt": "make it red", "response_format": "b64_json"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"][0]["b64_json"] == PNG_B64
+    assert _Vendor.gets == 0

@@ -1,9 +1,13 @@
 """GET /health endpoint (AC-18). Returns status ok plus dependency states.
 
-Redis and MinIO are optional accelerators, so a degraded dependency is not an
-unhealthy adapter: the endpoint always reports 200 and lets the deps map carry
-the detail. Failing the probe on a missing MinIO would take a perfectly
-serviceable single-node deployment out of its load balancer.
+Redis and object storage are optional accelerators, so a degraded dependency is
+not an unhealthy adapter: the endpoint always reports 200 and lets the deps map
+carry the detail. Failing the probe on a missing object store would take a
+perfectly serviceable single-node deployment out of its load balancer.
+
+The storage entry is keyed by the *configured backend's name* -- ``minio`` for
+a default deployment, ``fal`` when STORAGE_BACKEND says so. A fixed key would
+either lie about which store was reached or need a second field to say it.
 """
 
 from __future__ import annotations
@@ -19,31 +23,19 @@ from adapter.state_store import StateStore
 _PROBE_TIMEOUT = 5.0
 
 
-def _bucket_exists(settings) -> bool:
-    """Blocking MinIO round-trip. Must be called off the event loop."""
-    from minio import Minio
+async def _storage_ok(store) -> bool:
+    """Asks the backend, rather than building a second client to ask it.
 
-    client = Minio(
-        settings.minio_endpoint,
-        access_key=settings.minio_access_key,
-        secret_key=settings.minio_secret_key,
-        secure=settings.minio_secure,
-    )
-    client.bucket_exists(settings.minio_bucket)
-    return True
-
-
-async def _minio_ok(settings) -> bool:
-    if not settings.minio_endpoint:
+    This used to construct its own Minio client straight from settings, which
+    meant two independent places had to agree on the credentials, the pool and
+    the timeouts -- and the health probe was the copy nobody updated. The port
+    has one implementation, so the probe now reaches the same object the
+    uploads do.
+    """
+    if store is None:
         return False
     try:
-        # minio's client is synchronous. Calling it inline stalled the whole
-        # event loop for the duration of the round-trip, which on a slow or
-        # unreachable endpoint blocked every in-flight generation on this
-        # worker until the socket timed out.
-        return await asyncio.wait_for(
-            asyncio.to_thread(_bucket_exists, settings), timeout=_PROBE_TIMEOUT
-        )
+        return await asyncio.wait_for(store.ping(), timeout=_PROBE_TIMEOUT)
     except Exception:
         return False
 
@@ -52,8 +44,8 @@ async def health_handler(request: Request) -> JSONResponse:
     store: StateStore = request.app.state.state_store
     settings = request.app.state.settings
 
-    redis_ok, minio_ok = await asyncio.gather(
-        store.ping(), _minio_ok(settings)
+    redis_ok, storage_ok = await asyncio.gather(
+        store.ping(), _storage_ok(getattr(request.app.state, "storage", None))
     )
 
     return JSONResponse(
@@ -61,7 +53,7 @@ async def health_handler(request: Request) -> JSONResponse:
             "status": "ok",
             "deps": {
                 "redis": "ok" if redis_ok else "degraded",
-                "minio": "ok" if minio_ok else "degraded",
+                settings.storage_backend: "ok" if storage_ok else "degraded",
             },
         }
     )

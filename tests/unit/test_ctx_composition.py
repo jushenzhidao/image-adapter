@@ -13,11 +13,18 @@ import pytest
 from adapter.channel import ChannelSpec
 from adapter.context import AdapterContext, ContextCore
 from adapter.ctxapi import CTX_MIXINS
+from adapter.errors import AdapterError
 from adapter.settings import Settings
 
 # Every name a script is allowed to reach on ctx. Its purpose is to fail when
 # the flat surface silently changes shape during a refactor.
 SCRIPT_API = (
+    "caps",
+    "tier_value",
+    "size_to_px",
+    "fit_tier",
+    "fit_ratio",
+    "format_ratio",
     "encode_b64",
     "decode_b64",
     "data_uri",
@@ -31,6 +38,7 @@ SCRIPT_API = (
     "image_data_uri",
     "image_url",
     "emit",
+    "fail",
     "sleep",
     "image",
     "remaining",
@@ -92,3 +100,24 @@ def test_budget_and_plan_helpers_replace_private_pokes():
     assert ctx.plan.method is None and ctx.plan.query == {}
 
     assert inspect.ismethod(ctx.attach_budget)
+
+
+def test_fail_raises_a_client_visible_error():
+    """The script's only way to report "upstream said 200, and that is a failure"."""
+    with pytest.raises(AdapterError) as excinfo:
+        _ctx().fail("no image was produced", code="no_image_generated", param="prompt")
+
+    exc = excinfo.value
+    assert (exc.status, exc.code, exc.param) == (400, "no_image_generated", "prompt")
+    assert exc.err_type == "invalid_request_error"
+    # The envelope is what reaches the client; the message must survive it.
+    assert exc.to_body()["error"]["message"] == "no image was produced"
+
+
+def test_fail_can_speak_for_the_upstream():
+    """status=502 is how a script says "retry later" instead of "do not retry"."""
+    with pytest.raises(AdapterError) as excinfo:
+        _ctx().fail("upstream truncated", status=502, err_type="upstream_error")
+
+    assert excinfo.value.status == 502
+    assert excinfo.value.err_type == "upstream_error"

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     import aiohttp
 
     from adapter.settings import Settings
+    from adapter.storage.base import ObjectStore
 
 
 class CtxMixin:
@@ -36,7 +37,7 @@ class CtxMixin:
         def cache(self) -> Any: ...
 
         @property
-        def storage(self) -> Any | None: ...
+        def storage(self) -> ObjectStore | None: ...
 
 
 class NeedsCodec(CtxMixin):

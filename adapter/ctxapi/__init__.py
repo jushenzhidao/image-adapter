@@ -29,28 +29,37 @@ from __future__ import annotations
 
 from adapter.ctxapi.base import CtxMixin, NeedsCodec, NeedsStorage
 from adapter.ctxapi.budget import BudgetMixin
+from adapter.ctxapi.caps import CapsMixin
 from adapter.ctxapi.codec import CodecMixin
+from adapter.ctxapi.fault import FaultMixin
 from adapter.ctxapi.image_ref import ImageRefMixin
+from adapter.ctxapi.mapping import MappingMixin
 from adapter.ctxapi.plan import FilePart, PlanMixin, RequestPlan
 from adapter.ctxapi.storage import StorageMixin
 
 #: Every mixin composed into ``AdapterContext``, in MRO order. Registering a
 #: new group here is the whole wiring step.
 CTX_MIXINS = (
+    CapsMixin,
+    MappingMixin,
     CodecMixin,
     ImageRefMixin,
     StorageMixin,
     BudgetMixin,
     PlanMixin,
+    FaultMixin,
 )
 
 __all__ = [
     "CTX_MIXINS",
     "BudgetMixin",
+    "CapsMixin",
     "CodecMixin",
     "CtxMixin",
+    "FaultMixin",
     "FilePart",
     "ImageRefMixin",
+    "MappingMixin",
     "NeedsCodec",
     "NeedsStorage",
     "PlanMixin",

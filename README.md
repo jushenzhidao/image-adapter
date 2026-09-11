@@ -103,6 +103,7 @@ async def transform(ctx, payload, phase):
 | `await ctx.image_url(ref)` | 三态入参 → 可公网访问 URL（必要时经 MinIO 中转） |
 | `ctx.is_url(s)` / `ctx.is_data_uri(s)` | 形态判断，写多分支转换时用 |
 | `ctx.emit(url=..., method=..., headers=..., query=..., body=..., form=..., files=..., raw=..., timeout=...)` | 覆盖本次上游调用的任意维度（轮询换端点、multipart 上传等） |
+| `ctx.fail(msg, code=..., param=..., status=400)` | 以客户端可见的错误结束请求。上游返回 200 但业务失败时用（安全拦截、模型拒答、没出图）；脚本没有别的错误通道——抛其它异常会被包成 500，返回 `{"error": ...}` 会被当成 200 正常响应 |
 | `ctx.key` | 上游凭证（`Authorization` 去掉 Bearer 后的值），签名计算时用 |
 | `await ctx.sleep(s)` | 异步等待（脚本内禁用 `import asyncio`） |
 | `ctx.logfire` | 追踪句柄，`with ctx.logfire.span('...')` |
@@ -151,7 +152,7 @@ return {"prompt": "blend", "n": "2"}   # 这些成为 multipart 文本字段
 /Users/betterme/.workbuddy/binaries/python/versions/3.13.12/bin/python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 测试（318 项）
+# 测试（475 项）
 .venv/bin/python -m pytest tests/ -q
 
 # 启动
@@ -196,8 +197,25 @@ OpenAI 把图片任务按**载体**拆成两个端点：`/v1/images/generations`
 
 姊妹端点由渠道 URL 的末段替换推出，host 与 query 保留（因此 Azure 的
 `api-version` 会一并带过去）；布局不匹配时用
-`X-Channel-Options: {"edits_url": "..."}` 直接指定。响应两个端点同形，原样透传，
-含计费依赖的 `usage`。
+`X-Channel-Options: {"edits_url": "..."}` 直接指定。响应也走同一个脚本：`usage` 原样
+透传（计费依赖它），但**图片的输出形态按客户端的要求交付**，不把上游的偷懒转嫁给调用方。
+兼容 OpenAI 的上游对 `response_format` 的遵守程度并不一致——有的回真链接，有的在
+`data[].url` 里塞一个 `data:` URI，有的干脆忽略该字段只给 `b64_json`：
+
+| 客户端要的 | 上游给的 | 脚本做的事 |
+|---|---|---|
+| `url` | `data:` URI 或 `b64_json` | 落对象存储换回真链接（**没配存储则原样返回**） |
+| `b64_json` | 链接（`http` 或 `data:`） | 取回 / 解码后重新编码 |
+| 不传 | 任意 | 不干预，原样透传 |
+
+这正是 `docs/04_Spec.md` 的 AC-03 / AC-04（BR-007 / BR-008）。两点要清楚：
+`response_format=b64_json` 且上游只给链接时会发生下载，那个 host 必须在渠道的
+`upstream_host_set` 白名单里。`response_format=url` 要有配好的对象存储才能产出**真链接**——
+没配就跳过这一步、把上游原本的形态返回（可能仍是 `b64_json`，或上游自己塞的 `data:` URI），
+不为我们的配置缺口去 502；代价是要对外承诺链接的部署必须配好 MinIO。
+
+（火山方舟**不在**此列：它的上游如实支持 `url` 与 `b64_json` 两种 `response_format`，
+脚本转发即可，响应原样返回就对 —— 见 `docs/05` §2。**只有会撒谎的上游才需要归一化。**）
 
 ```bash
 curl -s -X POST localhost:8080/v1/images/generations \
@@ -282,7 +300,9 @@ SCRIPT_PIN_MANIFEST_DIGESTS=false # true = 按 manifest 的 sha256 强校验脚�
 UPSTREAM_ALLOW_PRIVATE_NETWORK=true  # 生产置 false（SSRF）
 UPSTREAM_HOST_ALLOWLIST=         # 逗号分隔的上游主机白名单
 REDIS_URL=                       # 空 = 内存降级
-MINIO_ENDPOINT=                  # 空 = data URI 降级
+STORAGE_BACKEND=minio            # 对象存储后端：minio（预签名，会过期）| fal（公网长期，需 fal extra）
+MINIO_ENDPOINT=                  # 空 = data URI 降级（STORAGE_BACKEND=minio 时）
+FAL_KEY=                         # 空 = data URI 降级（STORAGE_BACKEND=fal 时）
 LOGFIRE_TOKEN=                   # 空 = 仅本地
 SCRIPT_TIMEOUT=30
 UPSTREAM_TIMEOUT=180

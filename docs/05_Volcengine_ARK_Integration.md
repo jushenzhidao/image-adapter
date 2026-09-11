@@ -100,6 +100,13 @@ curl -X POST https://ark.cn-beijing.volces.com/api/v3/images/generations \
 | `response_format: "url"` | `response_format: "url"` | 直接透传 |
 | `response_format: "b64_json"` | `response_format: "b64_json"` | 直接透传 |
 
+> **这里刻意不做输出形态归一化**（2026-09-11 确认）。ARK 上游**本身就同时支持** `url` 与
+> `b64_json` 两种 `response_format`，脚本按 90 行显式转发后，上游会给回请求的那种形态，
+> 所以响应相位原样返回即可 —— 符合「上游场景优先于我方的转换」这条设计优先级。
+> 只有对 `response_format` 撒谎的上游才需要归一化：`openai/images@v1` 面向的兼容网关实测会
+> 拿 `data:` URI 冒充 `url`，`google/images@v1` 只出 base64，那两个脚本才做转换（见
+> `docs/06` §5.2 与 README「OpenAI 原生上游」）。**别为求统一而把转换搬到 ARK 上**。
+
 ### 3. 固定参数
 适配器自动添加以下参数：
 - `watermark: true` - 启用水印

@@ -34,7 +34,7 @@ from adapter.api.health import health_handler
 from adapter.api.image_edits import image_edits_handler
 from adapter.api.images import images_handler
 from adapter.api.responses import responses_handler
-from adapter.context import build_cache, build_storage
+from adapter.context import build_cache
 from adapter.error_handlers import install_error_handlers
 from adapter.logfire_setup import init_logfire, resolve_service_version
 from adapter.middleware.body_limit import BodyLimitMiddleware
@@ -44,6 +44,7 @@ from adapter.middleware.rate_limit import RateLimitMiddleware
 from adapter.script_cache import ScriptCache
 from adapter.scriptstore import build_store
 from adapter.settings import get_settings
+from adapter.storage import build_storage, missing_storage_config
 from adapter.state_store import StateStore
 
 logging.basicConfig(
@@ -150,9 +151,23 @@ async def lifespan(app: FastAPI):
         ),
     )
     app.state.asset_cache = build_cache(cfg)
-    # Same reasoning as the HTTP session, one layer down: a per-request Minio
-    # client discards the urllib3 pool, so every upload re-handshakes TLS.
-    app.state.storage = build_storage(cfg)
+    # Same reasoning as the HTTP session, one layer down: a per-request store
+    # discards the connection pool, so every upload re-handshakes TLS. The
+    # shared session is handed over as well -- the fal backend probes with it
+    # rather than opening a connection the health check has to close.
+    app.state.storage = build_storage(cfg, http=app.state.http)
+
+    if app.state.storage is None:
+        # Said once, at startup, naming the exact key: "storage is off" and
+        # "storage is misconfigured" behave identically at the call site, and
+        # only the second one is a deployment mistake worth waking someone for.
+        logger.warning(
+            "object storage is not configured (STORAGE_BACKEND=%s, missing %s); "
+            "ctx.upload_temp_image() will return a data URI and "
+            "response_format='url' will not produce a link",
+            cfg.storage_backend,
+            missing_storage_config(cfg),
+        )
 
     if cfg.adapter_key_required and not cfg.adapter_key:
         logger.error(

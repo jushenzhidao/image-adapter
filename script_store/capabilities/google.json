@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "vendor": "google",
+  "verified_at": "2026-09-11",
+  "verified_against": "api.chatfire.cn (gemini-3.1-flash-image-preview)",
+  "suffixes": ["-preview", "-exp", "-latest"],
+  "default_model": "gemini-3-pro-image",
+  "aliases": {
+    "nano-banana": "gemini-2.5-flash-image",
+    "nano-banana-2": "gemini-3.1-flash-image",
+    "nano-banana-2-lite": "gemini-3.1-flash-lite-image",
+    "nano-banana-pro": "gemini-3-pro-image"
+  },
+  "shared": {
+    "ratios": ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
+  },
+  "models": {
+    "gemini-2.5-flash-image": {
+      "kind": "generate",
+      "tiers": [],
+      "wide": false,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "image", "size", "response_format"],
+      "ignores": ["n", "quality", "watermark", "mask"]
+    },
+    "gemini-3.1-flash-lite-image": {
+      "kind": "generate",
+      "tiers": ["512", "1K"],
+      "wide": true,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "image", "size", "response_format"],
+      "ignores": ["n", "quality", "watermark", "mask"]
+    },
+    "gemini-3.1-flash-image": {
+      "kind": "generate",
+      "tiers": ["512", "1K", "2K", "4K"],
+      "wide": true,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "image", "size", "response_format"],
+      "ignores": ["n", "quality", "watermark", "mask"]
+    },
+    "gemini-3-pro-image": {
+      "kind": "generate",
+      "tiers": ["1K", "2K", "4K"],
+      "wide": true,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "image", "size", "response_format"],
+      "ignores": ["n", "quality", "watermark", "mask"]
+    }
+  },
+  "field_notes": {
+    "tiers": "supported imageSize values, low -> high. An EMPTY list means the model fixes its own resolution, so imageSize must not be sent at all.",
+    "wide": "accepts the extreme ratios (1:4, 4:1, 1:8, 8:1); false means they must fall back to a nearer ratio.",
+    "shared": "vendor-wide facts merged into every model entry by the loader, so a list shared by the whole family is written once.",
+    "ratios": "every ratio the family documents, as vendor-spelled strings (\"16:9\").",
+    "kind": "generate | format | enhance | erase | watermark | beauty. Lets a script pick defaults and lets an orchestrator reason about a chain.",
+    "outputs": "what one call produces (image | mask | text). An orchestrator uses it to check a chain is satisfiable - no consumer yet.",
+    "async": "the upstream answers with a task id instead of a result (needs X-Async polling).",
+    "accepts": "OpenAI-contract fields this model actually uses.",
+    "ignores": "fields it has no use for; a script should answer 400 rather than forward them and let the vendor complain."
+  }
+}

@@ -31,6 +31,14 @@ test = [
     "pytest-asyncio>=1.4.0",
     "httpx2>=2.0.0",
 ]
+# Object-storage backends that are not installed by default. fal-client pulls in
+# httpx, httpx-sse, msgpack, websockets, aiofiles and asyncstdlib; the last four
+# serve its queue/streaming/realtime model-calling paths, none of which this
+# adapter uses. Installing it only where STORAGE_BACKEND=fal keeps that weight
+# off every other deployment -- and off every image build that only needs minio.
+fal = [
+    "fal-client>=1.0.1",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

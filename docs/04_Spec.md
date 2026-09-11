@@ -25,10 +25,10 @@
 | P0 | Mock 上游服务：同步文生图 / 异步 Job / AK-SK 签名 三种模式 | AC-16 |
 | P0 | 示例脚本：upstream_a(同步)、upstream_b(异步) 全端点脚本 | 随 AC-01~10 验证 |
 | P0 | Logfire 全链路埋点（token 从环境变量读取，未配置时本地降级） | AC-17 |
-| P1 | `GET /health` 健康检查（含 Redis/MinIO 依赖状态） | AC-18 |
+| P1 | `GET /health` 健康检查（含 Redis/对象存储依赖状态） | AC-18 |
 | P1 | 中间件：鉴权（内部 Token）、日志、CORS；限流（Redis 滑动窗口） | AC-19 |
 | P1 | Docker Compose 编排（adapter + redis + minio + mock-upstream） | AC-20 |
-| P1 | 图片处理：URL 下载缓存 5min、MinIO 临时存储 TTL 1h、Base64 编解码 | AC-03/04 |
+| P1 | 图片处理：URL 下载缓存 5min、对象存储临时图片（生命周期随 `STORAGE_BACKEND`：minio 预签名 1h / fal 公网长期）、Base64 编解码 | AC-03/04 |
 
 ### 2.1 v1.1 增量范围：级联编排（前处理 + 生成 + 后处理）
 
@@ -68,7 +68,7 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | ASGI 服务器 | uvicorn（生产 + gunicorn） | pip 安装后回填 | 多 Worker 绕 GIL |
 | HTTP 客户端 | aiohttp | pip 安装后回填 | 异步连接池 + 流式下载 |
 | 缓存/状态 | redis-py（`redis.asyncio`，**不用已废弃的 aioredis 包**） | pip 安装后回填 | 官方异步客户端 |
-| 对象存储 | minio | pip 安装后回填 | S3 兼容预签名 URL |
+| 对象存储 | 端口 `adapter/storage`；后端 `minio`（默认）/ `fal` | minio 随镜像；fal 走 `fal` extra | 后端协议不同：minio 预签名会过期，fal 公网长期且 SDK 原生异步。新增 OSS/COS/TOS = 一个 builder |
 | 图片处理 | Pillow | pip 安装后回填 | 格式转换 |
 | 可观测 | logfire | pip 安装后回填 | OTel 标准；`logfire.instrument_fastapi(app)`，**capture_headers=False**（渠道头含凭据与脚本源码） |
 | 配置 | pydantic-settings | pip 安装后回填 | 环境变量类型安全 |
@@ -84,7 +84,7 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | POST | `/v1/images` | 文生图/图生图 | Bearer 内部 Token | model, prompt, n, size, quality, response_format(url/b64_json) | `{created, data:[{url|b64_json}]}` |
 | POST | `/v1/chat/completions` | 多模态对话 | Bearer 内部 Token | model, messages(含 image_url content), stream | ChatCompletion / SSE chunks |
 | POST | `/v1/responses` | Agent 工具编排 | Bearer 内部 Token | model, input, tools[{type:image_generation}], previous_response_id | `{id, output:[message|image_generation_call], usage}` |
-| GET | `/health` | 健康检查 | 无 | - | `{status, deps:{redis, minio}}` |
+| GET | `/health` | 健康检查 | 无 | - | `{status, deps:{redis, <storage_backend>}}` |
 
 错误格式统一（03_技术架构 §8.2）：`{"error":{"message","type","param","code"}}`；脚本异常不暴露堆栈（BR-009）。
 
@@ -96,10 +96,10 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | Redis | `job_lock:{job_id}` | 异步轮询分布式锁 | poll_interval+1s |
 | Redis | `resp_ctx:{response_id}` | responses 状态链上下文 | 1h |
 | Redis | `ratelimit:{token}:{window}` | 滑动窗口限流 | 窗口期 |
-| MinIO | `temp/{request_id}/{uuid}.{ext}` | 临时图片，预签名 URL | 1h (BR-005) |
-| MinIO | `temp/{request_id}/step_{name}.{ext}` | 管线中间产物（大图引用传递） | 1h (BR-016) |
+| 对象存储 | `temp/{request_id}/{uuid}.{ext}` | 临时图片（键由引擎构造，与后端无关） | minio：预签名 1h (BR-005)；fal：公网长期，仅取 basename |
+| 对象存储 | `temp/{request_id}/step_{name}.{ext}` | 管线中间产物（大图引用传递） | 同上 (BR-016) |
 
-**降级规则（锁定）**：`REDIS_URL`/`MINIO_ENDPOINT` 未配置时，dev 模式降级为进程内内存缓存 + data URI 输出并打 warning 日志；docker compose 生产编排必须配齐，不允许降级。
+**降级规则（锁定）**：`REDIS_URL`/所选后端必填项（`minio` 看 `MINIO_ENDPOINT`，`fal` 看 `FAL_KEY`）未配置时，dev 模式降级为进程内内存缓存 + data URI 输出并打 warning 日志；docker compose 生产编排必须配齐，不允许降级。
 
 ## 7. 页面清单
 
@@ -116,7 +116,7 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | AC-01 | images 同步 | When 客户端以 model=vendor-a-text2img 请求 /v1/images，系统必须经 upstream_a/images.py 映射调用 mock 上游并返回 200 + `data[0]` 含 b64_json 或 url | P0 |
 | AC-02 | images 批量 | When n=2 且上游不支持批量，系统必须内部聚合调用 2 次并返回 `len(data)==2` | P0 |
 | AC-03 | 输出统一 | If response_format=b64_json 且上游返回 URL，系统必须下载后编码为 b64_json（BR-007） | P0 |
-| AC-04 | 输出统一 | If response_format=url 且上游返回二进制，系统必须上传 MinIO 并返回预签名 URL（BR-008；无 MinIO 时 dev 降级 data URI） | P0 |
+| AC-04 | 输出统一 | If response_format=url 且上游返回二进制，系统必须上传到当前 `STORAGE_BACKEND` 指向的对象存储并返回其 URL（minio 为预签名、fal 为公网长期）（BR-008）。无对象存储时不得为此失败请求，也不得把 data URI 冒充 url：退回上游自身的形态（通常为 b64_json） | P0 |
 | AC-05 | chat 文本 | When 纯文本 messages 请求，系统必须返回标准 ChatCompletion 结构（choices[0].message.content 非空） | P0 |
 | AC-06 | chat Vision | When messages 含 image_url，系统必须下载图片并按上游要求编码后重组请求 | P0 |
 | AC-07 | 流式桥接 | When stream=true 且上游非流式，系统必须拆分为合法 SSE chunk 流并以 `data: [DONE]` 结束 | P0 |
@@ -130,7 +130,7 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | AC-15 | 路由 | If model 未在注册表登记，系统必须返回 404 + `code=model_not_found` | P0 |
 | AC-16 | Mock 上游 | Mock 服务必须提供：同步生图、异步 Job（提交/查询）、AK-SK 签名校验 三组端点，返回 1x1 PNG 真实字节 | P0 |
 | AC-17 | 可观测 | While LOGFIRE_TOKEN 已配置，每请求必须产生含 registry_resolve/script_load/script_transform_request/upstream_http_call/script_transform_response Span 的 Trace；未配置时本地运行不报错 | P1 |
-| AC-18 | 健康检查 | When GET /health，系统必须返回 200 + Redis/MinIO 连通状态 | P1 |
+| AC-18 | 健康检查 | When GET /health，系统必须返回 200 + Redis/对象存储连通状态。存储项的键名＝当前 `STORAGE_BACKEND`（默认 `minio`），使运维一眼看出探针实际打到了哪个后端 | P1 |
 | AC-19 | 鉴权 | If Authorization 缺失或 Token 错误（且 ADAPTER_AUTH_ENABLED=true），系统必须返回 401 标准错误 | P1 |
 | AC-20 | 编排 | docker compose config 必须校验通过；adapter 容器非 root、脚本只读挂载 | P1 |
 | AC-21 | 超时 | If 脚本执行超过 SANDBOX_TIMEOUT(30s)，系统必须返回 504（BR-003） | P0 |
@@ -182,7 +182,7 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | 各级超时相加溢出总预算 | stages | 每级独立 timeout 累加可远超总预算 | 每级实际超时取 `min(stage_timeout, ctx.remaining)` |
 | Pillow 同步调用阻塞事件循环 | Pillow+asyncio | resize/convert 是 CPU 密集同步操作 | `ctx.image` 内部走 `asyncio.to_thread`，不在事件循环里直接调 PIL |
 | 解压炸弹撑爆内存 | Pillow | 小文件可解出超大位图 | 设 `Image.MAX_IMAGE_PIXELS` + 解码前校验 50 MP 上限（BR-012） |
-| 中间产物在内存反复拷贝导致 OOM | stages | 每级持有完整 bytes，n>1 时线性放大 | `ctx.stage` 大图存 MinIO 句柄，级间传引用而非 bytes |
+| 中间产物在内存反复拷贝导致 OOM | stages | 每级持有完整 bytes，n>1 时线性放大 | `ctx.stage` 大图存对象存储句柄，级间传引用而非 bytes |
 | 级联把上游配额瞬间打穿 | ratelimit | 一次客户端请求 = n × stages 次上游调用 | 限流按实际上游调用次数计费，`concurrency` 限并发（BR-015） |
 | 降级产物被误判为成功而无标记 | stages | 上游 200 但内容是上一级原图 | 降级必须写 `degraded=true` + `degraded_reason`，并计 `adapter_stage_degraded_total`（BR-013） |
 

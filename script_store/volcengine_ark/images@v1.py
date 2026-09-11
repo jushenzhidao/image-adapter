@@ -123,6 +123,12 @@ async def transform(ctx, payload, phase):
     # response phase: ark already returns {"data": [...], "created": ...}.
     # usage is billing-relevant (layer decomposition bills per returned
     # image), so it is forwarded whenever ark provides it.
+    #
+    # No output-shape normalisation here, deliberately. `response_format` is
+    # forwarded above and this upstream honours both values, so `data` already
+    # has the shape the caller asked for. Only upstreams that lie about
+    # response_format need the url <-> b64_json conversion that
+    # openai/images@v1 and google/images@v1 do -- see docs/05 §2.
     out = {
         "created": payload.get("created", 0),
         "data": payload.get("data", []),
