@@ -12,14 +12,22 @@ body below and rejoins this same pipeline, so scripts implement one contract.
 The request shape is therefore a superset of the OpenAI images body:
 
     prompt            str
-    image             str | list[str]   URL, data URI or bare base64
+    image             str | list[str]   URL, data URI or bare base64;
+                                        null / [] mean "no image" and are dropped
     mask              str               same three shapes
-    n, size, quality, response_format, style, user
+    n                 int               a malformed value falls back to 1
+    size, quality, response_format, style, user
     <vendor extras>   passed through untouched
 
 Validation stays deliberately thin. The adapter owns no vendor semantics, so
 it rejects only what is malformed for *every* upstream; which fields a given
 vendor actually supports is the script's business.
+
+Two things are normalised rather than refused, because an otherwise complete
+text-to-image request should not fail over them: an unset `image` (`null` or
+`[]`, depending on the SDK) and an unusable `n`. Neither is a licence to skip
+checks -- a blank string, a missing prompt with no image, and a bad
+`response_format` are all still refused.
 """
 
 from __future__ import annotations
@@ -62,10 +70,13 @@ def validate_images_body(body: dict) -> None:
     running the same checks keeps the two endpoints from drifting apart.
     """
     n = body.get("n", 1)
-    # bool is an int subclass, and n=True is a client bug, not a request for
-    # one image.
+    # A malformed `n` falls back to one image instead of failing the request.
+    # `n` is a count the caller may not care about, and refusing an otherwise
+    # complete generation over it trades a usable answer for a technicality.
+    # `bool` is an int subclass, and n=True is a client bug, not a request for
+    # one image, so it takes the same path.
     if not isinstance(n, int) or isinstance(n, bool) or n < 1:
-        raise InvalidRequestError("'n' must be a positive integer", param="n")
+        body["n"] = 1
 
     response_format = body.get("response_format", "url")
     if response_format not in RESPONSE_FORMATS:
@@ -74,16 +85,21 @@ def validate_images_body(body: dict) -> None:
         )
 
     image = body.get("image")
-    if image is not None:
-        if isinstance(image, list):
-            if not image:
-                raise InvalidRequestError(
-                    "'image' must not be an empty list", param="image"
-                )
-            for item in image:
-                _check_image_ref(item, "image")
-        else:
-            _check_image_ref(image, "image")
+    # `null` and `[]` are the two ways a client says "no image here" -- several
+    # SDKs serialise an unset list field as an empty array. Both mean
+    # text-to-image, so the key is dropped rather than rejected. Dropped rather
+    # than merely tolerated: `openai/images@v1` forwards the canonical body
+    # verbatim on its text-to-image path, so a surviving `image: []` would reach
+    # a vendor that refuses the argument outright, turning a request this
+    # adapter accepted into an upstream error.
+    if image is None or image == []:
+        body.pop("image", None)
+        image = None
+    elif isinstance(image, list):
+        for item in image:
+            _check_image_ref(item, "image")
+    else:
+        _check_image_ref(image, "image")
 
     mask = body.get("mask")
     if mask is not None:

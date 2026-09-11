@@ -11,6 +11,7 @@ canonical images body and hand it to the same pipeline:
     mask=@m.png           ->     mask:  "<data URI>"
     prompt=redraw the sky ->     prompt: "redraw the sky"
     n=2                   ->     n: 2            (int)
+    n=abc                 ->     n: 1            (unparsable -> one image)
     <vendor extras>       ->     passed through as text
 
 Uploads become data URIs rather than bare base64 so the mime type survives:
@@ -86,13 +87,18 @@ async def _read_upload(upload: UploadFile, param: str, max_bytes: int) -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def _coerce_int(name: str, raw: str) -> int:
+def _coerce_int(name: str, raw: str) -> int | str:
+    """A form integer, or the raw text when it is not one.
+
+    Unparsable text is handed on untouched instead of refused here: normalising
+    a malformed `n` is validate_images_body()'s job, and refusing it at the
+    transport would make this door stricter than the JSON one for the very same
+    request -- the two are meant to accept and reject alike.
+    """
     try:
         return int(raw)
     except (TypeError, ValueError):
-        raise InvalidRequestError(
-            f"'{name}' must be an integer", param=name
-        ) from None
+        return raw
 
 
 async def normalise_edits_form(request: Request, max_bytes: int) -> dict:

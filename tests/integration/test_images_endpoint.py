@@ -17,14 +17,19 @@ async def transform(ctx, payload, phase):
 FAKE_UPSTREAM = "https://vendor.test/v2/text2img"
 
 
-def test_images_validation_bad_n(client, channel_headers):
+def test_images_bad_n_is_normalised_rather_than_refused(client, channel_headers):
+    """`n` no longer fails the request; it falls back to a single image.
+
+    The upstream here does not resolve, so any non-400 is the proof that
+    validation let the call through. The value `n` became is pinned exactly by
+    tests/unit/test_images_validation.py.
+    """
     resp = client.post(
         "/v1/images/generations",
         headers=channel_headers(IMAGES_SCRIPT, FAKE_UPSTREAM),
         json={"prompt": "cat", "n": 0},
     )
-    assert resp.status_code == 400
-    assert resp.json()["error"]["param"] == "n"
+    assert resp.status_code != 400, resp.text
 
 
 def test_images_validation_bad_response_format(client, channel_headers):

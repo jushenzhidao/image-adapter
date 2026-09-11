@@ -250,28 +250,25 @@ def test_non_image_upload_is_rejected(client, channel_headers, vendor):
     assert resp.json()["error"]["param"] == "image"
 
 
-def test_non_integer_n_is_rejected(client, channel_headers, vendor):
+def test_non_integer_n_falls_back_to_one(client, channel_headers, vendor):
+    """Unparsable `n` is normalised, not refused.
+
+    The transport must not be stricter than the JSON door for the same request:
+    `_coerce_int` hands the raw text on and validate_images_body() replaces it
+    with one image.
+    """
     resp = _post(
         client,
         _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
         files={"image": _png()},
         data={"prompt": "x", "n": "two"},
     )
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["param"] == "n"
+    assert resp.status_code == 200, resp.text
+    assert _Vendor.received["n"] == 1
 
 
 def test_shared_validator_still_applies(client, channel_headers, vendor):
-    """n=0 and a bad response_format are caught by validate_images_body."""
-    resp = _post(
-        client,
-        _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),
-        files={"image": _png()},
-        data={"prompt": "x", "n": "0"},
-    )
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["param"] == "n"
-
+    """A bad response_format is caught by validate_images_body on this door too."""
     resp = _post(
         client,
         _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img"),

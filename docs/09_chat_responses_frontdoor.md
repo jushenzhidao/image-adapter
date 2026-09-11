@@ -107,7 +107,8 @@ chat 请求体里没有 `prompt`，脚本 `payload.get("prompt", "")` 取到空�
 | 多个 `image_url` part | `image` 为数组，按出现顺序 | 规范体已支持单值或数组（`images.py:76-86`） |
 | url 为 data URI | **原样透传，不解码** | `README:5` 三态之一；解码要多一次内存拷贝，`ctx` 侧本来就会分流 |
 | `role=system` | 待定，见 §4 | |
-| 多条 `user` 或出现 `assistant` | 400 `unsupported_parameter` | 多轮改图是 `docs/06` §4.6 明确不承诺的范围；静默丢掉上下文是最难查的一类 bug |
+| 多条 `user` 或出现 `assistant` | **截断到最后一条 `user` 轮**：文本与图都只取最后一条 | 规范契约只有一个 `prompt` / 一个 `image`，历史无处可放。原为 400，理由是"静默丢上下文是最难查的一类 bug"；2026-09-11 按调用方要求改为截断，**该风险由此接受** |
+| 未知 `role` | 400 `unsupported_parameter` | 拼错的 `usre` 不能被当作历史吞掉，否则会静默选中错误的轮次 |
 | 未知 part `type` | 400 `unsupported_parameter` | 与既有裁决一致（`mask` 也是报 400 而不是静默丢弃） |
 | `model` | 保留 | |
 | `stream` | **必须保留在交给 `adapt` 的 dict 里** | `pipeline.py:157` 用 `payload.get("stream")` 决定是否走 SSE；前门若把它剔除，**流式会静默失效**。edits 前门不流式，所以没暴露这个坑 |
@@ -207,6 +208,27 @@ chat 客户端仍然解析不了。这是「前门只改输入不够」的地方
 出口是 `output[]`（`{type:"message" | "image_generation_call"}`）。
 `tools[].image_generation` 的语义就是"出图"，与 `docs/01` §4.3 的编排描述一致。
 
+### 7.1 实施后补充：历史按"轮"截断（2026-09-11）
+
+`input[]` 有两种拼法表达**同一轮**：`{role, content}` 消息，或一串裸
+`{type: input_text | input_image}` part。所以截断单位是**轮**而非 item：
+
+| `input[]` 形态 | 行为 |
+|---|---|
+| 字符串 | 一轮，全保留 |
+| 连续裸 part | **同属一轮**，全部保留 |
+| 多个 `{role, content}` | 每消息一轮，只保留最后一条 user 轮；`assistant` 忽略 |
+| `system` / `developer` | 不占轮次；文本以 `"\n\n"` 前置进 `prompt`（同 chat 门），附图视为全局参考、不参与截断 |
+| 未知 `role` | 400 `unsupported_parameter` |
+| 截断后无 user 轮（如只有 `assistant`） | 400 `invalid_request`（`prompt` 缺失） |
+
+按 item 截断会在第一种形态上出错：`[{input_text:"改背景"}, {input_image:…}]`
+会被削成"只剩图、丢了指令"，那是**改变请求**而不是缩短请求。
+`test_responses_bare_parts_are_one_turn_not_several` 是这条的守卫（已用变异验证过会报红）。
+
+⚠️ 本节改动同时把 `system` 与用户文本的分隔从 `"\n"` 改为 `"\n\n"`，并与 chat 门一致地把
+`system` 文本改为**前置**拼接（此前是按出现顺序插入）。
+
 建议新增 `adapter/api/frontdoor.py`，放**纯函数**折叠逻辑
 （`messages_to_canonical` / `input_to_canonical` / `canonical_to_chat` / `canonical_to_response`），
 两个路由各自薄封装。纯函数可直接单测，不必起服务。
@@ -232,7 +254,9 @@ chat 客户端仍然解析不了。这是「前门只改输入不够」的地方
 
 1. **回归今天的缺陷**：chat 体 + 图片脚本，断言出站 `parts[0].text` 是拼好的 prompt，**不是空串**；
 2. `content` 为 parts 数组时，`image_url` 正确落入 `image`，且 url 透传不下载；
-3. 多条 user / 出现 assistant -> 400 `unsupported_parameter`；
+3. 多条 user / 出现 assistant -> 截断到最后一条 user 轮（文本与图都只取最后一条，
+   前序轮次不留痕）；未知 `role` -> 400 `unsupported_parameter`；
+   **responses 门同理**，且**连续裸 part 属同一轮**（不得按 item 截断，见 §7.1）；
 4. 未知 part `type` -> 400；
 5. **chat 专有字段不出现在出站 body 里**（针对 `openai/images@v1` 的整体转发路径，
    用假 OpenAI 上游断言上游收到的 body 只有规范字段）—— 这条是 §2 第 2 条证据的守卫；
@@ -289,4 +313,8 @@ chat 客户端仍然解析不了。这是「前门只改输入不够」的地方
 - 没把 `stream` / `model` 折进规范体：脚本整体转发时会漏给上游，两者都是入口层的事；
 - 没给 `/v1/chat/completions` 保留 `tools`：这里的 `tools` 是函数调用，与 `image_generation` 编排同名不同义，
   带上会让脚本切到 `[TEXT, IMAGE]` 模态。`/v1/responses` 才带；
-- 没实现多轮：多条 user / 任何 assistant 轮一律 400（`docs/06` §4.6）。
+- 没实现多轮：**两个门**的历史都被**截断到最后一条 `user` 轮**（文本与图都只取最后一条，
+  `assistant` 轮忽略），前序轮次不进上游。chat 门按 `messages` 逐轮切分（§3）；responses 门
+  按"轮"切分，**连续裸 part 属同一轮**（§7.1）。真多轮改图（把上一轮返回的图带回下一轮）
+  仍未支持，见 `docs/06` §4.6。截断于 2026-09-11 由"一律 400"改来，理由与代价见 §3 规则表；
+  未知 `role` 依旧 400。

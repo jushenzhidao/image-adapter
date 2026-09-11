@@ -212,15 +212,20 @@ def test_script_may_import_allowlisted_stdlib(client, channel_headers, vendor):
     [
         ({"prompt": "x", "image": 123}, "image"),
         ({"prompt": "x", "image": ""}, "image"),
-        ({"prompt": "x", "image": []}, "image"),
         ({"prompt": "x", "image": ["ok", 5]}, "image"),
         ({"prompt": "x", "mask": PNG_B64}, "mask"),
         ({"image": None}, "prompt"),
         ({"prompt": "   "}, "prompt"),
-        ({"prompt": "x", "n": True}, "n"),
     ],
 )
 def test_invalid_bodies_are_rejected(client, channel_headers, vendor, body, param):
+    """`image: []` and a malformed `n` used to be listed here.
+
+    Both are now normalised rather than refused -- the key is dropped, or `n`
+    becomes one -- so they moved to tests/unit/test_images_validation.py, which
+    pins the value each becomes. `{"image": None}` stays: it has no prompt
+    either, which is still refused.
+    """
     resp = _post(client, channel_headers(PASSTHROUGH_SCRIPT, f"{vendor}/v2/img2img"), body)
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["param"] == param

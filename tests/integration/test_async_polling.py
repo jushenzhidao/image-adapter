@@ -159,9 +159,12 @@ def test_script_ref_from_store(client, channel_headers, settings):
     }
     # No upstream call is made when validation fails first; use a bad payload
     # to stop at validation and prove the ref resolved (a missing ref would
-    # produce script_not_found before validation ordering matters).
+    # produce script_not_found before validation ordering matters). `n` is no
+    # longer usable here -- it is normalised rather than refused.
     resp = client.post(
-        "/v1/images/generations", headers=headers, json={"prompt": "cat", "n": 0}
+        "/v1/images/generations",
+        headers=headers,
+        json={"prompt": "cat", "response_format": "hologram"},
     )
     assert resp.status_code == 400
-    assert resp.json()["error"]["param"] == "n"
+    assert resp.json()["error"]["param"] == "response_format"

@@ -182,13 +182,21 @@ def _attach_images(canonical: dict, refs: list[str]) -> None:
 def messages_to_canonical(body: dict) -> dict:
     """A chat body -> the canonical image request.
 
-    Only one user turn can be honoured: the canonical contract has a single
-    `prompt` and a single `image`, so history has nowhere to go. An `assistant`
-    turn or a second `user` turn therefore means multi-turn editing, which this
-    channel explicitly does not do (``docs/06`` 4.6). Refusing is the point:
-    quietly forwarding only the last turn would change the image while the
-    caller believed its context had been honoured, and that is the kind of bug
-    that looks like a model problem for weeks.
+    History is truncated to the last `user` turn: the canonical contract has a
+    single `prompt` and a single `image`, so an earlier turn has nowhere to go.
+    That last user message supplies both the prompt and the image set, and every
+    `assistant` turn is ignored -- its images are the *outputs* of earlier
+    turns, not inputs to this one.
+
+    The truncation is a deliberate trade, not an oversight. Refusing outright
+    was the original behaviour (``docs/06`` 4.6), and the reason still stands: a
+    silent truncation changes the image while the caller believes its context
+    was honoured, which is a bug that looks like a model problem for weeks. The
+    caller opted into truncation over refusal; what the refusal bought was a
+    loud failure, and that is what is given up.
+
+    An unknown role is still refused -- a misspelled ``"user"`` must not pass as
+    history and quietly reduce the request to the wrong turn.
     """
     messages = body.get("messages")
     if not messages or not isinstance(messages, list):
@@ -197,8 +205,9 @@ def messages_to_canonical(body: dict) -> dict:
         )
 
     instructions: list[str] = []
+    instruction_refs: list[str] = []
     user_text = ""
-    refs: list[str] = []
+    user_refs: list[str] = []
     users = 0
 
     for index, message in enumerate(messages):
@@ -210,16 +219,24 @@ def messages_to_canonical(body: dict) -> dict:
             text, found = _read_content(message.get("content"), f"{where}.content")
             if text:
                 instructions.append(text)
-            refs.extend(found)
+            # A system turn's images are global reference rather than one
+            # turn's input, so they survive the truncation below.
+            instruction_refs.extend(found)
         elif role == "user":
             users += 1
+            # Last one wins, images included: the canonical contract carries a
+            # single prompt and a single image set, so an earlier user turn is
+            # history and only the newest instruction is actionable.
             user_text, found = _read_content(message.get("content"), f"{where}.content")
-            refs.extend(found)
+            user_refs = list(found)
+        elif role == "assistant":
+            # Its images are the outputs of earlier turns, not inputs to this
+            # one, and its text is not an instruction this channel can act on.
+            continue
         else:
             raise InvalidRequestError(
                 "This channel turns a single user turn into one image; "
-                f"'{where}.role' is {role!r}. Multi-turn editing is not "
-                "supported here.",
+                f"'{where}.role' is {role!r}.",
                 param=f"{where}.role",
                 code=_UNSUPPORTED,
             )
@@ -227,13 +244,6 @@ def messages_to_canonical(body: dict) -> dict:
     if users == 0:
         raise InvalidRequestError(
             "'messages' must contain a user message", param="messages"
-        )
-    if users > 1:
-        raise InvalidRequestError(
-            "This channel turns a single user turn into one image; "
-            f"{users} user turns were sent",
-            param="messages",
-            code=_UNSUPPORTED,
         )
 
     prompt = user_text
@@ -244,7 +254,7 @@ def messages_to_canonical(body: dict) -> dict:
     if body.get("model") is not None:
         canonical["model"] = body["model"]
     canonical["prompt"] = prompt
-    _attach_images(canonical, refs)
+    _attach_images(canonical, instruction_refs + user_refs)
     return canonical
 
 
@@ -255,6 +265,17 @@ def input_to_canonical(body: dict, prior: object = None) -> dict:
     spelled three different ways in the wild: bare strings, `{type: input_text |
     input_image}` parts, or `{role, content}` messages.
 
+    History is truncated to the last user turn, exactly as on the chat door: the
+    canonical contract carries a single `prompt` and a single `image`, so an
+    earlier turn has nowhere to go. `assistant` items are skipped as history and
+    an unknown role is still refused, for the same reason as there.
+
+    The unit of truncation is the *turn*, not the item. `input[]` spells one
+    turn two ways -- a `{role, content}` message, or a bare run of
+    `{type: input_text | input_image}` parts -- and a turn's parts belong
+    together. Truncating item by item would keep a turn's image and drop its
+    instruction, which changes the request rather than shortening it.
+
     `tools` is carried, unlike on the chat door, because here it means
     `image_generation` orchestration -- a field scripts already read to decide
     their response modalities. `_previous_ctx` is the adapter's own state
@@ -262,34 +283,72 @@ def input_to_canonical(body: dict, prior: object = None) -> dict:
     the state chain.
     """
     raw = body.get("input")
+    instructions: list[str] = []
+    instruction_refs: list[str] = []
+    #: Banked turns, each as (texts, refs). Only the last one survives.
+    turns: list[tuple[list[str], list[str]]] = []
+    texts: list[str] = []
     refs: list[str] = []
+    opened = False
+
+    def close_turn() -> None:
+        """Bank the open turn when it carries anything, then clear it."""
+        nonlocal opened
+        if opened and (texts or refs):
+            turns.append((list(texts), list(refs)))
+        texts.clear()
+        refs.clear()
+        opened = False
+
+    def start_turn(*, fresh: bool) -> None:
+        """Open a turn, closing the previous one first when `fresh`."""
+        nonlocal opened
+        if fresh:
+            close_turn()
+        opened = True
 
     if isinstance(raw, str):
-        text = raw
+        start_turn(fresh=False)
+        texts.append(raw)
     elif isinstance(raw, list):
-        chunks: list[str] = []
         for index, item in enumerate(raw):
             where = f"input[{index}]"
             if isinstance(item, str):
-                chunks.append(item)
+                start_turn(fresh=False)
+                texts.append(item)
                 continue
             if not isinstance(item, dict):
                 raise InvalidRequestError(f"'{where}' must be an object", param=where)
             if "content" in item:
                 role = item.get("role")
-                if role not in (None, "user") and role not in _INSTRUCTION_ROLES:
+                if role in _INSTRUCTION_ROLES:
+                    # An instruction is not a turn: it applies to whichever turn
+                    # survives truncation, so it is never closed by it.
+                    chunk, found = _read_content(item.get("content"), f"{where}.content")
+                    if chunk:
+                        instructions.append(chunk)
+                    instruction_refs.extend(found)
+                    continue
+                if role == "assistant":
+                    # History: its images are the outputs of earlier turns, and
+                    # its text is not an instruction this channel can act on.
+                    close_turn()
+                    continue
+                if role not in (None, "user"):
                     raise InvalidRequestError(
                         "This channel turns a single user turn into one image; "
-                        f"'{where}.role' is {role!r}. Multi-turn editing is not "
-                        "supported here.",
+                        f"'{where}.role' is {role!r}.",
                         param=f"{where}.role",
                         code=_UNSUPPORTED,
                     )
+                start_turn(fresh=True)
                 chunk, found = _read_content(item.get("content"), f"{where}.content")
             elif item.get("type") in _TEXT_PART_TYPES | _IMAGE_PART_TYPES:
                 # The item *is* the part, so it is named directly rather than
                 # through a one-element list: `input[0].type`, not
-                # `input[0][0].type`.
+                # `input[0][0].type`. A bare run of these is one turn's parts,
+                # which is why they extend the open turn instead of replacing it.
+                start_turn(fresh=False)
                 chunk, ref = _read_part(item, where)
                 found = [ref] if ref else []
             else:
@@ -300,18 +359,26 @@ def input_to_canonical(body: dict, prior: object = None) -> dict:
                     code=_UNSUPPORTED,
                 )
             if chunk:
-                chunks.append(chunk)
+                texts.append(chunk)
             refs.extend(found)
-        text = "\n".join(chunks)
     else:
         raise InvalidRequestError(
             "'input' must be a non-empty string or an array", param="input"
         )
 
+    close_turn()
+    last_texts, last_refs = turns[-1] if turns else ([], [])
+    text = "\n".join(last_texts)
+    refs = instruction_refs + last_refs
+
+    prompt = text
+    if instructions:
+        prompt = "\n".join(instructions) + "\n\n" + text
+
     canonical: dict = {}
     if body.get("model") is not None:
         canonical["model"] = body["model"]
-    canonical["prompt"] = text
+    canonical["prompt"] = prompt
     _attach_images(canonical, refs)
     if body.get("tools") is not None:
         canonical["tools"] = body["tools"]
