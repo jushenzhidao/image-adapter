@@ -96,8 +96,8 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | Redis | `job_lock:{job_id}` | 异步轮询分布式锁 | poll_interval+1s |
 | Redis | `resp_ctx:{response_id}` | responses 状态链上下文 | 1h |
 | Redis | `ratelimit:{token}:{window}` | 滑动窗口限流 | 窗口期 |
-| 对象存储 | `temp/{request_id}/{uuid}.{ext}` | 临时图片（键由引擎构造，与后端无关） | minio：预签名 1h (BR-005)；fal：公网长期，仅取 basename |
-| 对象存储 | `temp/{request_id}/step_{name}.{ext}` | 管线中间产物（大图引用传递） | 同上 (BR-016) |
+| 对象存储 | `[<prefix>/]<yyyymmdd>/{request_id}/{uuid}.{ext}` | 临时图片（键由引擎构造，与后端无关；日期段恒定，前缀默认空 ⇒ 日期落在桶根） | minio：预签名 URL，TTL=`temp_image_ttl`（默认 1h，上限 7d）(BR-005)；fal：公网长期，仅取 basename |
+| 对象存储 | `[<prefix>/]<yyyymmdd>/{request_id}/step_{name}.{ext}` | 管线中间产物（大图引用传递）——**约定，非当前 API 能力**：`upload_temp_image` 不接受命名键，现无脚本产生此形态 | 同上 (BR-016) |
 
 **降级规则（锁定）**：`REDIS_URL`/所选后端必填项（`minio` 看 `MINIO_ENDPOINT`，`fal` 看 `FAL_KEY`）未配置时，dev 模式降级为进程内内存缓存 + data URI 输出并打 warning 日志；docker compose 生产编排必须配齐，不允许降级。
 

@@ -185,14 +185,14 @@ class Settings(BaseSettings):
     # would pay that for as long as the primary is down.
     storage_failover_cooldown: int = 30
 
-    # First segment of the keys the engine builds:
-    # ``<prefix>/<yyyymmdd>/<request-id>/<uuid>.<ext>``. The date segment is
-    # always present so a bucket lifecycle rule can expire a day at a time and
-    # an operator can find an upload by when it happened; the prefix is
-    # configurable because a deployment may already address its bucket through
-    # a convention of its own (STORAGE_KEY_PREFIX=cdn). Only the minio flavours
-    # see it -- fal has no directories and flattens the key to its basename.
-    storage_key_prefix: str = "temp"
+    # Optional first segment of the keys the engine builds:
+    # ``[<prefix>/]<yyyymmdd>/<request-id>/<uuid>.<ext>``. Empty is the default
+    # and puts the date at the bucket root, which is how the buckets these
+    # channels write to are already laid out; set it only to add a namespace of
+    # your own in front of the date. Slashes are stripped, so "" and "/" mean
+    # the same thing and neither can produce "//<date>/...". Only the minio
+    # flavours see it -- fal has no directories and flattens the key.
+    storage_key_prefix: str = ""
 
     @model_validator(mode="after")
     def _fallback_must_differ_from_the_primary(self) -> Self:

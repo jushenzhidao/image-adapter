@@ -4,13 +4,14 @@ Everything backend-specific lives in ``adapter.storage``; this mixin owns only
 the two things the engine decides:
 
   * **the key convention** --
-    ``<prefix>/<yyyymmdd>/<request-id>/<uuid>.<ext>``. Grouping by request id
-    keeps one request's objects together for an operator looking at a bucket,
-    and the uuid stops a second upload of identical bytes from overwriting the
-    first, which matters because the two may need different lifetimes. The date
-    segment and the configurable prefix exist so a bucket lifecycle rule can
-    expire a day at a time and an operator can find an upload by when it
-    happened. A backend with no directories flattens the whole thing; see
+    ``[<prefix>/]<yyyymmdd>/<request-id>/<uuid>.<ext>``. The date leads so a
+    bucket lifecycle rule can expire a day at a time and an operator can find
+    an upload by when it happened; it is also where the buckets these channels
+    write to already put objects, hence no prefix by default. Grouping by
+    request id keeps one request's objects together for an operator looking at
+    a bucket, and the uuid stops a second upload of identical bytes from
+    overwriting the first, which matters because the two may need different
+    lifetimes. A backend with no directories flattens the whole thing; see
     ``FalStore.put``.
   * **the degradation contract** -- storage is an accelerator, so an absent or
     failing store must not fail the request. The caller gets a data URI and a
@@ -90,7 +91,17 @@ class StorageMixin(NeedsCodec):
         return stored.url
 
     def _temp_key(self, ext: str) -> str:
-        """``<prefix>/<yyyymmdd>/<request-id>/<uuid>.<ext>``.
+        """``[<prefix>/]<yyyymmdd>/<request-id>/<uuid>.<ext>``.
+
+        The date comes first and the prefix is optional, because empty is the
+        default: a deployment that says nothing gets ``<date>/...`` at the
+        bucket root, which is how the buckets these channels write to are
+        already laid out. The prefix exists only for a deployment that wants
+        its own namespace in front of the date.
+
+        Slashes are stripped rather than left alone: an empty or "/"-only value
+        would otherwise produce ``//<date>/...``, which some S3 implementations
+        read as a different (empty) bucket path.
 
         The date is the process's local date, so ``TZ`` decides where the
         midnight boundary falls -- UTC in a container unless the deployment
@@ -98,6 +109,6 @@ class StorageMixin(NeedsCodec):
         wants the date their own clock showed, and there is no client timezone
         to derive one from.
         """
-        prefix = self.settings.storage_key_prefix.strip("/") or "temp"
-        day = time.strftime("%Y%m%d")
-        return f"{prefix}/{day}/{self.request_id}/{uuid.uuid4().hex}.{ext}"
+        prefix = self.settings.storage_key_prefix.strip("/")
+        tail = f"{time.strftime('%Y%m%d')}/{self.request_id}/{uuid.uuid4().hex}.{ext}"
+        return f"{prefix}/{tail}" if prefix else tail

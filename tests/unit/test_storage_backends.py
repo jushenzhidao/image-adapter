@@ -367,9 +367,8 @@ async def test_upload_uses_a_request_scoped_key_with_the_sniffed_extension():
 
     assert url == "https://cdn.test/x.png"
     key, content_type = store.calls[0]
-    # <prefix>/<yyyymmdd>/<request-id>/<uuid>.<ext>
-    prefix, day, request_id, name = key.split("/")
-    assert prefix == "temp"
+    # <yyyymmdd>/<request-id>/<uuid>.<ext> -- the prefix is optional and unset
+    day, request_id, name = key.split("/")
     assert day == time.strftime("%Y%m%d")
     assert request_id == "req-42"
     assert name.endswith(".webp")
@@ -384,7 +383,7 @@ async def test_upload_puts_the_day_in_the_key_so_a_lifecycle_rule_can_use_it():
     await _ctx(store).upload_temp_image(PNG, ext="png")
 
     key = store.calls[0][0]
-    assert key.split("/")[1] == time.strftime("%Y%m%d")
+    assert key.split("/")[0] == time.strftime("%Y%m%d")
 
 
 async def test_upload_takes_the_key_prefix_from_settings():
@@ -394,17 +393,31 @@ async def test_upload_takes_the_key_prefix_from_settings():
 
     await _ctx(store, storage_key_prefix="cdn").upload_temp_image(PNG, ext="png")
 
-    assert store.calls[0][0].startswith("cdn/")
+    key = store.calls[0][0]
+    assert key.startswith(f"cdn/{time.strftime('%Y%m%d')}/req-42/")
+    assert key.endswith(".png")
 
 
-async def test_an_empty_key_prefix_still_yields_a_usable_key():
-    """Empty or "/"-only would otherwise produce "//20260911/...", which some
-    S3 implementations treat as a different (empty) bucket path."""
+async def test_an_empty_key_prefix_puts_the_date_at_the_bucket_root():
+    """Empty is the default, and it must *not* fall back to a literal "temp".
+
+    The buckets these channels write to already lay objects out by date
+    (``cdn/<yyyymmdd>/...``), so an extra segment nobody configured is worse
+    than no segment: a lifecycle rule or a listing script keyed to the date
+    would have to know about it. "/"-only values are still stripped, because
+    ``//20260911/...`` is read as a different (empty) bucket path by some S3
+    implementations.
+    """
     store = _RecordingStore()
 
     for value in ("", "/", "///"):
         await _ctx(store, storage_key_prefix=value).upload_temp_image(PNG, ext="png")
-        assert store.calls[-1][0].startswith("temp/")
+
+        key = store.calls[-1][0]
+        assert key.startswith(f"{time.strftime('%Y%m%d')}/req-42/")
+        assert "temp/" not in key
+
+    assert len(store.calls) == 3
 
 
 async def test_upload_returns_a_data_uri_when_no_store_is_configured():

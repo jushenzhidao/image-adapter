@@ -22,9 +22,14 @@ Required on the storage side (nothing this process can arrange):
   * the bucket policy must allow ``s3:GetObject`` to ``*``. ``ping`` checks
     that, so a deployment which forgot reports degraded instead of handing out
     URLs that 403.
-  * object keys must not be guessable. Ours are ``temp/<uuid4>/<uuid4>``, so
-    "public" means "anyone holding the link" rather than "anyone who asks" --
-    but that is a property of the key convention, not of the policy.
+  * object keys must not be guessable. Ours are
+    ``[<prefix>/]<yyyymmdd>/<request-id>/<uuid4>.<ext>``, and the trailing
+    uuid4 is what carries that property: the request-id segment can be chosen
+    by the caller via ``X-Request-Id``, so it must not be counted on. Note also
+    that key secrecy only means anything while the policy withholds
+    ``s3:ListBucket`` -- measured on a live bucket on 2026-09-11, a policy with
+    ``Principal: "*"`` on ``s3:ListBucket`` let an anonymous caller enumerate
+    20 real keys, at which point "public" really does mean "anyone who asks".
 """
 
 from __future__ import annotations
@@ -106,8 +111,8 @@ class MinioPublicStore(MinioStore):
             scheme = "https" if self._settings.minio_secure else "http"
             bucket = self._settings.minio_bucket
             base = f"{scheme}://{self._settings.minio_endpoint}/{bucket}"
-        # safe="/" keeps the temp/<request-id>/<uuid>.<ext> shape readable in
-        # logs while still escaping anything a key should never contain.
+        # safe="/" keeps the <yyyymmdd>/<request-id>/<uuid>.<ext> shape readable
+        # in logs while still escaping anything a key should never contain.
         return f"{base.rstrip('/')}/{quote(key, safe='/')}"
 
     def _put_and_url(self, data: bytes, key: str, content_type: str) -> str:

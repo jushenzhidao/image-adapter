@@ -390,7 +390,7 @@ def _mime_from_url(ref, ctx):
 | 出站带宽 | 1.37X 走**我方上行**（跨境） | 几百字节 |
 | 硬上限 | 入站 64MB → 单图 20MB → **上游 inline 最紧**（保守 7MB/图 ≈ 原图 5.25MB；多图或按 20MB/请求算） | 100MB，且不吃我们的 body |
 | 失败模式 | 413 / 400，往往打到上游才知道 | 上游拉不到 URL，错误可读 |
-| 留存 | 不落盘 | 写进我方对象存储（`temp/<request_id>/<uuid>.<ext>`）。**留存期取决于后端**：minio 预签名 1h；fal 公网长期、不过期 |
+| 留存 | 不落盘 | 写进我方对象存储（`[<prefix>/]<yyyymmdd>/<request_id>/<uuid>.<ext>`，日期段恒定、前缀默认空）。**留存期取决于后端**：minio 预签名 URL（TTL 可配，默认 1h，上限 7d）；fal 公网长期、不过期 |
 
 两条决定性事实：`binascii` **不释放 GIL**（编解码串行占 event loop，≈0.5ms/MB/次，5MB 图走
 edits+inline ≈ 7~8ms 纯 CPU）；以及**上游 inline 上限是三层限制里最紧的** —— 所以"inline 大图"

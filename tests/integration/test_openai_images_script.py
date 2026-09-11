@@ -394,7 +394,12 @@ def test_a_data_uri_upstream_becomes_a_link_when_storage_is_configured(
     assert len(storage.puts) == 1
     key, content_type, raw = storage.puts[0]
     assert raw == PNG_1X1
-    assert key.startswith("temp/") and key.endswith(".png")
+    # <yyyymmdd>/<request-id>/<uuid>.<ext>: the day leads so a bucket lifecycle
+    # rule can expire a day at a time, and there is no prefix unless a
+    # deployment asks for one.
+    day, request_id, name = key.split("/")
+    assert len(day) == 8 and day.isdigit()
+    assert request_id and name.endswith(".png")
     # The port carries the type through to the backend so the object is served
     # inline rather than as a download.
     assert content_type == "image/png"
