@@ -9,7 +9,10 @@ an image script does:
     iVBORw0KGgo...          bare base64
 
 bytes -> URL is the one direction that cannot be done locally: it needs
-object storage, which lives in ``StorageMixin.upload_temp_image``.
+object storage, which lives in ``StorageMixin.upload_temp_image``. Its mirror
+-- bytes -> *fewer* bytes -- needs no infrastructure at all, and lives here as
+``compress_image``: Pillow is already a dependency, and the operators it calls
+are the ones in ``adapter.utils.imageops``.
 """
 
 from __future__ import annotations
@@ -229,3 +232,51 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
         if mime.startswith("image/"):
             ext = mime.split("/", 1)[1]
         return await self.upload_temp_image(data, ext=ext)
+
+    async def compress_image(
+        self,
+        ref: str,
+        *,
+        max_bytes: int | None = None,
+        max_edge: int | None = None,
+        fmt: str | None = None,
+        quality: int | None = None,
+    ) -> bytes:
+        """Any of the three shapes -> bytes that fit the limits given.
+
+        A reference is the biggest thing a client sends and the one thing an
+        upstream may refuse to fetch: ARK documents a hard 5 s download cap on
+        its side and recommends compressing references below 100 kB, and no
+        request parameter can raise either. Shrinking the reference is
+        therefore the answer to two failures at once -- the fetch that times
+        out, and the payload that will not fit.
+
+        **Why this is a capability and not a behaviour.** The obvious-looking
+        alternative is to compress inside ``upload_temp_image``, and it is
+        wrong twice over. That one method serves the reference *and* the
+        generated image handed back to the client, which are not the same
+        thing at all -- one is an input we may resample, the other is the
+        product the caller paid for. And "should this be compressed" depends on
+        what the *channel* wants, which is the one question the framework is
+        forbidden to answer (``docs/07`` §2). So the mechanism is here, the
+        decision stays in the script, and a channel that wants it says so in
+        ``X-Channel-Options``.
+
+        The limits are passed straight through to ``ctx.image.compress``, which
+        documents what each one guarantees: ``max_edge`` is a ceiling and
+        ``max_bytes`` is a target that may be missed.
+
+        Raises ``InvalidRequestError`` for bytes no image library can read, for
+        a format outside the allowlist, and for anything over the pixel or byte
+        cap -- the same refusals ``image_bytes`` already makes. A caller that
+        must not fail its request has to catch it and keep the original, which
+        is a decision this layer deliberately leaves alone.
+        """
+        data = await self.image_bytes(ref)
+        return await self.image.compress(
+            data,
+            max_bytes=max_bytes,
+            max_edge=max_edge,
+            fmt=fmt,
+            quality=quality,
+        )

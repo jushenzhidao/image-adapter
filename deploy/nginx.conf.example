@@ -95,11 +95,15 @@ server {
         # gunicorn, so a reaped worker's own error reaches the caller instead of
         # an nginx-generated 504 that hides which layer failed.
         #
-        # Sized for the shipped .env: UPSTREAM_TIMEOUT=600 (a 2K generation
+        # Sized for the shipped .env: UPSTREAM_TIMEOUT=300 (a 2K generation
         # measures 27~82s against Ark, so 60s truncates slow successes) and
-        # GUNICORN_TIMEOUT=960. Raise this whenever those move.
-        proxy_read_timeout 1000s;
-        proxy_send_timeout 1000s;
+        # GUNICORN_TIMEOUT=600. Raise this whenever those move -- and keep this
+        # value strictly ABOVE GUNICORN_TIMEOUT, never equal to it: nginx's
+        # default 60s (and an equal value) makes nginx win the race, and then
+        # the caller gets an nginx-generated 504 that hides which layer failed.
+        # Being well above it is fine: it is only the last line of defence.
+        proxy_read_timeout 1200s;
+        proxy_send_timeout 1200s;
         proxy_connect_timeout 10s;
 
         # MUST for /v1/chat/completions with stream=true. The adapter bridges a

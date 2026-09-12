@@ -390,7 +390,7 @@ def _mime_from_url(ref, ctx):
 | 出站带宽 | 1.37X 走**我方上行**（跨境） | 几百字节 |
 | 硬上限 | 入站 64MB → 单图 20MB → **上游 inline 最紧**（保守 7MB/图 ≈ 原图 5.25MB；多图或按 20MB/请求算） | 100MB，且不吃我们的 body |
 | 失败模式 | 413 / 400，往往打到上游才知道 | 上游拉不到 URL，错误可读 |
-| 留存 | 不落盘 | 写进我方对象存储（`[<prefix>/]<yyyymmdd>/<request_id>/<uuid>.<ext>`，日期段恒定、前缀默认空）。**留存期取决于后端**：minio 预签名 URL（TTL 可配，默认 1h，上限 7d）；fal 公网长期、不过期 |
+| 留存 | 不落盘 | 写进我方对象存储（`<yyyymmdd>/[<prefix>/]<uuid>.<ext>`，日期段恒定且落在桶根、前缀默认空且位于日期之内、**键里既无 model 也无 request-id 段**）。**留存期取决于后端**：minio 预签名 URL（TTL 可配，默认 1h，上限 7d）；fal 公网长期、不过期 |
 
 两条决定性事实：`binascii` **不释放 GIL**（编解码串行占 event loop，≈0.5ms/MB/次，5MB 图走
 edits+inline ≈ 7~8ms 纯 CPU）；以及**上游 inline 上限是三层限制里最紧的** —— 所以"inline 大图"
@@ -420,7 +420,7 @@ base64 缺 mime 时才需要解码一次去 sniff。
 ### 4.5 `n` / `mask` / `watermark` 的处理决策
 
 - **`n > 1` → 400 `unsupported_parameter`**（"Gemini returns one image per request; send
-  separate requests"）。不做串行 repeat：那会把单请求压到 `UPSTREAM_TIMEOUT`（180s）以上、
+  separate requests"）。不做串行 repeat：那会把单请求压到 `UPSTREAM_TIMEOUT`（现 300s）以上、
   计费 ×n、且失败语义不清（部分成功怎么回？）。要做也应在上层控制面 fan-out。
 - **`mask` → 400**（Gemini 没有 mask 语义，静默丢弃等于骗调用方）。
 - **`watermark` → 忽略**（SynthID 不可关）；文档注明，不要假装支持。
@@ -541,7 +541,7 @@ class FaultMixin(CtxMixin):
 | Header | 值 |
 |---|---|
 | `X-Upstream-Url` | `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent` |
-| `X-Script-Ref` | `google/images@v1` |
+| `X-Script-Ref` | `google/images@stable`（推荐；`@v1` / `@latest` 同指一版） |
 | `Authorization` | `Bearer <GEMINI_API_KEY>`（凭据仍走标准头，值会被 `upstream_key` 取走） |
 | `X-Auth-Emit` | `header:x-goog-api-key`（**裸 key，无前缀**） |
 | `X-Channel-Options` | `{"default_response_format":"b64_json","image_ref_mode":"inline"}` |
@@ -580,7 +580,7 @@ curl -X POST http://localhost:8080/v1/images/edits \
 
 | 既有约束 | 现状 | 对 Google 渠道的影响 / 处置 |
 |---|---|---|
-| `UPSTREAM_TIMEOUT` | 默认 60s，`.env` 已设 180s | 3.x Pro 带 thinking，同步出图可能 30~90s；**180s 是硬下限**，4K 建议实测后调 |
+| `UPSTREAM_TIMEOUT` | 默认 60s，`.env` 已设 300s | 3.x Pro 带 thinking，同步出图可能 30~90s；**180s 是硬下限**，现取值 300s 留有余量，4K 仍建议实测后调 |
 | `MAX_UPSTREAM_BYTES` | 64MB | 4K PNG 的 base64 约 15~35MB，够用；但**响应相位若还要在此基础上转 URL 上传，峰值内存 ×2** |
 | `MAX_REQUEST_BYTES` | 64MB（入站） | inline 上限有 7/20/100MB 三口径（P0-2）；**URL 直通模式下这条约束直接消失**（图片不进我们的 body），这正是 `auto` 模式要按体积分流的原因 |
 | `TEMP_IMAGE_TTL` | 3600s | **仅 minio 后端**：只控制预签名有效期，不控制对象何时被删除（那属于桶生命周期规则，代码不管）。OpenAI/ARK 客户端习惯 24h，故 url 形态的有效期差异要写进文档；fal 后端无此概念 |

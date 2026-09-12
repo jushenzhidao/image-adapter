@@ -3,15 +3,15 @@
 Everything backend-specific lives in ``adapter.storage``; this mixin owns only
 the two things the engine decides:
 
-  * **the key convention** --
-    ``[<prefix>/]<yyyymmdd>/<request-id>/<uuid>.<ext>``. The date leads so a
-    bucket lifecycle rule can expire a day at a time and an operator can find
-    an upload by when it happened; it is also where the buckets these channels
-    write to already put objects, hence no prefix by default. Grouping by
-    request id keeps one request's objects together for an operator looking at
-    a bucket, and the uuid stops a second upload of identical bytes from
-    overwriting the first, which matters because the two may need different
-    lifetimes. A backend with no directories flattens the whole thing; see
+  * **the key convention** -- ``<yyyymmdd>/[<prefix>/]<uuid>.<ext>``. The date leads so
+    a bucket lifecycle rule can expire a day at a time and an operator can find an
+    upload by when it happened; it is also where the buckets these channels write to
+    already put objects, hence no prefix by default. A prefix, when set, groups objects
+    *within* the day (a deployment's own namespace) and never moves the date out of
+    first position. Neither the model nor the request id appears in the key: a key
+    becomes the URL handed to the caller, so whatever is in it is readable by whoever
+    holds that URL, and the trace already carries both facts for people allowed them.
+    A backend with no directories flattens the whole thing; see
     ``FalStore.put``.
   * **the degradation contract** -- storage is an accelerator, so an absent or
     failing store must not fail the request. The caller gets a data URI and a
@@ -134,24 +134,36 @@ class StorageMixin(NeedsCodec):
         return stored.url
 
     def _temp_key(self, ext: str) -> str:
-        """``[<prefix>/]<yyyymmdd>/<request-id>/<uuid>.<ext>``.
+        """``<yyyymmdd>/[<prefix>/]<uuid>.<ext>``.
 
-        The date comes first and the prefix is optional, because empty is the
-        default: a deployment that says nothing gets ``<date>/...`` at the
-        bucket root, which is how the buckets these channels write to are
-        already laid out. The prefix exists only for a deployment that wants
-        its own namespace in front of the date.
+        The date comes first and sits at the bucket root, because that is how the
+        buckets these channels write to are already laid out: a lifecycle rule can
+        expire a day at a time, and an upload can be found by when it happened.
 
-        Slashes are stripped rather than left alone: an empty or "/"-only value
-        would otherwise produce ``//<date>/...``, which some S3 implementations
-        read as a different (empty) bucket path.
+        A prefix is a namespace *below* the date, not above it, so setting one never
+        moves the date out of first position -- that property is what the rule above
+        depends on. Slashes are stripped either way, so "" and "/" mean the same thing
+        and neither can produce "<date>//<name>".
 
-        The date is the process's local date, so ``TZ`` decides where the
-        midnight boundary falls -- UTC in a container unless the deployment
-        says otherwise. That is deliberate: an operator reading the bucket
-        wants the date their own clock showed, and there is no client timezone
-        to derive one from.
+        The name is the bare uuid, and the model deliberately does **not** appear in it
+        (reversed on 2026-09-12, the same day it was added). A key becomes the URL handed
+        to the caller, and on the unsigned backends anyone holding that URL -- or reading
+        a log, a referrer, or the bucket itself -- would learn which model produced the
+        image. That is information about the deployment, and a key is not the place to
+        publish it: the trace already carries ``model`` for people who are allowed it
+        (``trace_attrs.summarise_request``).
+
+        No request-id segment either, deliberately. Nothing consumed it: no code parses a
+        key back, and the trace carries ``request_id`` from ``request.state`` instead (see
+        ``logfire_setup._request_attributes``). What it did do was lengthen the URL handed
+        to the caller, so it was a cost with no buyer.
+
+        The date is the process's local date, so ``TZ`` decides where the midnight
+        boundary falls -- UTC in a container unless the deployment says otherwise. That
+        is deliberate: an operator reading the bucket wants the date their own clock
+        showed, and there is no client timezone to derive one from.
         """
+        date = time.strftime("%Y%m%d")
+        name = f"{uuid.uuid4().hex}.{ext}"
         prefix = self.settings.storage_key_prefix.strip("/")
-        tail = f"{time.strftime('%Y%m%d')}/{self.request_id}/{uuid.uuid4().hex}.{ext}"
-        return f"{prefix}/{tail}" if prefix else tail
+        return f"{date}/{prefix}/{name}" if prefix else f"{date}/{name}"

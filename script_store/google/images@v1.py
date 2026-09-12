@@ -1,5 +1,28 @@
 """google/images@v1: Gemini Image ("Nano Banana") through generateContent.
 
+The two per-image loops -- fetching the client's references and re-hosting the
+reply's images -- run through ``ctx.fanout``, so N images cost one wait instead
+of N. Nothing else is involved: same parts, same order, same error codes, and
+N=1 still takes the serial path.
+
+Two places are deliberately *not* a straight parallelisation of the loop, and
+both are about keeping a decision in the order it was made:
+
+* **The reference fetches are hoisted, not parallelised in place.** Whether a
+  reference is inlined or re-hosted depends on a per-request byte allowance that
+  is read-then-written in input order, so that decision must stay serial. What
+  *can* run concurrently is the download itself, so the downloads are pulled out
+  in front of the loop and the loop keeps making its decisions in the same order
+  as before. The set of references prefetched is exactly the set that loop would
+  have fetched -- no speculative work, and no wasted download if a later
+  decision would have hosted the image instead.
+* **The reply's decode stays serial.** ``binascii`` holds the GIL, so decoding N
+  images concurrently buys nothing; only the uploads go out together.
+
+The concurrency itself is a *behaviour* the caller can observe: up to
+``fanout_concurrency`` concurrent requests on the caller's image host, and on
+the object store, for one request.
+
 Channel setup (New API side):
   X-Upstream-Url:    https://generativelanguage.googleapis.com/v1beta/models/
                      gemini-3-pro-image:generateContent
@@ -29,7 +52,7 @@ This vendor differs from the OpenAI-shaped ones in four ways the script absorbs:
    uploading to MinIO here. TEMP_IMAGE_TTL applies (1h by default), not OpenAI's
    24h. With no MinIO configured the upload degrades to a data URI, which is not
    a link and is never returned as one: that item falls back to `b64_json`
-   instead of failing, matching openai/images@v1.
+   instead of failing, matching the openai script.
 4. The response phase cannot see the client's request body, so
    `response_format` travels through a module-level table keyed by request_id.
 
@@ -67,6 +90,7 @@ preview was exercised), the inline ceiling above 8.27MB, mime/type mismatch
 tolerance, and the exact shape of a safety block.
 """
 
+from functools import partial
 from urllib.parse import urlsplit, urlunsplit
 
 # Model facts -- aliases, resolution tiers, which ratios a model accepts -- live in
@@ -226,12 +250,40 @@ async def _bytes_part(ctx, ref, data, mime, mode, allowance):
     return {"inlineData": {"mimeType": mime, "data": ctx.encode_b64(data)}}
 
 
-async def _ref_part(ctx, ref, mode, allowance):
+def _needs_fetch(ctx, ref, mode):
+    """True when this reference is a URL we have to download ourselves.
+
+    Deliberately free of ``allowance``: *that* we need the bytes is a property of
+    the mode and the reference alone, while *what we do with them* -- inline or
+    re-host -- is the budget-dependent decision that has to stay serial. Drawing
+    the line there is what makes the downloads safe to run concurrently.
+
+    A URL the upstream will fetch itself is excluded, so nothing is prefetched
+    that the loop below would have skipped.
+    """
+    if not ctx.is_url(ref):
+        return False
+    # Handed to the upstream as-is under the passthrough rule: zero download.
+    return not (mode != "inline" and _passthrough(ctx))
+
+
+async def _fetch_ref(ctx, ref):
+    """One reference's bytes, named so ctx.fanout gets a single-argument call."""
+    return await ctx.image_bytes(ref)
+
+
+async def _ref_part(ctx, ref, mode, allowance, prefetched):
     """Three input shapes, four paths. Never fetch or encode what can be avoided.
 
     `allowance` is a one-element cell holding what is left of this request's
     inline budget: the upstream cap that matters is per request, so several
     individually small images can still overflow it.
+
+    `prefetched` carries the bytes of every reference ``_needs_fetch`` accepted,
+    downloaded concurrently before this loop started. The reads below are
+    therefore served from it, and the ``image_bytes`` calls that remain are the
+    local ones -- a bare base64 string being decoded -- which have nothing to
+    overlap anyway.
     """
     ref = ref.strip()
     per_image = int(ctx.options.get("inline_max_bytes", 4 * 1024 * 1024))
@@ -239,7 +291,11 @@ async def _ref_part(ctx, ref, mode, allowance):
     if ctx.is_url(ref):
         if mode != "inline" and _passthrough(ctx):
             return _uri_part(ref, _declared_mime(ctx, ref))  # zero download
-        data = await ctx.image_bytes(ref)  # we must fetch it ourselves
+        # Present already in the normal case; the fallback keeps this function
+        # correct when called on its own, and costs one cache lookup.
+        data = prefetched.get(ref)
+        if data is None:
+            data = await ctx.image_bytes(ref)  # we must fetch it ourselves
         return await _bytes_part(ctx, ref, data, ctx.sniff_mime(data), mode, allowance)
 
     fits = mode == "auto" and _b64_size(ref) <= min(per_image, allowance[0])
@@ -330,6 +386,23 @@ def _usage(payload):
     }
 
 
+async def _host_image(ctx, item):
+    """One (mime, base64) reply image -> a link, or None when storage is absent.
+
+    None rather than an adapter error, because the caller's fallback is the
+    upstream's own base64 -- a disappointment, but a usable answer, and failing
+    outright would punish the caller for a gap in our configuration.
+    ``upload_temp_image`` degrades to a data URI without storage, and a data URI
+    is not a link, so it must never be dressed up as one. The same rule holds in
+    openai/images, so both channels behave alike.
+    """
+    mime, blob = item
+    url = await ctx.upload_temp_image(
+        ctx.decode_b64(blob), ext=mime.split("/", 1)[-1] or "png"
+    )
+    return None if url.startswith("data:") else url
+
+
 async def _response(ctx, payload):
     """Upstream 200 -> the OpenAI envelope, or a client-visible error."""
     images = _collect_images(payload)
@@ -362,24 +435,17 @@ async def _response(ctx, payload):
         "default_response_format", "b64_json"
     )
 
-    data = []
-    for mime, blob in images:
-        if fmt == "url":
-            raw = ctx.decode_b64(blob)
-            url = await ctx.upload_temp_image(raw, ext=mime.split("/", 1)[-1] or "png")
-            if url.startswith("data:"):
-                # Without storage, upload_temp_image degrades to a data URI. That
-                # is not a link and must never be dressed up as one, so the
-                # upstream's own shape is returned instead: the caller asked for
-                # `url` and gets base64, which is a disappointment but a usable
-                # answer. Failing outright would punish the caller for a gap in
-                # our configuration -- and the same rule now holds in
-                # openai/images@v1, so both channels behave alike.
-                data.append({"b64_json": blob})
-                continue
-            data.append({"url": url})
-        else:
-            data.append({"b64_json": blob})
+    if fmt != "url":
+        data = [{"b64_json": blob} for _mime, blob in images]
+    else:
+        # The uploads go out together. The decode inside each one stays serial
+        # because binascii holds the GIL, so overlapping them would buy nothing
+        # -- it is the store round-trip that is worth hiding.
+        links = await ctx.fanout(images, partial(_host_image, ctx))
+        data = [
+            {"b64_json": blob} if url is None else {"url": url}
+            for (_mime, blob), url in zip(images, links)
+        ]
 
     out = {"created": payload.get("created", 0), "data": data, "usage": _usage(payload)}
     # Kept verbatim alongside the mapped block so billing can be reconciled
@@ -453,7 +519,17 @@ async def transform(ctx, payload, phase):
 
     allowance = [int(ctx.options.get("inline_total_max_bytes", 6 * 1024 * 1024))]
     mode = ctx.options.get("image_ref_mode", "auto")
-    ref_parts = [await _ref_part(ctx, ref, mode, allowance) for ref in refs]
+    # The downloads go out together; the decisions that consume them stay in
+    # input order below, because the inline allowance is read-then-written and
+    # which image is inlined must not depend on which download finished first.
+    # The prefetch set is computed without consulting that allowance, so this
+    # cannot change *whether* a reference is inlined -- only how soon it arrives.
+    wanted = [ref for ref in refs if _needs_fetch(ctx, ref, mode)]
+    fetched = await ctx.fanout(wanted, partial(_fetch_ref, ctx))
+    prefetched = dict(zip(wanted, fetched))
+    ref_parts = [
+        await _ref_part(ctx, ref, mode, allowance, prefetched) for ref in refs
+    ]
 
     # Search grounding can only run alongside text output, so anything asking for
     # tools needs TEXT in the modalities or the request is refused outright.

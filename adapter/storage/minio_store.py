@@ -27,9 +27,15 @@ class MinioStore:
 
     name = "minio"
 
-    def __init__(self, client, settings) -> None:
+    def __init__(self, client, settings, name: str | None = None) -> None:
         self._client = client
         self._settings = settings
+        if name:
+            #: Role label for a store that is one *address* of a deployment rather than
+            #: the whole backend -- ``minio_colocated`` names its two halves so a log
+            #: line can say which address failed. Defaults to the class's own name,
+            #: which is the value /health reports for a normally selected backend.
+            self.name = name
 
     @property
     def client(self):

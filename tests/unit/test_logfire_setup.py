@@ -15,6 +15,7 @@ the attribute set), and one that redacts too little exports a working key.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 
@@ -331,3 +332,102 @@ def _match(path: tuple, value: object, matched: str, *, text: str | None = None)
     pattern_match = re.search(re.escape(matched), haystack, re.IGNORECASE)
     assert pattern_match is not None, "the probe needs the pattern to match"
     return logfire.ScrubMatch(path=path, value=value, pattern_match=pattern_match)
+
+
+# --- the logging bridge ---------------------------------------------------
+
+
+def test_init_logfire_bridges_stdlib_logging_at_warning():
+    """Tracing and logging are separate pipelines: configuring one does not wire the other.
+
+    Until the handler was attached, every ``logger.warning`` in the codebase -- including
+    the storage layer saying an address went dark -- stopped at the container boundary.
+    """
+    root = logging.getLogger()
+    before = list(root.handlers)
+    try:
+        init_logfire(FastAPI(), _settings())
+
+        bridges = [h for h in root.handlers if isinstance(h, logfire.LogfireLoggingHandler)]
+        assert len(bridges) == 1
+        # WARNING and above: shipping every INFO progress line is a different decision,
+        # and INFO keeps going to stdout for the platform's own collector either way.
+        assert bridges[0].level == logging.WARNING
+        # `main.py` already prints to stderr through logging.basicConfig, so logfire's
+        # default fallback would print a suppressed record a second time.
+        assert isinstance(bridges[0].fallback, logging.NullHandler)
+    finally:
+        root.handlers = before
+
+
+def test_the_bridge_is_not_attached_twice():
+    """A second handler ships every record twice -- and nothing would fail loudly."""
+    root = logging.getLogger()
+    before = list(root.handlers)
+    try:
+        init_logfire(FastAPI(), _settings())
+        init_logfire(FastAPI(), _settings())
+
+        bridges = [h for h in root.handlers if isinstance(h, logfire.LogfireLoggingHandler)]
+        assert len(bridges) == 1
+    finally:
+        root.handlers = before
+
+
+def test_a_storage_warning_reaches_the_handler(monkeypatch):
+    """The plumbing, asserted at the boundary this repo owns.
+
+    ``emit`` is where a record leaves ``logging`` and becomes a Logfire record; what
+    Logfire does with it afterwards is its own tested behaviour. An "end to end" assertion
+    here would be asserting the wrong thing convincingly: this version of
+    ``logfire.testing.TestExporter`` exports spans only, so the log path is not readable
+    from it.
+    """
+    root = logging.getLogger()
+    before = list(root.handlers)
+    seen: list[logging.LogRecord] = []
+    try:
+        init_logfire(FastAPI(), _settings())
+        monkeypatch.setattr(
+            logfire.LogfireLoggingHandler, "emit", lambda self, record: seen.append(record)
+        )
+        logging.getLogger("adapter.storage.minio_colocated_store").warning(
+            "internal address %s failed (%s); serving from %s",
+            "minio:19000",
+            "ConnectionError",
+            "s3ai.cn",
+        )
+    finally:
+        root.handlers = before
+
+    assert [record.name for record in seen] == ["adapter.storage.minio_colocated_store"]
+
+
+def test_extra_fields_become_queryable_attributes():
+    """The promise the bridge makes: ``extra=`` is a field, a formatted message is not.
+
+    Reading ``fill_attributes`` back is the honest check -- it is the function that decides
+    what Logfire stores -- and it is what makes a storage warning findable by *address*
+    rather than by prose.
+    """
+    handler = logfire.LogfireLoggingHandler()
+    record = logging.LogRecord(
+        name="adapter.storage.minio_colocated_store",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg="internal address failed",
+        args=(),
+        exc_info=None,
+    )
+    record.address = "minio:19000"  # what logger.warning(..., extra={...}) lands as
+    record.serving = "s3ai.cn"
+
+    attributes = handler.fill_attributes(record)
+
+    assert attributes["address"] == "minio:19000"
+    assert attributes["serving"] == "s3ai.cn"
+    # The code location arrives on its own, and is what makes an exported line usable for
+    # "which build produced this" without a separate deploy marker.
+    assert attributes["code.filepath"] == __file__
+    assert record.name in attributes.values()

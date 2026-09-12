@@ -1,4 +1,4 @@
-"""The shipped ``openai/images@v2`` script, driven directly.
+"""The shipped ``openai/images@v1`` script, driven directly.
 
 Gate one of two -- the other is
 ``tests/integration/test_fanout_materialisation.py``. This one loads the file by
@@ -32,7 +32,7 @@ SCRIPT_PATH = (
     pathlib.Path(__file__).resolve().parents[2]
     / "script_store"
     / "openai"
-    / "images@v2.py"
+    / "images@v1.py"
 )
 
 UPSTREAM = "https://vendor.test/v1/images/generations"
@@ -43,7 +43,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
 
 def _load():
     """The script module, loaded from the file the image ships."""
-    spec = importlib.util.spec_from_file_location("openai_images_v2", SCRIPT_PATH)
+    spec = importlib.util.spec_from_file_location("openai_images_v1", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -84,7 +84,7 @@ def _ctx() -> AdapterContext:
         fal_key="",
     )
     channel = ChannelSpec(upstream_url=UPSTREAM)
-    return AdapterContext("v2-test", channel, settings, endpoint="images")
+    return AdapterContext("v1-test", channel, settings, endpoint="images")
 
 
 def _wire(monkeypatch, ctx) -> _Downloads:
@@ -105,7 +105,7 @@ def _parts(ctx) -> list:
 def test_the_shipped_text_still_passes_the_sandbox_scan():
     """A script that trips the policy is rejected at load, in production only.
     Cheap to assert here, and it would otherwise be discovered by an outage."""
-    scan_source(SCRIPT_PATH.read_text(encoding="utf-8"), filename="openai/images@v2.py")
+    scan_source(SCRIPT_PATH.read_text(encoding="utf-8"), filename="openai/images@v1.py")
 
 
 # --- dispatch, read off the plan ------------------------------------------

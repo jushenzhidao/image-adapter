@@ -19,7 +19,7 @@ Concurrency
 
 Timeouts
     `timeout` is a worker liveness watchdog, not a request budget. It must stay
-    above UPSTREAM_TIMEOUT (180s in the shipped .env) or gunicorn will SIGKILL
+    above UPSTREAM_TIMEOUT (300s in the shipped .env) or gunicorn will SIGKILL
     a worker that is legitimately waiting on a slow generation. Request budgets
     belong to the aiohttp client, which enforces them per upstream call.
 """

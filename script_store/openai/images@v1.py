@@ -1,5 +1,15 @@
 """openai/images@v1: OpenAI-native generations (JSON) and edits (multipart).
 
+Per-image work runs through ``ctx.fanout``, so N references cost one wait
+instead of N -- the client's references on the way in (including a mask), and
+the N reply items on the way back. Nothing else is involved: same body, same
+multipart part order, same error codes, and N=1 still takes the serial path.
+
+That concurrency is a *behaviour* the caller can observe: a multi-reference edit
+puts up to ``fanout_concurrency`` concurrent requests on the caller's image
+origin instead of one at a time, and the same for the N conversions on the way
+back. What it does not change is the request the upstream receives.
+
 Channel setup (New API side):
   X-Upstream-Url:    https://api.openai.com/v1/images/generations
   X-Script-Ref:      openai/images@v1
@@ -64,6 +74,7 @@ Note the helper convention: sync helpers carry annotations, the async ones do
 not, matching the other scripts in this store.
 """
 
+from functools import partial
 from urllib.parse import urlsplit, urlunsplit
 
 #: Fields that change shape on the way out: they become multipart file parts
@@ -120,8 +131,14 @@ def _with_carrier(item: dict, key: str, value: str) -> dict:
     return out
 
 
-async def _file_part(ctx, ref, stem):
-    """One image reference -> (filename, bytes, content-type)."""
+async def _file_part(ctx, pair):
+    """One (reference, stem) pair -> (filename, bytes, content-type).
+
+    Takes a pair rather than two arguments because ``ctx.fanout`` hands its work
+    one item at a time; ``functools.partial`` supplies ctx, so what the fan-out
+    sees is a single-argument callable.
+    """
+    ref, stem = pair
     data = await ctx.image_bytes(ref)
     mime = ctx.sniff_mime(data)
     return (_filename(stem, mime), data, mime)
@@ -199,12 +216,26 @@ async def _shape(ctx, payload, want):
         return payload
 
     convert = _as_url if want == "url" else _as_b64
-    data = []
-    for item in items:
-        # One at a time. The adapter never fans out to several upstream calls,
-        # and a conversion is cheap beside the generation it belongs to.
-        data.append(await convert(ctx, item) if isinstance(item, dict) else item)
+    # Concurrently. Each item may need a fetch and a store upload, and those are
+    # waits rather than work, so N of them cost one wait instead of N. `data`
+    # stays in the order the vendor sent whatever order the conversions finish
+    # in, and an adapter error raised by any item still reaches the client with
+    # its own status: ctx.fanout re-raises the earliest failing item's own
+    # exception rather than an ExceptionGroup.
+    data = await ctx.fanout(items, partial(_convert_one, ctx, convert))
     return {**payload, "data": data}
+
+
+async def _convert_one(ctx, convert, item):
+    """One reply item: converted when it is an object, passed through if not.
+
+    Module-level with the context and the converter bound by
+    ``functools.partial`` instead of closing over them, so ``ctx.fanout``
+    receives the single-argument callable it expects.
+    """
+    if not isinstance(item, dict):
+        return item
+    return await convert(ctx, item)
 
 
 async def _response(ctx, payload):
@@ -233,11 +264,17 @@ async def transform(ctx, payload, phase):
     # images and uses the bare name for one -- the same convention the
     # adapter's own /v1/images/edits front door accepts on the way in.
     name = "image[]" if len(refs) > 1 else "image"
-    files: dict[str, list] = {
-        name: [await _file_part(ctx, ref, f"image{i}") for i, ref in enumerate(refs)]
-    }
+    # The mask rides in the same batch as the references: it is an independent
+    # read of the same kind, and a slow mask costs exactly as much as a slow
+    # reference. The batch is then split back apart, so the part order -- and
+    # therefore the multipart body -- is what it always was.
+    pairs = [(ref, f"image{i}") for i, ref in enumerate(refs)]
     if payload.get("mask"):
-        files["mask"] = [await _file_part(ctx, payload["mask"], "mask")]
+        pairs.append((payload["mask"], "mask"))
+    parts = await ctx.fanout(pairs, partial(_file_part, ctx))
+    files: dict[str, list] = {name: parts[: len(refs)]}
+    if payload.get("mask"):
+        files["mask"] = parts[len(refs) :]
 
     ctx.emit(
         url=ctx.options.get("edits_url") or _sibling_edits_url(ctx.upstream_url),

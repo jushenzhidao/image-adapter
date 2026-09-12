@@ -1,23 +1,17 @@
-"""Does the fan-out actually happen, and is the contract still the same?
+"""openai/images@v1 through real sockets: does the fan-out reach the network?
 
-``openai/images@v2`` replaces the per-image loops with ``ctx.fanout``. Two things
-have to be shown, and neither can be shown by reading the code:
+Two things have to be shown, and neither can be shown by reading the code:
 
   * the fan-out is **real** -- the caller's image origin sees concurrent requests
-    rather than one at a time, or v2 is just v1 with extra ceremony;
-  * the contract is **unchanged** -- the same part names and order, the same
-    N=1 behaviour, the same results.
-
-Both are asserted as **differential pairs**: the identical request is sent twice
-with nothing but the script ref changed, and the observations must differ (or
-match) in exactly the stated way. A single-sided assertion would be satisfied by
-a v2 that did nothing at all, which is the failure mode this file exists to
-catch.
+    rather than one at a time, in both directions (the references on the way in,
+    the reply items on the way back);
+  * the contract is **unchanged** -- the same part names and order, and the same
+    N=1 behaviour, which is the case a fan-out must leave alone.
 
 Real sockets on both sides, because "did two requests overlap in time" is not a
 question a stub can answer. The image source is a ``ThreadingHTTPServer``: a
 plain ``HTTPServer`` serves one request at a time, so a concurrent client would
-look serial and the pair would be vacuous.
+look serial and every peak assertion here would be vacuous.
 """
 
 from __future__ import annotations
@@ -171,37 +165,28 @@ def _filenames_in_order(body: bytes) -> list[str]:
     ]
 
 
-# --- the differential pair: the fan-out is real ---------------------------
+# --- the inbound fan-out: the client's references -------------------------
 
 
-def test_v1_fetches_references_one_at_a_time(client, vendor, image_source):
-    """The baseline the pair is measured against. If this ever showed overlap,
-    the comparison below would stop meaning anything."""
+def test_references_are_fetched_concurrently(client, vendor, image_source):
+    """The fan-out has to reach the network, not just the script.
+
+    The hit count is asserted alongside the peak: an overlap of one would satisfy
+    a peak assertion on a request that only ever fetched one reference.
+    """
     response = _edit(client, vendor, image_source, "openai/images@v1", 3)
 
     assert response.status_code == 200
-    assert _ImageSource.peak == 1, (
-        f"v1 overlapped {_ImageSource.peak} fetches, so the baseline is not serial "
-        "and a concurrent v2 could not be told apart from it"
-    )
-
-
-def test_v2_fetches_references_concurrently(client, vendor, image_source):
-    """Same request, same server, only the ref changed -- and the observation
-    must flip. This is the assertion that proves the fan-out runs at all."""
-    response = _edit(client, vendor, image_source, "openai/images@v2", 3)
-
-    assert response.status_code == 200
-    assert _ImageSource.peak > 1, (
-        f"v2 fetched serially too (peak {_ImageSource.peak}); ctx.fanout is not "
-        "reaching the reference downloads"
-    )
     assert len(_ImageSource.hits) == 3
+    assert _ImageSource.peak > 1, (
+        f"the references were fetched serially (peak {_ImageSource.peak}); "
+        "ctx.fanout is not reaching the reference downloads"
+    )
 
 
-def test_v2_leaves_a_single_reference_serial(client, vendor, image_source):
-    """N=1 is the common case and must be indistinguishable from the old code."""
-    response = _edit(client, vendor, image_source, "openai/images@v2", 1)
+def test_a_single_reference_is_left_serial(client, vendor, image_source):
+    """N=1 is the common case and the one every fan-out site must leave alone."""
+    response = _edit(client, vendor, image_source, "openai/images@v1", 1)
 
     assert response.status_code == 200
     assert _ImageSource.peak == 1
@@ -216,46 +201,27 @@ def test_the_parts_reach_the_vendor_in_the_same_order(client, vendor, image_sour
     meaningful to the model.
     """
     assert _edit(client, vendor, image_source, "openai/images@v1", 3).status_code == 200
-    v1_body = _Vendor.bodies[0]
+    body = _Vendor.bodies[0]
 
-    assert _edit(client, vendor, image_source, "openai/images@v2", 3).status_code == 200
-    v2_body = _Vendor.bodies[1]
-
-    expected = ["image0.png", "image1.png", "image2.png"]
-    assert _filenames_in_order(v1_body) == expected
-    assert _filenames_in_order(v2_body) == expected
-    assert b'name="image[]"' in v1_body
-    assert b'name="image[]"' in v2_body
+    assert _filenames_in_order(body) == ["image0.png", "image1.png", "image2.png"]
+    assert b'name="image[]"' in body
 
 
 # --- the outbound fan-out, which is the other half ------------------------
 
 
-def test_v2_converts_reply_items_concurrently(client, vendor, image_source):
-    """The way back: N reply items each need their picture fetched. v1 did that
-    one at a time, v2 overlaps them, and the caller gets one b64 per item
-    either way."""
+def test_reply_items_are_converted_concurrently(client, vendor, image_source):
+    """The way back: N reply items each need their picture fetched, and the
+    caller gets one b64 per item however many were in flight."""
     _Vendor.item_count = 3
-    payload = {"prompt": "x", "response_format": "b64_json"}
-
-    one_at_a_time = client.post(
+    response = client.post(
         "/v1/images/generations",
         headers=_headers(vendor, "openai/images@v1"),
-        json=payload,
+        json={"prompt": "x", "response_format": "b64_json"},
     )
-    assert one_at_a_time.status_code == 200
-    assert _ImageSource.peak == 1, "baseline: v1 converts reply items serially"
 
-    _ImageSource.reset()
-
-    all_at_once = client.post(
-        "/v1/images/generations",
-        headers=_headers(vendor, "openai/images@v2"),
-        json=payload,
-    )
-    assert all_at_once.status_code == 200
-    assert _ImageSource.peak > 1, "v2 did not overlap the reply-item conversions"
-
-    data = all_at_once.json()["data"]
+    assert response.status_code == 200
+    assert _ImageSource.peak > 1, "the reply-item conversions did not overlap"
+    data = response.json()["data"]
     assert len(data) == 3
     assert all(item["b64_json"] == PNG_B64 for item in data)

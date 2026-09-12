@@ -12,7 +12,9 @@ from __future__ import annotations
 import time
 from datetime import timedelta
 
+import logfire
 import pytest
+from logfire.testing import SimpleSpanProcessor, TestExporter
 from pydantic import ValidationError
 
 from adapter.channel import ChannelSpec
@@ -360,18 +362,26 @@ def _ctx(store, **overrides) -> AdapterContext:
     )
 
 
-async def test_upload_uses_a_request_scoped_key_with_the_sniffed_extension():
+async def test_upload_keys_by_day_and_the_sniffed_extension():
+    """``<date>/<uuid>.<ext>``: the date leads, then one random name, and nothing else.
+
+    The date leading is what a day-at-a-time lifecycle rule matches on. The key carries
+    neither the request id nor the model, and both absences are asserted here so neither
+    creeps back in: a key becomes the URL handed to the caller, so an id nobody reads is
+    pure cost, and a model name there publishes which model produced the image.
+    """
     store = _RecordingStore()
 
     url = await _ctx(store).upload_temp_image(PNG, ext="webp")
 
     assert url == "https://cdn.test/x.png"
     key, content_type = store.calls[0]
-    # <yyyymmdd>/<request-id>/<uuid>.<ext> -- the prefix is optional and unset
-    day, request_id, name = key.split("/")
+    day, name = key.split("/")
     assert day == time.strftime("%Y%m%d")
-    assert request_id == "req-42"
     assert name.endswith(".webp")
+    assert "req-42" not in key and "req42" not in key
+    # A model prefix would keep two segments and only add the underscore.
+    assert "_" not in name
     assert content_type == "image/webp"
 
 
@@ -387,15 +397,21 @@ async def test_upload_puts_the_day_in_the_key_so_a_lifecycle_rule_can_use_it():
 
 
 async def test_upload_takes_the_key_prefix_from_settings():
-    """A deployment that already addresses its bucket through a convention of
-    its own (cdn/...) should not have to change the engine to keep it."""
+    """A prefix is a namespace *inside* the day, never in front of it.
+
+    The date has to stay the leading segment -- that is what a day-at-a-time bucket
+    lifecycle rule matches on -- so a prefix placed above it would quietly take every
+    upload out of the rule's reach. A deployment that partitions its bucket further
+    (``cdn/<date>/gpt-2/...``) sets this rather than changing the engine.
+    """
     store = _RecordingStore()
 
     await _ctx(store, storage_key_prefix="cdn").upload_temp_image(PNG, ext="png")
 
-    key = store.calls[0][0]
-    assert key.startswith(f"cdn/{time.strftime('%Y%m%d')}/req-42/")
-    assert key.endswith(".png")
+    day, prefix, name = store.calls[0][0].split("/")
+    assert day == time.strftime("%Y%m%d")
+    assert prefix == "cdn"
+    assert name.endswith(".png")
 
 
 async def test_an_empty_key_prefix_puts_the_date_at_the_bucket_root():
@@ -414,7 +430,10 @@ async def test_an_empty_key_prefix_puts_the_date_at_the_bucket_root():
         await _ctx(store, storage_key_prefix=value).upload_temp_image(PNG, ext="png")
 
         key = store.calls[-1][0]
-        assert key.startswith(f"{time.strftime('%Y%m%d')}/req-42/")
+        # Exactly two segments: the day, then the name. No prefix, no request id.
+        day, name = key.split("/")
+        assert day == time.strftime("%Y%m%d")
+        assert name.endswith(".png")
         assert "temp/" not in key
 
     assert len(store.calls) == 3
@@ -452,6 +471,14 @@ async def test_a_non_url_result_degrades_rather_than_reaching_a_client():
 def _public_store(client: _FakeMinio, **overrides) -> MinioPublicStore:
     overrides.setdefault("minio_endpoint", "s3.example")
     overrides.setdefault("minio_bucket", "adapter-temp")
+    # Pinned so these assertions describe the store rather than the machine: ``Settings``
+    # reads ``.env``, and a deployment sets MINIO_SECURE plus an origin for its own links
+    # there. Both change what is under test -- the origin replaces the derived URL, and
+    # setting it also stops ``ping`` from checking the bucket policy -- so leaving them to
+    # the environment made this file pass or fail by deployment. A deployment that sets
+    # ``MINIO_PUBLIC_BASE_URL`` is exactly what exposed it.
+    overrides.setdefault("minio_secure", False)
+    overrides.setdefault("minio_public_base_url", "")
     return MinioPublicStore(client, Settings(storage_backend="minio_public", **overrides))
 
 
@@ -631,6 +658,40 @@ async def test_failover_uses_the_secondary_when_the_primary_fails():
     )
 
     assert stored.url.startswith("https://secondary.test/")
+
+
+async def test_a_failover_is_reported_to_logfire():
+    """Which pair swapped deserves a queryable event, not only a log line.
+
+    A failover changes what the caller receives -- the host, and whether the URL expires
+    belong to whichever backend serves -- so the base store reports it too, not just
+    ``minio_colocated``, which happens to know two addresses. Here the two sides are
+    different backends, so the store *names* are what identify them.
+    """
+    exporter = TestExporter()
+    logfire.configure(
+        send_to_logfire=False,
+        console=False,
+        additional_span_processors=[SimpleSpanProcessor(exporter)],
+    )
+
+    stored = await _failover(
+        _StubStore("minio_colocated", put_error=ConnectionError("refused")),
+        _StubStore("fal"),
+    ).put(PNG, key="k.png", content_type="image/png")
+    assert stored.url.startswith("https://fal.test/")
+
+    logfire.force_flush()
+    events = [
+        span["attributes"]
+        for span in exporter.exported_spans_as_dict()
+        if span["name"] == "storage_fallback"
+    ]
+    assert len(events) == 1, events
+    assert events[0]["address"] == "minio_colocated"
+    assert events[0]["serving"] == "fal"
+    assert events[0]["error_code"] == "ConnectionError"
+    assert events[0]["check"] == "upload"
 
 
 async def test_a_parked_primary_is_not_retried_inside_the_cooldown():

@@ -13,9 +13,11 @@ validation or the byte cap that justified decoding in the first place.
 from __future__ import annotations
 
 import base64
+import io
 from typing import ClassVar
 
 import pytest
+from PIL import Image
 
 from adapter.context import AdapterContext
 from adapter.errors import InvalidRequestError
@@ -156,3 +158,89 @@ async def test_download_image_leaves_http_urls_to_the_ssrf_guard(monkeypatch):
     with pytest.raises(RuntimeError) as excinfo:
         await _ctx().download_image("https://cdn.example/a.png")
     assert excinfo.value is reached
+
+
+# `compress_image` is the bytes-out counterpart of `image_url`: a script that
+# needs a smaller reference should not have to know which of the three shapes
+# it arrived in, nor call the codec helpers in the right order. What it must
+# *not* do is decide anything -- the limits are arguments, and refusing an
+# image is left to the layer that can tell a client error from a channel one.
+
+
+def real_png(width: int = 400, height: int = 300) -> bytes:
+    """A payload Pillow can actually open, unlike this module's PNG stub."""
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), (10, 120, 200)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def png_side(data: bytes) -> tuple[int, int]:
+    with Image.open(io.BytesIO(data)) as img:
+        return img.size
+
+
+@pytest.mark.asyncio
+async def test_compress_image_applies_the_ceiling_to_an_inline_reference():
+    src = real_png()
+    ref = f"data:image/png;base64,{base64.b64encode(src).decode()}"
+    out = await _ctx().compress_image(ref, max_edge=100)
+    assert png_side(out) == (100, 75)
+    assert len(out) < len(src)
+
+
+@pytest.mark.asyncio
+async def test_compress_image_accepts_a_bare_base64_reference():
+    src = real_png()
+    out = await _ctx().compress_image(base64.b64encode(src).decode(), max_edge=100)
+    assert png_side(out) == (100, 75)
+
+
+@pytest.mark.asyncio
+async def test_compress_image_fetches_a_url_exactly_once(monkeypatch):
+    """One download per reference: the fetch and the compression are one call.
+
+    A second pass over the same URL would double the budget this operator
+    exists to spend, and the URL is the one whose latency is not ours.
+    """
+    ctx = _ctx()
+    seen: list[str] = []
+    src = real_png()
+
+    async def fake_download(url: str) -> bytes:
+        seen.append(url)
+        return src
+
+    monkeypatch.setattr(ctx, "download_image", fake_download)
+    out = await ctx.compress_image("https://cdn.example/a.png", max_edge=100)
+    assert seen == ["https://cdn.example/a.png"]
+    assert png_side(out) == (100, 75)
+
+
+@pytest.mark.asyncio
+async def test_compress_image_keeps_the_input_byte_cap():
+    """Compressing is not a way to be handed more than the cap allows."""
+    ctx = _ctx(max_asset_bytes=64)
+    ref = f"data:image/png;base64,{base64.b64encode(real_png()).decode()}"
+    with pytest.raises(InvalidRequestError):
+        await ctx.compress_image(ref, max_edge=100)
+
+
+@pytest.mark.asyncio
+async def test_compress_image_refuses_bytes_that_are_not_an_image():
+    with pytest.raises(InvalidRequestError) as excinfo:
+        await _ctx().compress_image(base64.b64encode(b"junk").decode(), max_edge=100)
+    assert excinfo.value.code == "image_invalid"
+
+
+@pytest.mark.asyncio
+async def test_compress_image_refuses_an_unknown_target_format():
+    ref = f"data:image/png;base64,{base64.b64encode(real_png()).decode()}"
+    with pytest.raises(InvalidRequestError) as excinfo:
+        await _ctx().compress_image(ref, fmt="tiff")
+    assert excinfo.value.code == "image_format_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_compress_image_refuses_a_non_string_reference():
+    with pytest.raises(InvalidRequestError):
+        await _ctx().compress_image("")

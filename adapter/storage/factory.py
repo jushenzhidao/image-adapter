@@ -20,6 +20,11 @@ from adapter.settings import Settings
 from adapter.storage.base import ObjectStore
 from adapter.storage.fal_store import FalStore, build_client
 from adapter.storage.fallback_store import FallbackStore
+from adapter.storage.minio_colocated_store import (
+    DOMAIN_LABEL,
+    INTERNAL_LABEL,
+    MinioColocatedStore,
+)
 from adapter.storage.minio_public_store import MinioPublicStore
 from adapter.storage.minio_store import MinioStore
 
@@ -32,26 +37,40 @@ logger = logging.getLogger(__name__)
 #: again, and a silently different timeout would be a behaviour change.
 _MINIO_TIMEOUT = 300.0
 
-#: The environment variable each backend cannot work without. Named rather
+#: Retry budget for the ordinary pool -- the configuration this file has always installed.
+#: Measured on 2026-09-12 against a closed port: five retries with backoff make a dead
+#: endpoint take **6.02s** to give up (``Retry(total=0)`` takes 0.00s). That is fine for a
+#: last resort and unacceptable for the internal half of ``minio_colocated``, whose whole
+#: job is to give up quickly and let the domain serve -- hence ``retries=0`` there.
+_MINIO_RETRIES = 5
+
+#: The environment variables each backend cannot work without. Named rather
 #: than counted, because "storage is off" and "storage is misconfigured" look
 #: identical at the call site and only one of them deserves an operator.
-_REQUIRED_KEY: dict[str, str] = {
-    "minio": "MINIO_ENDPOINT",
-    "minio_public": "MINIO_ENDPOINT",
-    "fal": "FAL_KEY",
+#:
+#: A tuple, because one backend needs more than one: ``minio_colocated`` is two
+#: addresses of one bucket, and with only the internal address set there is nothing to
+#: fall back to -- which would otherwise be indistinguishable from storage being off.
+_REQUIRED_KEY: dict[str, tuple[str, ...]] = {
+    "minio": ("MINIO_ENDPOINT",),
+    "minio_public": ("MINIO_ENDPOINT",),
+    "minio_colocated": ("MINIO_ENDPOINT", "MINIO_INTERNAL_ENDPOINT"),
+    "fal": ("FAL_KEY",),
 }
 
 
 def missing_storage_config(settings: Settings) -> str | None:
     """The config key the selected backend still needs, or None when it has it."""
-    key = _REQUIRED_KEY.get(settings.storage_backend)
-    if key is None:
+    keys = _REQUIRED_KEY.get(settings.storage_backend)
+    if keys is None:
         # Unreachable through Settings (the field is a Literal), but a name
         # can be added there before its builder exists. Reporting it beats
         # returning False and looking like an unconfigured deployment.
         return f"a known backend (got {settings.storage_backend!r})"
-    value = getattr(settings, key.lower(), "")
-    return None if value else key
+    for key in keys:
+        if not getattr(settings, key.lower(), ""):
+            return key
+    return None
 
 
 def storage_configured(settings: Settings) -> bool:
@@ -73,8 +92,100 @@ def _build_minio_public(settings: Settings, http: Any = None) -> ObjectStore | N
     return _minio_store(settings, MinioPublicStore)
 
 
+def _build_minio_colocated(settings: Settings, http: Any = None) -> ObjectStore | None:
+    """Two addresses of one bucket: the in-cluster one for uploads, MINIO_ENDPOINT to fall
+    back to.
+
+    Only *which address carries the bytes* is decided here. The bucket, the credentials and
+    the URL are the same either way, and they are read from the same settings object -- so
+    ``MinioPublicStore.public_url`` derives the link from ``MINIO_ENDPOINT`` exactly as it
+    does for ``minio_public``. Nothing has to be re-pointed at switch time: enabling this
+    backend is one added key, not a changed one.
+
+    The two transports differ by position: ``MINIO_ENDPOINT`` uses ``MINIO_SECURE`` as it
+    always has, while the in-cluster address is plaintext unless its value carries
+    ``https://``. One shared flag cannot say both, and this repo's own ``.env`` sets
+    ``MINIO_SECURE=true`` for the public side.
+    """
+    internal_endpoint, internal_secure = _split_scheme(
+        settings.minio_internal_endpoint, default_secure=False
+    )
+    if not internal_endpoint or not settings.minio_endpoint:
+        return None
+
+    internal = _minio_store_at(
+        settings,
+        MinioPublicStore,
+        endpoint=internal_endpoint,
+        secure=internal_secure,
+        # Fast-fail pool: see _MINIO_RETRIES above. The fallback only happens after this
+        # attempt gives up, so its cost *is* the fallback's latency.
+        connect_timeout=settings.minio_internal_connect_timeout,
+        retries=0,
+        label=INTERNAL_LABEL,
+    )
+    domain = _minio_store_at(
+        settings,
+        MinioPublicStore,
+        endpoint=settings.minio_endpoint,
+        secure=settings.minio_secure,
+        # The last resort keeps the ordinary pool: a transient 5xx here is worth retrying.
+        connect_timeout=_MINIO_TIMEOUT,
+        retries=_MINIO_RETRIES,
+        label=DOMAIN_LABEL,
+    )
+    if internal is None or domain is None:
+        return None
+    return MinioColocatedStore(
+        internal,
+        domain,
+        # Names for the trace only: the transport addresses are already inside the two
+        # clients, but a fallback event has to say *which* address went dark.
+        internal_address=internal_endpoint,
+        domain_address=settings.minio_endpoint,
+        cooldown=settings.storage_failover_cooldown,
+    )
+
+
+def _split_scheme(value: str, *, default_secure: bool) -> tuple[str, bool]:
+    """``https://s3ai.cn`` -> ``("s3ai.cn", True)``; no scheme keeps ``default_secure``.
+
+    An unrecognised scheme is left in the value rather than silently stripped, so a typo
+    fails at the SDK (which then reports it) instead of becoming a hostname nobody meant.
+    """
+    scheme, sep, rest = value.partition("://")
+    if not sep:
+        return value, default_secure
+    if scheme == "https":
+        return rest.rstrip("/"), True
+    if scheme == "http":
+        return rest.rstrip("/"), False
+    return value, default_secure
+
+
 def _minio_store(settings: Settings, store_cls: type) -> ObjectStore | None:
-    """One Minio client per process, or None when it is not configured.
+    """The ``MINIO_ENDPOINT`` flavour with the ordinary pool (unchanged behaviour)."""
+    return _minio_store_at(
+        settings,
+        store_cls,
+        endpoint=settings.minio_endpoint,
+        secure=settings.minio_secure,
+        connect_timeout=_MINIO_TIMEOUT,
+        retries=_MINIO_RETRIES,
+    )
+
+
+def _minio_store_at(
+    settings: Settings,
+    store_cls: type,
+    *,
+    endpoint: str,
+    secure: bool,
+    connect_timeout: float,
+    retries: int,
+    label: str | None = None,
+) -> ObjectStore | None:
+    """One Minio client for one address, or None when that address is unset.
 
     Building one per request (which ``ContextCore.storage`` used to do) throws
     away the urllib3 connection pool: every upload then pays a fresh TCP+TLS
@@ -82,13 +193,10 @@ def _minio_store(settings: Settings, store_cls: type) -> ObjectStore | None:
     no request state, so sharing it is safe. ``MinioStore.put`` calls it
     through ``asyncio.to_thread`` because the SDK is synchronous.
 
-    Shared by both minio flavours -- they differ only in the URL they hand
+    Shared by every minio flavour -- they differ only in the URL they hand
     back, and the pool configuration below must not drift between them.
-
-    ``http`` is accepted and ignored: the parameter exists so every builder has
-    one signature, and this SDK carries its own urllib3 pool.
     """
-    if not settings.minio_endpoint:
+    if not endpoint:
         return None
 
     import os
@@ -105,24 +213,28 @@ def _minio_store(settings: Settings, store_cls: type) -> ObjectStore | None:
     # sharing above therefore stops buying anything, and every upload pays its
     # own TCP+TLS handshake -- the exact cost it exists to remove.
     pool = urllib3.PoolManager(
-        timeout=urllib3.Timeout(connect=_MINIO_TIMEOUT, read=_MINIO_TIMEOUT),
+        timeout=urllib3.Timeout(connect=connect_timeout, read=_MINIO_TIMEOUT),
         maxsize=settings.minio_pool_size,
         # minio-py's cert_check=True default, restated.
         cert_reqs="CERT_REQUIRED",
         ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
-        retries=urllib3.Retry(
-            total=5, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504]
+        retries=(
+            urllib3.Retry(
+                total=retries, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504]
+            )
+            if retries
+            else urllib3.Retry(total=0)
         ),
     )
 
     client = Minio(
-        settings.minio_endpoint,
+        endpoint,
         access_key=settings.minio_access_key,
         secret_key=settings.minio_secret_key,
-        secure=settings.minio_secure,
+        secure=secure,
         http_client=pool,
     )
-    return store_cls(client, settings)
+    return store_cls(client, settings, name=label)
 
 
 def _build_fal(settings: Settings, http: Any = None) -> ObjectStore | None:
@@ -142,6 +254,7 @@ def _build_fal(settings: Settings, http: Any = None) -> ObjectStore | None:
 _BUILDERS: dict[str, Callable[[Settings, Any], ObjectStore | None]] = {
     "minio": _build_minio,
     "minio_public": _build_minio_public,
+    "minio_colocated": _build_minio_colocated,
     "fal": _build_fal,
 }
 
@@ -171,7 +284,7 @@ def build_storage(settings: Settings, http: Any = None) -> ObjectStore | None:
             "STORAGE_FALLBACK_BACKEND=%s is not configured (%s is unset); "
             "%s will serve alone",
             fallback,
-            _REQUIRED_KEY.get(fallback, "its endpoint"),
+            ", ".join(_REQUIRED_KEY.get(fallback, ("its endpoint",))),
             primary.name,
         )
         return primary

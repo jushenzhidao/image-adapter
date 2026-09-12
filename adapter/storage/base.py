@@ -65,12 +65,13 @@ class ObjectStore(Protocol):
         """Stores ``data`` and returns how to reach it.
 
         ``key`` is the engine's own path convention
-        (``<yyyymmdd>/<request-id>/<uuid>.<ext>``, with an optional prefix in
-        front). A backend without a directory concept is expected to map it,
-        not to reject it -- that mapping is a large part of why this port
-        exists. ``content_type`` is required rather than inferred: callers
-        already sniff the bytes, and a backend that stores the type can serve
-        the URL inline instead of as a download.
+        (``<yyyymmdd>/[<prefix>/]<uuid>.<ext>``; the date leads so a bucket
+        lifecycle rule can expire a day at a time, and any prefix sits inside
+        the day rather than in front of it). A backend without a
+        directory concept is expected to map it, not to reject it -- that mapping
+        is a large part of why this port exists. ``content_type`` is required
+        rather than inferred: callers already sniff the bytes, and a backend that
+        stores the type can serve the URL inline instead of as a download.
 
         Raises on failure. Degrading is the caller's decision, not the
         backend's: ``StorageMixin`` turns a failure into a data URI, and a

@@ -39,6 +39,16 @@ class CtxMixin:
         @property
         def storage(self) -> ObjectStore | None: ...
 
+        @property
+        def image(self) -> Any:
+            """Pillow-backed operators (``adapter.utils.imageops.ImageOps``).
+
+            Typed as ``Any`` like the other lazily built collaborators: the
+            engine builds it on first use, and importing the class here would
+            make this module -- which every mixin inherits -- depend on Pillow.
+            """
+            ...
+
 
 class NeedsCodec(CtxMixin):
     """Declares the codec helpers a mixin consumes from its siblings.

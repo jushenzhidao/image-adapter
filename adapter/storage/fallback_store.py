@@ -18,8 +18,10 @@ each worker pays at most one slow request -- the one that discovers the
 recovery, since the marker expires rather than being cleared by a peer.
 
 What is deliberately *not* hidden: parking the primary logs a warning naming
-both backends and the cooldown, recovering logs an info, and ``ping`` probes
-the primary for real (so ``/health`` tracks the primary, not just the pair).
+both backends and the cooldown, **reports a ``storage_fallback`` event to
+Logfire** (a failover is a fact worth querying, not only one container's log
+line), recovering logs an info, and ``ping`` probes the primary for real (so
+``/health`` tracks the primary, not just the pair).
 
 Note the shape this produces: while the primary is parked, every upload is
 served by the fallback and therefore carries **that** backend's semantics --
@@ -36,6 +38,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from adapter.storage.base import ObjectStore, StoredObject
+from adapter.trace_attrs import record_storage_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,7 @@ class FallbackStore:
         *,
         cooldown: float = DEFAULT_COOLDOWN,
         clock: Callable[[], float] = time.monotonic,
+        name: str | None = None,
     ) -> None:
         self._primary = primary
         self._secondary = secondary
@@ -63,19 +67,29 @@ class FallbackStore:
         #: Injectable so a test can expire the park without sleeping.
         self._clock = clock
         self._parked_until = 0.0
+        #: Optional override for the reported name. Needed when the two halves are the
+        #: same backend reached two ways (``minio_colocated``), where "a+b" would read
+        #: "minio_public+minio_public": true, and useless in /health and log lines.
+        self._name = name
 
     @property
     def name(self) -> str:
         """Both halves, because log lines have to say which one served."""
-        return f"{self._primary.name}+{self._secondary.name}"
+        return self._name or f"{self._primary.name}+{self._secondary.name}"
 
     # -- parking -----------------------------------------------------------
 
     def _parked(self) -> bool:
         return self._clock() < self._parked_until
 
-    def _park(self, detail: str) -> None:
+    def _park(self, detail: str) -> bool:
         """Stop asking the primary until the cooldown expires.
+
+        Returns True when *this* call is the one that parked it, i.e. the transition.
+        Callers use that to report the transition rather than every occurrence: the
+        store logs a warning on it, and a telemetry event belongs at the same rate
+        (see ``_on_primary_failure``) -- otherwise a health probe would emit one event
+        per probe for as long as a backend stayed down.
 
         Logged at warning on the transition only: while parked we never call
         the primary, so the earliest a second warning can appear is one
@@ -86,13 +100,43 @@ class FallbackStore:
         fresh = not self._parked()
         self._parked_until = self._clock() + self._cooldown
         if fresh:
+            # ``extra=`` rather than only prose: Logfire's logging bridge turns these into
+            # attributes, so "which store went dark" is a field to filter on rather than a
+            # phrase to grep. The message keeps the human-readable version either way.
             logger.warning(
                 "object storage primary %s %s; %s serves the next %.0fs",
                 self._primary.name,
                 detail,
                 self._secondary.name,
                 self._cooldown,
+                extra={
+                    "storage_primary": self._primary.name,
+                    "storage_secondary": self._secondary.name,
+                    "storage_cooldown_s": self._cooldown,
+                },
             )
+        return fresh
+
+    def _on_primary_failure(self, exc: BaseException | None, *, probe: bool) -> None:
+        """Reports the failover to Logfire, naming the two backends.
+
+        The base class reports rather than staying silent, because a failover **changes
+        what the caller receives** -- the URL's host, and whether it expires at all, belong
+        to whichever backend serves -- so "this pair swapped" is worth a queryable event
+        for any pair, not only for the two addresses of one bucket.
+
+        ``address``/``serving`` carry the store names here (``minio_colocated``, ``fal``);
+        ``MinioColocatedStore`` overrides this to report the two *addresses* instead, which
+        is the more useful pair when both halves are the same backend. ``exc`` is None when
+        the primary reported itself unusable instead of raising -- a probe that returns
+        False has no exception to quote.
+        """
+        record_storage_fallback(
+            address=self._primary.name,
+            serving=self._secondary.name,
+            error=exc,
+            probe=probe,
+        )
 
     def _unpark(self) -> None:
         if self._parked_until:
@@ -112,7 +156,9 @@ class FallbackStore:
         try:
             stored = await attempt
         except Exception as exc:  # noqa: BLE001 - every backend's zoo
-            self._park(f"failed ({exc})")
+            if self._park(f"failed ({exc})"):
+                # The transition, not every failed attempt: see _park.
+                self._on_primary_failure(exc, probe=False)
             return None
         self._unpark()
         return stored
@@ -141,15 +187,29 @@ class FallbackStore:
         deployment recovers on the probe's cadence, not this class's.
         """
         healthy = False
+        failure: BaseException | None = None
         try:
             healthy = await self._primary.ping()
         except Exception as exc:  # noqa: BLE001 - see put()
-            self._park(f"failed ({exc})")
+            failure = exc
+
         if healthy:
             self._unpark()
             return True
-        if not self._parked():
+
+        # Park it here, quoting the exception when there is one. Doing it in one place
+        # keeps the telemetry at the transition -- a primary that stays down is reported
+        # once per cooldown, not once per probe, and a k8s probe runs often enough for
+        # the difference to matter.
+        if failure is not None:
+            fresh = self._park(f"failed ({failure})")
+        elif not self._parked():
             # ping returned False rather than raising, so nothing has parked it
             # yet. Park it here; there is no exception to quote.
-            self._park("reports unusable")
+            fresh = self._park("reports unusable")
+        else:
+            fresh = False
+        if fresh:
+            self._on_primary_failure(failure, probe=True)
+
         return await self._secondary.ping()

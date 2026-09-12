@@ -1,39 +1,30 @@
 {
   "scripts": {
     "openai/images": {
-      "latest": "v2",
+      "latest": "v1",
       "aliases": {
-        "stable": "v2"
+        "stable": "v1"
       },
       "digests": {
-        "v1": "d392b782ee003ac6f0aa7c1f4b62b4e7510fbe5ab0e662c3a2912cf46f22f872",
-        "v2": "ca4b79447106b064cc513a5b88a67c437dc9c2c33db54916605f21a433c43f27"
+        "v1": "e36b5571f1028757d4a3731c6aeb61d87c12c514f679fe4c7a4617459bdda34a"
       }
     },
     "volcengine_ark/images": {
-      "latest": "v8",
+      "latest": "v1",
       "aliases": {
-        "stable": "v8"
+        "stable": "v1"
       },
       "digests": {
-        "v1": "aea29194912d20de8b0e5178918139773eae734f745a84f52d025609e57d206d",
-        "v2": "170051d7b5d59937b850b96ce0a03e45783e403e23ff48971c39c31fcfc254d4",
-        "v3": "bfd42f254d243497a13100233bfc0423a5f91f6116cf582d109e2468648eb4e4",
-        "v4": "c18acd91f034670a8ca1b0d82a7671578153c0c65998e1934cf2c58d613e36ee",
-        "v5": "bb37593233ede3f65604d27fd55ea446fb6b05e58deed331166c92a237b99f75",
-        "v6": "2cdd3fe09afad338f64b92812bb354aefc5aa02314188e6349d9be1acb7233c9",
-        "v7": "ac2e7281c20ba8273a58af688d96d3d35064945adf8ddf30da24c6fb57e50bdf",
-        "v8": "a3268580b1c03490d041328e55bd2d7e81ac3ead41da10da58f13444a48bf8ac"
+        "v1": "b00cadad6828d616779a7761f1eae05ebb24a153c321f4146f80b85d67327230"
       }
     },
     "google/images": {
-      "latest": "v2",
+      "latest": "v1",
       "aliases": {
-        "stable": "v2"
+        "stable": "v1"
       },
       "digests": {
-        "v1": "6937809539e5351cedfe32407e81cff305358adf774b23b752dc0914768d3210",
-        "v2": "63d410905043d63758a560dece5505f276acbd627ad1b4d45648c802591b940c"
+        "v1": "bcb45d98bcb6ab95a85b4d02921d37b975067db625d650f2f156a7734f5d7fea"
       }
     }
   }

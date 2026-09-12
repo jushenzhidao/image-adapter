@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -31,14 +32,24 @@ async def transform(ctx, payload, phase):
 
 class _JobVendor(BaseHTTPRequestHandler):
     polls = 0
+    #: Seconds to stall the *poll* endpoint. The submit path is never delayed:
+    #: the bound under test is the one a poll gets, not the one a generation does.
+    poll_delay = 0.0
+    #: Seconds to stall the submit path, for the test that checks the generation
+    #: bound is still the generation-sized one.
+    submit_delay = 0.0
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         self.rfile.read(length)
         if self.path.endswith("/submit"):
+            if _JobVendor.submit_delay:
+                time.sleep(_JobVendor.submit_delay)
             _JobVendor.polls = 0
             body = {"job_id": "job-42", "state": "queued"}
         else:
+            if _JobVendor.poll_delay:
+                time.sleep(_JobVendor.poll_delay)
             _JobVendor.polls += 1
             if _JobVendor.polls >= 2:
                 body = {
@@ -61,6 +72,8 @@ class _JobVendor(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def job_vendor():
+    _JobVendor.poll_delay = 0.0
+    _JobVendor.submit_delay = 0.0
     server = HTTPServer(("127.0.0.1", 0), _JobVendor)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -80,6 +93,49 @@ def test_async_job_polls_until_done(client, channel_headers, job_vendor):
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"][0]["url"] == "https://cdn.vendor.test/done.png"
     assert _JobVendor.polls >= 2
+
+
+def test_a_slow_poll_is_bounded_by_the_poll_timeout(
+    client, settings, channel_headers, job_vendor
+):
+    """A poll is a status check, so it gets `poll_request_timeout`, not the
+    generation-sized `upstream_timeout`.
+
+    Without that bound one slow poll could overrun the entire job budget:
+    `poll_timeout_default` is only checked at the top of the loop, so a poll
+    allowed to run for `upstream_timeout` outlives the loop that owns it. The
+    error message names the bound it used, which is what lets this be asserted
+    without timing anything -- and what would have said "60s" before the change.
+    """
+    settings.poll_request_timeout = 1.0
+    _JobVendor.poll_delay = 2.0
+    headers = channel_headers(ASYNC_SCRIPT, job_vendor)
+    headers["X-Async"] = "poll=0.05,timeout=10"
+
+    resp = client.post(
+        "/v1/images/generations", headers=headers, json={"prompt": "slow art"}
+    )
+
+    assert resp.status_code == 504, resp.text
+    assert "within 1s" in resp.text
+
+
+def test_the_submit_call_still_gets_the_generation_bound(
+    client, settings, channel_headers, job_vendor
+):
+    """The short bound is the poll's alone: submitting a job is a generation
+    request and keeps the deployment's `upstream_timeout`."""
+    settings.upstream_timeout = 1.0
+    _JobVendor.submit_delay = 2.0
+    headers = channel_headers(ASYNC_SCRIPT, job_vendor)
+    headers["X-Async"] = "poll=0.05,timeout=10"
+
+    resp = client.post(
+        "/v1/images/generations", headers=headers, json={"prompt": "slow art"}
+    )
+
+    assert resp.status_code == 504, resp.text
+    assert "within 1s" in resp.text
 
 
 def test_async_without_poll_phases_is_config_error(

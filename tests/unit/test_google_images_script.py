@@ -16,8 +16,10 @@ from pathlib import Path
 
 import pytest
 
+from adapter.ctxapi.fanout import FanoutMixin
 from adapter.ctxapi.mapping import MappingMixin
 from adapter.sandbox import scan_source
+from adapter.settings import Settings
 
 SCRIPT = (
     Path(__file__).resolve().parents[2] / "script_store" / "google" / "images@v1.py"
@@ -35,16 +37,21 @@ def _load():
 g = _load()
 
 
-class FakeCtx(MappingMixin):
+class FakeCtx(MappingMixin, FanoutMixin):
     """Just enough ctx for the helpers that take one.
 
     The mapping helpers are inherited from the real mixin -- they are pure and the
     script's behaviour depends on them, so stubbing them would test the stub. Only
-    the infrastructure (caps, emit, fail) is faked.
+    the infrastructure (caps, emit, fail) is faked. The fan-out mixin is inherited
+    for the same reason, and because the script reaches for `ctx.fanout` on *every*
+    request that carries references -- the zero-reference case included, where the
+    call returns without doing anything. A stub without it fails on the attribute
+    rather than on anything this file is about.
     """
 
     def __init__(self, caps=None, **options):
         self.options = options
+        self.settings = Settings(minio_endpoint="", fanout_concurrency=4)
         self.request_id = "req-1"
         self.upstream_url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"

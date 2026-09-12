@@ -17,8 +17,11 @@ cannot express:
     it is worth stating twice: **edit the manifest, restart the process.**
 
     Aliases only rewrite a ref that *has* a version. ``@v1`` is passed through
-    untouched, which is what makes pinning a real escape valve -- and why a
-    version must never be written as an alias for another one.
+    untouched, and a version must never be written as an alias for another one.
+    Note what that means today: with one version per channel there is nothing
+    to pin *to*, and a concrete version the root no longer carries degrades to
+    ``@stable`` in ``ChainStore`` instead of resolving to a different version
+    silently.
   * **digests** — the expected sha256 per version, so a root can be audited.
     A mismatch is refused rather than silently served.
 
@@ -66,6 +69,12 @@ MAX_ALIAS_DEPTH = 8
 #: under ``aliases``. An explicit entry in ``aliases`` still wins.
 LATEST_ALIAS = "latest"
 
+#: The alias the chain degrades to when a concrete version is gone. Every entry
+#: is expected to define it -- ``adapter.scriptstore.build_store`` warns at
+#: startup when one does not -- because it is the only fallback a retired
+#: version has (see ``ChainStore.get``).
+STABLE_ALIAS = "stable"
+
 
 @dataclass(frozen=True)
 class ManifestEntry:
@@ -102,6 +111,16 @@ class ManifestEntry:
             current = self.aliases[current]
         return current
 
+    def defines(self, alias: str) -> bool:
+        """Whether ``alias`` maps to a concrete version here.
+
+        Used by deployment assembly to report an entry that lacks ``stable``:
+        without it the chain's fallback has nothing to land on, so a retired
+        version fails where it would otherwise degrade.
+        """
+        resolved = self.resolve_version(alias)
+        return resolved is not None and resolved != alias
+
 
 class Manifest:
     """Parsed manifest for one root. Never raises on malformed content."""
@@ -114,6 +133,10 @@ class Manifest:
 
     def entry_for(self, ref: ParsedRef) -> ManifestEntry | None:
         return self._entries.get("/".join(ref.parts))
+
+    def items(self) -> list[tuple[str, ManifestEntry]]:
+        """Entries as (versionless ref, entry). Startup validation only."""
+        return list(self._entries.items())
 
     def resolve(self, ref: ParsedRef) -> ParsedRef:
         """Turns ``vendor/mj@stable`` into ``vendor/mj@v1.3`` when known.

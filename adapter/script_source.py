@@ -27,6 +27,7 @@ from adapter.channel import ChannelSpec
 from adapter.errors import ScriptPolicyError, ScriptSourceError
 from adapter.scriptstore import ChainStore, build_store, parse_ref
 from adapter.settings import Settings
+from adapter.trace_attrs import record_script_fallback
 from adapter.urlguard import check_url
 
 
@@ -36,6 +37,10 @@ class ScriptSource:
     sha256: str
     origin: str
     ref: str | None = None
+    #: Set only when ``ref`` named a version this deployment no longer carries
+    #: and the chain served ``@stable`` instead. The caller asked for one
+    #: revision and got another, which the digest alone does not say.
+    fallback_to: str | None = None
 
 
 def _digest(text: str) -> str:
@@ -119,6 +124,18 @@ async def resolve_source(
         return _verify(ScriptSource(text, _digest(text), "remote", ref), spec, settings)
 
     backend = store if store is not None else build_store(settings)
-    text = await backend.read(parse_ref(ref))
-    _enforce_size(text, settings.max_script_bytes, "Ref")
-    return _verify(ScriptSource(text, _digest(text), "ref", ref), spec, settings)
+    served = await backend.load(parse_ref(ref))
+    _enforce_size(served.text, settings.max_script_bytes, "Ref")
+    digest = _digest(served.text)
+    # Recorded here, where the degradation is known, rather than by a caller:
+    # a fact that needs a second wiring point is one that goes missing.
+    fallback_to = served.served if served.degraded else None
+    if fallback_to:
+        record_script_fallback(
+            requested=served.requested, serving=fallback_to, sha256=digest
+        )
+    return _verify(
+        ScriptSource(served.text, digest, "ref", ref, fallback_to=fallback_to),
+        spec,
+        settings,
+    )

@@ -112,6 +112,7 @@ async def transform(ctx, payload, phase):
 | `await ctx.image_b64(ref)` | 三态入参 → 裸 base64（校验+限长；已是 b64 则原样返回，不重编码） |
 | `await ctx.image_data_uri(ref)` | 三态入参 → data URI，mime 由magic number 嗅探 |
 | `await ctx.image_url(ref)` | 三态入参 → 可公网访问 URL（必要时经 MinIO 中转） |
+| `await ctx.compress_image(ref, *, max_edge=, max_bytes=, fmt=, quality=)` | 三态入参 → 变小后的 bytes。`max_edge` 是长边硬上限；`max_bytes` 是**目标非保证**（先降 quality 到下限 40，再降尺寸，且只在缩小确实达标时才动尺寸）；格式解析不开的图会**抛错**，要不要退回原图由调用方决定（见 `volcengine_ark/images@v1` 的 `ref_*`） |
 | `ctx.is_url(s)` / `ctx.is_data_uri(s)` | 形态判断，写多分支转换时用 |
 | `ctx.emit(url=..., method=..., headers=..., query=..., body=..., form=..., files=..., raw=..., timeout=...)` | 覆盖本次上游调用的任意维度（轮询换端点、multipart 上传等） |
 | `ctx.fail(msg, code=..., param=..., status=400)` | 以客户端可见的错误结束请求。上游返回 200 但业务失败时用（安全拦截、模型拒答、没出图）；脚本没有别的错误通道——抛其它异常会被包成 500，返回 `{"error": ...}` 会被当成 200 正常响应 |
@@ -170,14 +171,15 @@ return {"prompt": "blend", "n": "2"}   # 这些成为 multipart 文本字段
 ADAPTER_KEY=dev-key .venv/bin/python -m uvicorn adapter.main:app --port 8080
 ```
 
-E2E 冒烟（火山方舟，脚本走内置 script_store 引用）：
+E2E 冒烟（火山方舟，脚本走内置 script_store 引用）：渠道头**按 `@stable` 写**（用户口径：
+以 `@stable` 为准），它既是别名、又恰好是退役版本的降级目标；`@v1` / `@latest` 指向同一版。
 
 ```bash
 curl -s -X POST localhost:8080/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "X-Adapter-Key: dev-key" \
   -H "X-Upstream-Url: https://ark.cn-beijing.volces.com/api/v3/images/generations" \
-  -H "X-Script-Ref: volcengine_ark/images@v1" \
+  -H "X-Script-Ref: volcengine_ark/images@stable" \
   -H "Authorization: Bearer $VOLCENGINE_ARK_API_KEY" \
   -d '{"prompt":"一只可爱的白色小猫","size":"2048x2048","response_format":"url"}'
 ```
@@ -188,7 +190,7 @@ curl -s -X POST localhost:8080/v1/images/generations \
 curl -s -X POST localhost:8080/v1/images/edits \
   -H "X-Adapter-Key: dev-key" \
   -H "X-Upstream-Url: https://ark.cn-beijing.volces.com/api/v3/images/generations" \
-  -H "X-Script-Ref: volcengine_ark/images@v1" \
+  -H "X-Script-Ref: volcengine_ark/images@stable" \
   -H "Authorization: Bearer $VOLCENGINE_ARK_API_KEY" \
   -F image=@cat.png \
   -F prompt=把猫换成橘色 \
@@ -234,7 +236,7 @@ curl -s -X POST localhost:8080/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "X-Adapter-Key: dev-key" \
   -H "X-Upstream-Url: https://api.openai.com/v1/images/generations" \
-  -H "X-Script-Ref: openai/images@v1" \
+  -H "X-Script-Ref: openai/images@stable" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{"model":"gpt-image-1","prompt":"一只白猫","image":"https://cdn.test/cat.png"}'
 ```
@@ -272,8 +274,10 @@ adapter/
   api/responses.py   # /v1/responses（前门 + 状态链）
 script_store/        # 命名脚本库（默认后端，随镜像打包）
   manifest.json      # 可选：别名（@stable/@latest）+ 每版本 sha256
-  volcengine_ark/images@v1.py
-  openai/images@v1.py  # OpenAI 原生：generations(JSON) / edits(multipart) 分流
+  volcengine_ark/images@v1.py   # 每渠道只有一个版本（2026-09-13 起取消版本切分）
+  openai/images@v1.py           # OpenAI 原生：generations(JSON) / edits(multipart) 分流
+  google/images@v1.py
+                            # 改行为＝原地改这一个文件 + 重算 manifest 摘要；没有旧版可退
 tests/               # 单元（沙箱/工具/组装/存储）+ 集成（真实 HTTP mock 上游）
 ```
 
@@ -303,6 +307,9 @@ tests/               # 单元（沙箱/工具/组装/存储）+ 集成（真实 
 要强校验就打开 `SCRIPT_PIN_MANIFEST_DIGESTS=true`。清单损坏（非法 JSON、
 结构不对）只记 warning 并按「无清单」处理，不会连带其它 ref 一起失败。
 
+> ⚠️ **本仓现状（2026-09-13 起）**：三个渠道各只保留一份 `images@v1.py`，`latest` 与
+> `stable` 都指向它。别名机制仍在、也确实能整体前移，但**现在没有第二个版本可前移**。
+
 ⚠️ **改清单要重启，改脚本不用** —— 两者语义不同，别把脚本的热改经验套到清单上：
 
 | 改什么 | 何时生效 | 原因 |
@@ -310,16 +317,33 @@ tests/               # 单元（沙箱/工具/组装/存储）+ 集成（真实 
 | 挂载目录里的**脚本 `.py`** | **立即**，无需重启 | 读取缓存按 `(mtime_ns, size)` 校验，改文件即换缓存键 |
 | `manifest.json`（别名 / 摘要） | **必须重启**（或滚动发布） | 清单在 `DirStore.__init__` 里 `load_manifest` 读一次，而 store 是进程启动时建一次的 |
 
-实测：同一进程内把 `stable` 从 `v1` 改成 `v2`，`@stable` 仍然解析到 `v1`；
-新建 store 实例后才变成 `v2`。要**不重启**换版本，只有两条路 —— 改渠道头的
-`X-Script-Ref` 指向具体版本（如 `@v2`），或把脚本放进 overlay 目录。
+实测：同一进程内把 `stable` 从 `v1` 改指另一个版本，`@stable` 仍然解析到 `v1`；
+新建 store 实例后才变。要**不重启**换版本，只有两条路 —— 改渠道头的
+`X-Script-Ref` 指向具体版本，或把脚本放进 overlay 目录。
 
 别名只影响**带版本号的 ref**：`@stable` / `@latest` 会被查表改写，而 `@v1` 这种
 具体版本**原样透传**（`Manifest.resolve` 只在 `ref.version` 是别名时才改写）。
-这就是「钉住旧版本」的逃生阀 —— `@v1` 永远指向 v1 那个文件，
-无论别名怎么前移，也**绝不要**把 `v1` 写成指向 `v2` 的别名。
+也**绝不要**把 `v1` 写成指向另一个版本的别名。
+
+🔴 **「钉住旧版本」这条逃生阀没有了，但退役版本不会打死部署**（2026-09-13）：`@v2` 及以上
+已删除、manifest 也没为它们留别名 —— 但链条会**降级到 `@stable`**（并打一条 `warning`），所以
+渠道头指旧版本得到的不是失败，而是**stable 那一版的内容**。要回滚行为只能改脚本（旧版正文在
+git 历史里，见提交 `chore(script_store): 归档 ark v3–v8 后再合并为单一 v1`）。
+
+⇒ **`stable` 因此是必须项**：每个 manifest 条目都要定义它，否则降级无处落地、退役版本会退回成
+硬失败。启动时会对缺少它的条目打 warning，`tests/unit/test_scriptstore.py` 也钉住了本仓
+manifest 三渠道都定义了它。降级还会开一个 `script_ref_fallback` span（`requested` → `serving`），
+所以它在 Logfire 里可查、可告警 —— 一次降级不该只在一条日志里被看见。降级**只发生在「具体版本找不到」时**：无版本的 ref 仍报
+`script_not_found`，而某个 root 真有该版本时也仍按根优先级如实服务（不会被 `stable` 顶替）。
 
 ## 关键环境变量
+
+> 下列取值是**示例值**（与 `.env.example` 模板一致），作用是说清键名与语义，**不代表本部署在跑的数**；
+> 它也**不全等于**代码默认（`adapter/settings.py`：`SCRIPT_TIMEOUT=30`、`UPSTREAM_TIMEOUT=60`、
+> `POLL_TIMEOUT_DEFAULT=300`、`IMAGE_DOWNLOAD_TIMEOUT=25`）。本部署 `.env` 的实际覆盖
+> （`SCRIPT_TIMEOUT=240` / `UPSTREAM_TIMEOUT=300` / `IMAGE_DOWNLOAD_TIMEOUT=60` / `STORAGE_UPLOAD_TIMEOUT=60` /
+> `POLL_TIMEOUT_DEFAULT=240` / `FANOUT_CONCURRENCY=5`）与代码默认的逐项对照见 `docs/03` §3.3.1；
+> 两者不一致时**一律以 `.env` 为准**。
 
 ```bash
 ADAPTER_KEY=                     # 数据面准入密钥（必填，除非显式关闭）
@@ -341,7 +365,7 @@ POLL_TIMEOUT_DEFAULT=120     # 异步 Job 轮询的总时长（不是单次轮�
 STAGE_BUDGET_DEFAULT=300     # 多级级联的总预算，上限 STAGE_BUDGET_MAX=600
 IMAGE_DOWNLOAD_TIMEOUT=25    # 单次客户端图片下载；紧贴 SCRIPT_TIMEOUT 下方，只负责「报自己」不是「掐时间」
 STORAGE_UPLOAD_TIMEOUT=25    # 单次对象存储上传；超时按既有契约降级成 data URI
-FANOUT_CONCURRENCY=3         # 单请求内并发物化条数（ctx.fanout：N 张图下载 / 取回 / 上传）
+FANOUT_CONCURRENCY=5         # 单请求内并发物化条数（ctx.fanout：N 张图下载 / 取回 / 上传）；实际并发 = min(本值, N)
 ```
 
 ## 响应头

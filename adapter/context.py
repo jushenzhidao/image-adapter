@@ -152,6 +152,11 @@ class ContextCore:
         # script's, but a script may need it for a signature computation.
         self.key = channel.upstream_key
         self.upstream_url = channel.upstream_url
+        # Set by the engine when it offers the script a second request phase to
+        # answer an upstream failure (see `_retry_offered` in adapter.executor).
+        # None on a first attempt, so a script that ignores it behaves exactly as
+        # it did before the mechanism existed.
+        self.upstream_error: dict[str, Any] | None = None
 
         self.plan = RequestPlan()
 

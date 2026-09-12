@@ -2,8 +2,17 @@
 
 import pytest
 
+import pathlib
+
 from adapter.errors import ScriptSourceError
-from adapter.scriptstore import ChainStore, DirStore, build_store, parse_ref
+from adapter.scriptstore import (
+    STABLE_ALIAS,
+    ChainStore,
+    DirStore,
+    build_store,
+    load_manifest,
+    parse_ref,
+)
 from adapter.settings import Settings
 
 SCRIPT = "async def transform(ctx, payload, phase):\n    return payload\n"
@@ -359,3 +368,112 @@ class TestMalformedManifestIsIgnored:
     def test_parsed_manifest_is_truthy(self, tmp_path):
         (tmp_path / "manifest.json").write_text(_manifest(latest="v1.3"))
         assert DirStore(tmp_path).manifest
+
+
+class TestStableFallback:
+    """A retired version degrades to ``@stable`` instead of failing the request.
+
+    The version line is collapsed to one version per channel, so a channel
+    header left pointing at a version that no longer exists is an *expected*
+    state. The fallback is what keeps that from being an outage -- and the two
+    non-cases below are what keep it from hiding a real mistake.
+    """
+
+    def _chain(self, tmp_path, *, stable="v1", versions=("v1",)):
+        (tmp_path / "v").mkdir(exist_ok=True)
+        for version in versions:
+            (tmp_path / "v" / f"mj@{version}.py").write_text(f"# {version}\n")
+        if stable:
+            (tmp_path / "manifest.json").write_text(
+                _manifest(latest=stable, aliases={"stable": stable})
+            )
+        return ChainStore([DirStore(tmp_path, "image")])
+
+    @pytest.mark.asyncio
+    async def test_a_retired_version_falls_back_to_stable(self, tmp_path):
+        chain = self._chain(tmp_path)
+        assert await chain.read(parse_ref("v/mj@v2")) == "# v1\n"
+
+    @pytest.mark.asyncio
+    async def test_a_version_that_exists_is_never_substituted(self, tmp_path):
+        """The fallback must not shadow a real hit, or pinning means nothing."""
+        chain = self._chain(tmp_path, versions=("v1", "v2"))
+        assert await chain.read(parse_ref("v/mj@v2")) == "# v2\n"
+
+    @pytest.mark.asyncio
+    async def test_a_versionless_ref_does_not_fall_back(self, tmp_path):
+        """There is no version to replace -- still a hard miss, not a degrade."""
+        chain = self._chain(tmp_path)
+        with pytest.raises(ScriptSourceError) as exc:
+            await chain.read(parse_ref("v/mj"))
+        assert exc.value.code == "script_not_found"
+
+    @pytest.mark.asyncio
+    async def test_a_missing_stable_does_not_recurse(self, tmp_path):
+        """Without stable there is nothing to land on; it must not retry for ever."""
+        chain = self._chain(tmp_path, stable=None)
+        with pytest.raises(ScriptSourceError) as exc:
+            await chain.read(parse_ref("v/mj@v2"))
+        assert exc.value.code == "script_not_found"
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_reaches_across_roots(self, tmp_path):
+        """Chain-level, not per-root: any root may supply the stable text."""
+        overlay, image = tmp_path / "overlay", tmp_path / "image"
+        (overlay / "v").mkdir(parents=True)
+        (image / "v").mkdir(parents=True)
+        (image / "v" / "mj@v1.py").write_text("# image stable\n")
+        (image / "manifest.json").write_text(
+            _manifest(latest="v1", aliases={"stable": "v1"})
+        )
+        chain = ChainStore([DirStore(overlay, "overlay"), DirStore(image, "image")])
+        assert await chain.read(parse_ref("v/mj@v2")) == "# image stable\n"
+
+    @pytest.mark.asyncio
+    async def test_the_error_names_the_fallback_it_tried(self, tmp_path):
+        """A 404 that hides the fallback attempt sends the reader to the wrong layer."""
+        (tmp_path / "manifest.json").write_text(_manifest(aliases={"stable": "gone"}))
+        chain = ChainStore([DirStore(tmp_path, "image")])
+        with pytest.raises(ScriptSourceError) as exc:
+            await chain.read(parse_ref("v/mj@v2"))
+        assert "v/mj@stable" in str(exc.value)
+
+    def test_an_entry_without_stable_warns_at_startup(self, tmp_path, caplog):
+        """The fallback depends on `stable` existing, so its absence is reported."""
+        (tmp_path / "manifest.json").write_text(_manifest(latest="v1"))
+        with caplog.at_level("WARNING"):
+            build_store(Settings(script_ref_dir=str(tmp_path), script_overlay_dirs=""))
+        assert any("defines no 'stable'" in message for message in caplog.messages)
+
+
+    @pytest.mark.asyncio
+    async def test_load_reports_the_ref_it_degraded_to(self, tmp_path):
+        """Text alone cannot say which ref answered; load() carries both."""
+        served = await self._chain(tmp_path).load(parse_ref("v/mj@v2"))
+        assert served.text == "# v1\n"
+        assert served.requested == "v/mj@v2"
+        assert served.served == "v/mj@stable"
+        assert served.degraded
+
+    @pytest.mark.asyncio
+    async def test_load_reports_no_degradation_for_a_real_hit(self, tmp_path):
+        served = await self._chain(tmp_path, versions=("v1", "v2")).load(
+            parse_ref("v/mj@v2")
+        )
+        assert served.served == "v/mj@v2"
+        assert not served.degraded
+
+
+class TestShippedManifest:
+    def test_every_channel_defines_stable(self):
+        """`stable` is the fallback target, so the shipped manifest must define it.
+
+        An entry without it turns a retired version back into a hard failure --
+        exactly the outage the fallback exists to prevent -- and nothing else
+        would catch that before a deployment did.
+        """
+        root = pathlib.Path(__file__).resolve().parents[2] / "script_store"
+        manifest = load_manifest(root)
+        assert manifest.items(), "the shipped manifest should not be empty"
+        for ref, entry in manifest.items():
+            assert entry.defines(STABLE_ALIAS), f"{ref} defines no {STABLE_ALIAS!r}"

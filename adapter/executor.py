@@ -136,18 +136,24 @@ async def _do_upstream(
     default_url: str | None = None,
     budget: Budget | None = None,
     stage: str | None = None,
+    default_timeout: float | None = None,
 ) -> UpstreamReply:
     """Performs the outbound call described by ctx.plan plus the channel.
 
     `budget`, when given, is the cascade-wide countdown: the call is clamped to
     what remains, so N stages cannot each spend a full per-stage timeout.
+
+    `default_timeout` replaces `settings.upstream_timeout` as the bound for this
+    call when it is given -- it exists for the poll loop, where the outbound call
+    is a status check rather than a generation. A script's `ctx.emit(timeout=...)`
+    still wins over both.
     """
     if budget is not None and budget.exhausted:
         raise PipelineTimeoutError(budget.total, stage)
 
     url, method, kwargs = build_request(channel, ctx.plan, body, default_url)
 
-    timeout = ctx.plan.timeout or settings.upstream_timeout
+    timeout = ctx.plan.timeout or default_timeout or settings.upstream_timeout
     if budget is not None:
         timeout = budget.cap(timeout)
     kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
@@ -249,7 +255,13 @@ async def _run_poll_loop(
             script, ctx, handle, PHASE_POLL_REQUEST, settings.script_timeout
         )
         reply = await _do_upstream(
-            ctx, channel, settings, poll_body, budget=budget, stage=stage
+            ctx,
+            channel,
+            settings,
+            poll_body,
+            budget=budget,
+            stage=stage,
+            default_timeout=settings.poll_request_timeout,
         )
 
         verdict = await _call_phase(
@@ -267,6 +279,23 @@ async def _run_poll_loop(
         if verdict.get("done"):
             return verdict.get("payload", reply.payload)
         handle = verdict.get("payload", handle)
+
+
+
+
+def _request_was_refused(status: int | None) -> bool:
+    """Whether the upstream's status says our request was refused outright.
+
+    Only a 4xx is a statement about the request *we* sent -- "it was refused, so
+    nothing ran" -- and only that kind is worth answering with a different
+    second attempt. A 5xx, a timeout, an unreachable endpoint and an oversized
+    reply all leave the outcome **unknown**, and re-sending on an unknown
+    outcome is how one request gets billed twice.
+
+    Deliberately not a channel option: this is what the status codes mean, not a
+    preference, and a knob here could only ever be set wrong.
+    """
+    return status is not None and 400 <= status < 500
 
 
 async def execute(
@@ -308,9 +337,40 @@ async def execute(
             script, ctx, client_payload, PHASE_REQUEST, settings.script_timeout
         )
 
-        reply = await _do_upstream(
-            ctx, channel, settings, upstream_body, budget=budget, stage=stage
-        )
+        try:
+            reply = await _do_upstream(
+                ctx, channel, settings, upstream_body, budget=budget, stage=stage
+            )
+        except UpstreamError as exc:
+            if not _request_was_refused(exc.upstream_status):
+                raise
+            # One more request phase, so the script can answer the failure
+            # itself -- it is the side that knows its vendor and can read the
+            # error text. The engine hands over the failure and nothing else.
+            ctx.upstream_error = {
+                "message": exc.message,
+                "upstream_status": exc.upstream_status,
+            }
+            # Whatever the failed attempt emitted is stale; this attempt emits
+            # what it needs. `reset_plan` only drops outbound overrides, so
+            # there is nothing else to rewind.
+            ctx.reset_plan()
+            retried_body = await _call_phase(
+                script, ctx, client_payload, PHASE_REQUEST, settings.script_timeout
+            )
+            if retried_body == upstream_body:
+                # Nothing changed, so a second call would buy the same refusal.
+                # This is what makes the offer free for every script -- one
+                # pinned to a version from before this existed included -- and
+                # therefore what lets it happen without asking anyone first.
+                raise
+            # Exactly one more upstream call, never a loop: a second failure is
+            # reported as itself. `upstream_retried` on the span, and
+            # `phase_calls["request"] == 2`, are the evidence it happened.
+            span.set_attribute("upstream_retried", True)
+            reply = await _do_upstream(
+                ctx, channel, settings, retried_body, budget=budget, stage=stage
+            )
 
         # X-Async is the control plane asserting this upstream is job-based, so
         # the paired script must handle both poll phases.

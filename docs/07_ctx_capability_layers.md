@@ -48,7 +48,7 @@ ARK 脚本有 `_ark_size()`，Google 脚本有 `_ratio()/_tier()`，下一个上
 | **档位（清晰度/size）兜底/转换**     | ✅ ctx 纯函数                  | 1,2,3,4 | **本轮 bug 就在这里**；"档位表"是厂商数据              |
 | **模型兜底/转换**               | ✅ ctx 纯函数（归一化）+ 脚本（别名表）    | 1,2,3   | 剥离 `-preview/-exp/-latest`、大小写归一 = 通用规则 |
 | 图片元信息（宽高/mime/透明通道）       | ✅ ctx（只读 header，不解码）       | 2,3,4   | "保持输入比例"必须知道原图尺寸，现在只能整图解码               |
-| **图片压缩**                  | ✅ ctx（CPU + 已有 Pillow 基建）  | 2,3,4   | `utils/imageops.py` 已有 to_thread 通道     |
+| **图片压缩**                  | ✅ ctx（CPU + 已有 Pillow 基建）  | 2,3,4   | `utils/imageops.py` 的 `compress`；判据是"怎么压"由调用方给，不由 ctx 猜 |
 | 参数替换的**上报出口**            | ❌ **不做**（见 §4.1 末）       | —       | 方向已安全、客户端可从返回图核对；`fit_tier` 已返回 `adjusted`，需要时再接 |
 | 超分（upscale）               | ⚠️ 渠道编排（stages），**不进 ctx** | 1       | 它是"再调一个上游模型"，属于 `STAGES` 的职责            |
 | 去水印                       | ❌ 明确不做                     | —       | 内容篡改 + 版权/合规风险，不是格式转换                   |
@@ -128,8 +128,14 @@ ctx.is_extreme_ratio(pair, fold=4)            -> bool            # 由数值推�
 
 # --- 还没做（P1）-----------------------------------------------------------
 await ctx.image_info(ref)                     -> ImageInfo(w, h, mime, has_alpha)  # 只读 header
+```
+
+```text
+# --- 已落地（2026-09-12）----------------------------------------------------
+await ctx.image.compress(data, *, max_edge=None, fmt=None,
+                         quality=None, max_bytes=None) -> bytes   # 机制层，bytes 进 bytes 出
 await ctx.compress_image(ref, *, max_bytes=None, max_edge=None,
-                         fmt=None, quality=None) -> bytes          # 走 to_thread（imageops）
+                         fmt=None, quality=None) -> bytes          # 三形态归一 + 委托上面那个
 ```
 
 **早期草案里的两个"大函数"没有落地，这是有意的**：
@@ -157,7 +163,7 @@ await ctx.compress_image(ref, *, max_bytes=None, max_edge=None,
 | **P0** | `tier_value` / `size_to_px` / `fit_tier` / `fit_ratio` / `format_ratio` / `is_extreme_ratio` | ✅ **已落地**（§6 实施记录）：纯函数、零风险，直接消灭"每个脚本重写一遍 + 各踩一次 4K 坑"这类缺陷 |
 | ❌ **不做** | 参数替换的上报出口（原 `ctx.note`） | 方向已安全 + 客户端可从返回图核对 + 加响应头是公共契约变更；`adjusted` 已在返回值里留着口子（§4.1） |
 | **P1** | `image_info`                                            | "保持输入比例"目前只能整图解码；纯读 header 便宜一到两个数量级             |
-| **P1** | `compress_image`                                        | 已有 Pillow + to_thread 基建，复用即可；压缩是"让请求能通过上游上限"的正解 |
+| ✅ **已落地** | `compress_image`（+ `ctx.image.compress`）              | 2026-09-12 落地。签名里 `max_bytes` 是**目标不是保证**（先降 quality 到 40 下限，再降尺寸，且只在缩小确实达标时才动尺寸）；首个消费者是 `volcengine_ark/images@v1` 的 `ref_*` 渠道选项 |
 | **P2** | `policy="escalate"/"strict"`                            | 目前只有 ARK 需要 escalate，需求还没到                       |
 
 **建议的落地顺序**：P0 纯函数 → 把两个既有脚本（`volcengine_ark`、`google`）改成调用它 →  
@@ -405,9 +411,9 @@ mapped = ctx.map_size(size, caps)         # §5 的纯函数
 │   ↑ 用
 ├─ ctx 能力层
 │   ├─ 映射纯函数 ── fit_ratio / fit_tier / map_size / resolve_model
-│   ├─ 本地图像处理 ─ compress_image / image_info（to_thread + Pillow）
+│   ├─ 本地图像处理 ─ compress_image（三形态）/ ctx.image.compress（机制）/ image_info（待做）
 │   ├─ IO 三件套 ── image_* / download_image / upload_temp_image
-│   ├─ 出口 ────── emit / fail / note
+│   ├─ 出口 ────── emit / fail
 │   └─ 缓存与预算 ── image / sleep / remaining / deadline
 │
 └─ 基础设施 ────────────────── aiohttp 连接池 / Redis / 对象存储端口 / 线程池
@@ -558,7 +564,9 @@ X-Stage-Timeout: total=300                    # 总预算，已有机制
    —— 上游调用次数与计费口径（`n × len(STAGES)`）都不因并发改变。
 2. **失败语义不变**。仍是"任一子任务失败即整体失败"，错误码与串行时逐个一致。
    这一条把并发化限定在**本来就 fail-fast 的路径**上，不引入"局部成功、部分计费"。
-3. **并发度有上限**。受 `fanout_concurrency`（默认 3）约束；
+3. **并发度有上限**。受 `fanout_concurrency`（默认 5，2026-09-13 起；原为 3）约束，
+   且**实际并发 = min(该值, N)**——只有 1 张参考图时信号量根本不创建，纯文生图压根不走扇出
+   ⇒ 低于等于 N 的取值不产生任何开销。实测口径与代价见 §14.3；
    注意它**不是** `docs/04_Spec.md` AC-30 里那个给"`n` 次上游调用"用的 `concurrency`，
    两者服务的是不同对象，别合并成一个配置项。
 
@@ -583,7 +591,34 @@ results = await ctx.fanout(items, work)      # work: async (item) -> value
 
 实现：`adapter/utils/fanout.py`（原语）+ `adapter/ctxapi/fanout.py`（门面）。
 8 项单测，并做过**变异自证**：退回串行 / 去掉上限 / 按完成序收集，三种错法都会报红。
-首个消费者是 `openai/images@v2`（**`v1` 原样不动**，`latest` 前移到 v2、`stable` 留在 v1）。
+
+**消费者（三个渠道，全部在 `@v1`）**：`openai/images@v1`（入站多图 + mask 同批、出站 N 项转换）、
+`google/images@v1`（出站 N 项上传、入站预取）、`volcengine_ark/images@v1`（N 张参考图的
+`ref_*` 压缩与物化，即 `reports/2026-09-12_phase-optimization/PLAN.md` §2.7 的 A4）。
+
+🔴 **版本切分已于 2026-09-13 取消**（用户裁决「全部用最优版本，其他全部删掉，文件命名 v1」）：
+三个渠道各只保留一个 `images@v1.py`，承载全部最优行为；`@v2` 及以上已删除、manifest 也不留
+别名。代价是**回滚机制消失**——没有旧版本可退，只能改代码重发版；旧版本内容保留在 git 历史里
+（提交 `chore(script_store): 归档 ark v3–v8 后再合并为单一 v1`）。此前那条「并发改造一律新建
+`@vN`」的纪律**随之作废**。
+
+**但退役的 ref 不会打死部署**：`ChainStore` 在全链都找不到该具体版本时**降级到 `@stable`**
+（打 warning），所以渠道头指旧版本得到的是 `stable` 那一版的内容，而不是 `script_not_found`。
+降级与钉版不冲突 —— 某个 root 真有该版本时仍如实服务。⚠️ 由此 **`stable` 成为必须项**：启动时
+缺它会 warning，单测钉住本仓三渠道都定义了它。降级会开一个 `script_ref_fallback` span
+（`requested` → `serving`，见 `docs/03` §5.2 的 trace 树），因此可查、可告警。
+
+**`fanout_concurrency` 取值口径（2026-09-13 实测，取代原先"相位预算先到"的说法）**：
+原说法**不成立**——延迟受限上游、N=9 时 c=3→9 把墙钟从 927ms 压到 368ms（2.5x），
+`script_timeout=240`（本部署 `.env` 取值；代码默认 30）全程远未接近。真正的约束是**上游自身并发行为 + 内存 + 连接池**：
+最坏内存 = `fanout_concurrency × max_asset_bytes`（20MB）；超过 `HTTP_POOL_LIMIT_PER_HOST`
+只在池里排队，且**排队时间计入动作超时**。理论上界＝渠道 `max_input_images`（google 默认 10）；
+**`min(cap, N)` 已内建**（`gather` 只创建 `len(items)` 个任务），故 N 的不确定性被信号量自动吸收，
+**不需要 `MIN_FANOUT_CONCURRENCY` 之类旋钮**——它在结构上是空的（N=1 恒走串行分支，
+抬 `width` 也进不了并发臂）。现取 **5**：常态 2~4 张与 5 张一拍做完，google 的 10 张分两拍，
+最坏内存 100MB/worker。
+⚠️ 前提是**延迟受限**：带宽受限时抬并发零收益（单张耗时≈×cap，总时间不变）且更易撞
+`image_download_timeout`，此时正确处方是压单张体积（`ctx.compress_image` / `ref_*`）。
 
 **§14.2 的结论不变**：不做并发生成调用、不做 DAG、`stages.py` 级联仍严格串行、
 `ctx.gather()` 仍是"被刻意排除的设计"。本节只是把**排除到哪里为止**写出来，

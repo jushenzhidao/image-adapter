@@ -135,6 +135,13 @@ class Settings(BaseSettings):
     # it is their sum that can run long.
     poll_interval_default: float = 2.0
     poll_timeout_default: float = 300.0
+    #: One poll is a status check, not a generation, so it gets its own short
+    #: bound: `poll_timeout_default` is only checked at the top of the loop, and
+    #: a single poll allowed to run for `upstream_timeout` could therefore
+    #: overrun the whole job budget by itself. Same reasoning as
+    #: `remote_script_timeout`. A script can still ask for more per call with
+    #: `ctx.emit(timeout=...)`, which wins over this.
+    poll_request_timeout: float = 10.0
     poll_max_attempts: int = 600
 
     # --- Multi-stage pipelines ---------------------------------------------
@@ -169,10 +176,23 @@ class Settings(BaseSettings):
     # a per-worker resource limit, so exceeding it queues inside aiohttp and the
     # queued time is charged to the action's own timeout (adapter/utils/fanout).
     #
-    # Three because a multi-reference edit is two to four images and that is the
-    # only fan-out today; the request-phase budget (script_timeout) is what the
-    # larger N is really bounded by, so a big cap would buy nothing.
-    fanout_concurrency: int = 3
+    # Five, and the bound is worth stating correctly because the note this
+    # replaces got it wrong: it is *not* the request-phase budget
+    # (script_timeout) that caps a useful value. Measured 2026-09-13 against a
+    # latency-limited source, N=9 went from 927 ms at 3 to 368 ms at 9 -- 2.5x
+    # -- with the phase budget nowhere near being reached. What caps it is
+    # upstream behaviour, memory, and the pool above: peak memory is
+    # fanout_concurrency x max_asset_bytes, and a degree past
+    # HTTP_POOL_LIMIT_PER_HOST queues, with that wait charged to the action's
+    # own timeout.
+    #
+    # At or below the degree the value is free rather than merely cheap: the
+    # width actually used is min(this, N), so one reference never constructs the
+    # semaphore at all and a text-to-image request never reaches the fan-out.
+    # Five buys full overlap on the common two-to-four-reference edit and on a
+    # five-reference one, and batches a ten-reference request (google's own
+    # max_input_images ceiling) into two waves. See docs/07 §14.2.1.
+    fanout_concurrency: int = 5
 
     # Hard ceiling on a single upstream response body. Every reply is buffered
     # in full -- one buffer per in-flight request, see ``executor._do_upstream``
@@ -212,7 +232,13 @@ class Settings(BaseSettings):
     #
     # A Literal so a typo fails at startup. `extra="ignore"` would otherwise
     # turn "STORAGE_BACKND=fal" into a silent fallback to minio.
-    storage_backend: Literal["minio", "minio_public", "fal"] = "minio"
+    #
+    # minio_colocated is the two-address shape of one bucket: uploads prefer
+    # MINIO_ENDPOINT (the internal address) and fall back to
+    # MINIO_FALLBACK_ENDPOINT (the domain), while the URL handed back is always
+    # the domain -- see storage/minio_colocated_store.py for why the two halves
+    # are not interchangeable.
+    storage_backend: Literal["minio", "minio_public", "minio_colocated", "fal"] = "minio"
 
     # Optional second backend, tried when the first cannot take an upload.
     # Empty keeps the previous behaviour: a failing store degrades to a data
@@ -224,20 +250,23 @@ class Settings(BaseSettings):
     # StoredObject.visibility says which one served. And the fallback has to be
     # configured in its own right (FAL_KEY for fal): an unconfigured fallback is
     # reported and skipped, never silently replaced by the primary.
-    storage_fallback_backend: Literal["", "minio", "minio_public", "fal"] = ""
+    storage_fallback_backend: Literal[
+        "", "minio", "minio_public", "minio_colocated", "fal"
+    ] = ""
     # How long the primary is skipped after a failure, in seconds. A refused
     # connection costs ~6s per attempt (five urllib3 retries at the pool
     # settings the minio builder installs), so without this park every upload
     # would pay that for as long as the primary is down.
     storage_failover_cooldown: int = 30
 
-    # Optional first segment of the keys the engine builds:
-    # ``[<prefix>/]<yyyymmdd>/<request-id>/<uuid>.<ext>``. Empty is the default
-    # and puts the date at the bucket root, which is how the buckets these
-    # channels write to are already laid out; set it only to add a namespace of
-    # your own in front of the date. Slashes are stripped, so "" and "/" mean
-    # the same thing and neither can produce "//<date>/...". Only the minio
-    # flavours see it -- fal has no directories and flattens the key.
+    # Optional segment of the keys the engine builds, *inside* the day:
+    # ``<yyyymmdd>/[<prefix>/]<uuid>.<ext>``. Empty is the default and puts the
+    # date at the bucket root, which is how the buckets these channels write to
+    # are already laid out. The date always leads -- a day-at-a-time bucket
+    # lifecycle rule matches on that -- so a prefix sits below it, never in
+    # front of it. Slashes are stripped, so "" and "/" mean the same thing and
+    # neither can produce "<date>//...". Only the minio flavours see it -- fal
+    # has no directories and flattens the key.
     storage_key_prefix: str = ""
 
     @model_validator(mode="after")
@@ -265,6 +294,24 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "adapter-temp"
     minio_secure: bool = False
+    # The *in-cluster* address of the SAME bucket, used only by
+    # STORAGE_BACKEND=minio_colocated: uploads try this one first (on the same node it is a
+    # local hop) and fall back to MINIO_ENDPOINT. Empty means "not configured", which the
+    # factory reports rather than working around -- a pod that quietly lost its internal
+    # address looks exactly like one that never needed it.
+    #
+    # MINIO_ENDPOINT keeps meaning what it means for every other backend: the bucket's
+    # reachable address, and the origin the URL is derived from. So switching backend is
+    # "add this one key", not "repoint MINIO_ENDPOINT" -- and MINIO_SECURE (which applies
+    # to MINIO_ENDPOINT) keeps meaning what it meant.
+    #
+    # A scheme may be carried in the value (http://minio:19000); without one it is
+    # plaintext, the usual case for an in-cluster hop. Use https:// to say otherwise.
+    minio_internal_endpoint: str = ""
+    # Connect timeout for that address, in seconds. Deliberately short: it is also the
+    # give-up cost that must precede the fallback, and an in-cluster address either answers
+    # in milliseconds or is not reachable at all. The public address keeps the ordinary 300s.
+    minio_internal_connect_timeout: float = 1.0
     # Per-host HTTP connection pool for object storage. minio-py's own default
     # is 10, which sits below the concurrency this service reaches; size it to
     # roughly the uploads expected in flight per worker. Only consulted when

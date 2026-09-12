@@ -314,6 +314,78 @@ def record_ingress_failure(
         pass
 
 
+# --- object storage --------------------------------------------------------
+
+
+#: Longest exception text carried into a span. What is worth reading is the first clause
+#: ("Connection refused", "timed out"); beyond that it is a urllib3 retry transcript.
+_STORAGE_ERROR_CAP = 200
+
+
+def record_storage_fallback(
+    *,
+    address: str,
+    serving: str,
+    error: BaseException | None,
+    probe: bool,
+) -> None:
+    """Reports that one object-storage target failed and another one took over.
+
+    ``address``/``serving`` name the two: the two *addresses* of one bucket when the caller
+    knows them (``minio:19000`` → ``s3ai.cn``), or the two backend *names* when it does not
+    (``minio_colocated`` → ``fal``). Either way a reader learns which side of a failover a
+    request went through, which is not visible anywhere else once the upload succeeds.
+
+    An event of its own rather than an attribute on the upload span, because the fallback
+    is the **success** path: the upload completes, ``storage_put`` says ``outcome=ok``,
+    and nothing else in the trace would say the internal address is unreachable. That is
+    the whole difference between "the deployment is healthy" and "every upload from this
+    pod is now leaving the cluster over the internet" -- the second is fine, and worth
+    knowing about before it stops being fine.
+
+    ``probe`` says which check found it: ``True`` the health probe, ``False`` a real
+    upload that paid the failure. Emitted once per park (the store reports the transition,
+    not every upload), so the rate is bounded by the cooldown rather than by traffic.
+    """
+    attrs: dict[str, Any] = {
+        "address": address,
+        "serving": serving,
+        "check": "health_probe" if probe else "upload",
+    }
+    if error is not None:
+        attrs["error_code"] = type(error).__name__
+        attrs["error_message"] = str(error)[:_STORAGE_ERROR_CAP]
+    with logfire.span("storage_fallback", **attrs):
+        pass
+
+
+# --- script store ----------------------------------------------------------
+
+
+def record_script_fallback(*, requested: str, serving: str, sha256: str) -> None:
+    """Reports that a channel's ``X-Script-Ref`` named a version this deployment
+    no longer carries, so the chain served ``@stable`` instead.
+
+    The success path, like ``record_storage_fallback``: the request completes and
+    the caller gets a picture -- produced by a **different revision of the script**
+    than the channel asked for. Nothing else in the trace says so; the response's
+    ``X-Script-Sha256`` is the only other witness, and it only helps a reader who
+    has the manifest to compare it against.
+
+    Emitted per degraded request rather than per transition: unlike a storage
+    failover there is no cooldown to bound the rate, and that is the honest
+    shape -- a deployment whose headers are stale degrades on *every* request,
+    which is exactly the state worth being able to see.
+    """
+    with logfire.span(
+        "script_ref_fallback",
+        requested=requested,
+        serving=serving,
+        script_sha256=sha256[:12],
+    ):
+        pass
+
+
 # --- span timing -----------------------------------------------------------
 
 

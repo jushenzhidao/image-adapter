@@ -1,36 +1,40 @@
-"""volcengine_ark/images: which wire form the channel's mode selects.
+"""volcengine_ark/images@v1: one script, and every behaviour it has.
 
-The failure these tests exist for is not a crash. ARK fetches a client-supplied
-URL itself, under a hard 5 s cap on its side that no request parameter can
-raise, and a request that trips it **cannot be retried**: the engine makes one
-upstream call per request and raises on the non-2xx reply before the response
-phase runs. So the wire form has to be right *before* the call.
+This is the channel's only version. The version-split practice was dropped, so
+nothing below is a comparison between two files -- each class states what the
+shipped script does, and the assertions are the specification a change has to
+keep passing.
 
-The bug pinned here is that `image_ref_mode` used to be read only after the URL
-shape had already been recognised and returned verbatim. The option was
-therefore unable to prevent the one failure on this channel that nothing
-downstream can repair -- the operator sets it, and still gets the timeout.
+The shape of a request is decided by three things and the suite is organised by
+them:
 
-These are dispatch tests: they assert which conversion the script asks ctx for,
-against the real ctx mixins (only the network and the object store are faked),
-because the conversions themselves are covered by tests/unit/test_image_ref.py.
+  * `image_ref_mode` picks the wire form for every reference (including URLs,
+    which get no privileged exemption -- that exemption is what used to let a
+    slow source time out inside ARK);
+  * the `ref_*` group optionally re-encodes a reference whose bytes pass
+    through us, and its three failure rules each have a test here because each
+    of them is a way an optimisation turns a working request into a 400;
+  * ARK's own fetch cap is answered by an override on the *retry* attempt, and
+    that override must win over whatever mode was configured.
 
-The fix ships as `images@v2`, so both versions are loaded. `v2` is where the
-behaviour is now specified; `v1` is here only to prove that a channel pinned to
-it keeps the old ordering, which is the whole reason this is a version rather
-than an edit (see TestVersionSplit).
+Two assertions are pinned rather than blessed: an unrecognised `image_ref_mode`
+falls through to the URL path, and a `null` watermark is forwarded as `null`.
+Both are recorded so a change to them is deliberate.
 """
 
 from __future__ import annotations
 
 import base64
 import importlib.util
+import io
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
+from PIL import Image
 
 from adapter.context import AdapterContext
+from adapter.errors import AdapterError
 from adapter.settings import Settings
 
 ROOT = Path(__file__).resolve().parents[2] / "script_store" / "volcengine_ark"
@@ -43,16 +47,41 @@ def _load(name: str, filename: str):
     return module
 
 
-ark = _load("ark_images_v2", "images@v2.py")
-ark_v1 = _load("ark_images_v1", "images@v1.py")
+ark = _load("ark_images_v1_main", "images@v1.py")
 
+#: Only the magic bytes matter for anything that is not decoded. The `ref_*`
+#: tests need a payload Pillow can open, which is what REAL_PNG is for -- and the
+#: fact that this stub survives them proves the fallback path: a reference the
+#: pipeline cannot read is sent on rather than refused.
 PNG = b"\x89PNG\r\n\x1a\n" + b"pretend payload bytes"
 BARE = base64.b64encode(PNG).decode()
 DATA_URI = f"data:image/png;base64,{BARE}"
 
-#: A stand-in for the case that motivated the change: a source ARK cannot pull
-#: inside its own 5 s budget.
+
+def _real_png(width: int = 400, height: int = 300) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), (10, 120, 200)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+REAL_PNG = _real_png()
+REAL_BARE = base64.b64encode(REAL_PNG).decode()
+
+
+def _size_of(payload: bytes) -> tuple[int, int]:
+    with Image.open(io.BytesIO(payload)) as img:
+        return img.size
+
+
+def _b64_size(value: str) -> tuple[int, int]:
+    return _size_of(base64.b64decode(value.split(";base64,", 1)[-1]))
+
+
+#: A stand-in for the case that motivated the wire-form option: a source ARK
+#: cannot pull inside its own 5 s budget.
 URL = "https://overseas.example/holiday.png"
+
+OTHER_URL = "https://overseas.example/second.png"
 
 REHOSTED = "https://our-storage.example/temp.png"
 
@@ -74,15 +103,19 @@ class Spy:
     "Did we fetch it" and "did we upload it" are the whole observable
     difference between the modes, so they are recorded rather than inferred
     from the body: a body that happens to look right must not pass while the
-    script quietly made the wrong call.
+    script quietly made the wrong call. The uploaded *bytes* and their
+    extension are recorded for the same reason -- a compressed reference is a
+    different picture, and the extension is what the object store is told it
+    is.
     """
 
     def __init__(self) -> None:
         self.downloads: list[str] = []
         self.uploads: list[bytes] = []
+        self.exts: list[str] = []
 
 
-def _ctx(monkeypatch, **options) -> tuple[AdapterContext, Spy]:
+def _ctx(monkeypatch, payload: bytes = PNG, **options) -> tuple[AdapterContext, Spy]:
     ctx = AdapterContext(
         request_id="req-1",
         channel=_ChannelStub(options),
@@ -92,10 +125,11 @@ def _ctx(monkeypatch, **options) -> tuple[AdapterContext, Spy]:
 
     async def fake_download(url: str) -> bytes:
         spy.downloads.append(url)
-        return PNG
+        return payload
 
     async def fake_upload(data: bytes, ext: str = "png") -> str:
         spy.uploads.append(data)
+        spy.exts.append(ext)
         return REHOSTED
 
     monkeypatch.setattr(ctx, "download_image", fake_download)
@@ -103,15 +137,20 @@ def _ctx(monkeypatch, **options) -> tuple[AdapterContext, Spy]:
     return ctx, spy
 
 
-async def _image_field(ctx, image):
-    body = await ark.transform(
+async def _image_field(ctx, image, module=ark):
+    """The `image` field after the request phase."""
+    body = await module.transform(
         ctx, {"prompt": "replace the circle", "image": image}, "request"
     )
     return body["image"]
 
 
+async def _body(ctx, payload: dict, module=ark):
+    return await module.transform(ctx, payload, "request")
+
+
 class TestDefaultMode:
-    """`url` mode: unchanged, and the reason it must stay unchanged."""
+    """`url` mode: the cheap path, and the one thing it must not touch."""
 
     @pytest.mark.asyncio
     async def test_a_url_is_forwarded_verbatim_and_costs_us_nothing(
@@ -133,7 +172,7 @@ class TestDefaultMode:
 
 
 class TestDataUriMode:
-    """The fix: the mode is honoured for URLs too, so ARK fetches nothing."""
+    """The mode that stops ARK from fetching anything at all."""
 
     @pytest.mark.asyncio
     async def test_a_url_is_fetched_by_us_and_inlined(self, monkeypatch):
@@ -177,7 +216,7 @@ class TestDataUriMode:
         """An operator who learned the value on a google channel gets it here.
 
         Falling through to "url" instead would be a silent no-op, which is the
-        exact defect this file is about.
+        exact defect this option exists to fix.
         """
         ctx, spy = _ctx(monkeypatch, image_ref_mode="inline")
         assert await _image_field(ctx, URL) == DATA_URI
@@ -192,59 +231,412 @@ class TestBase64Mode:
         assert spy.downloads == [URL]
 
 
-@pytest.mark.asyncio
-async def test_an_unknown_mode_still_falls_through_to_url(monkeypatch):
+class TestAnUnknownModeFallsThroughToUrl:
     """Pinned deliberately: this is the old behaviour, not a new failure mode.
 
     A channel carrying a value this script does not know must keep working
-    exactly as it did rather than start refusing requests.
-    """
-    ctx, spy = _ctx(monkeypatch, image_ref_mode="something-else")
-    assert await _image_field(ctx, URL) == URL
-    assert spy.downloads == []
-
-
-class TestVersionSplit:
-    """`@v1` keeps the ordering, and `@v2` is otherwise a safe promotion.
-
-    These two tests are the reason the change ships as a new version: the
-    promotion has to be safe for every channel that does not opt in, and
-    reversible for one that needs the old behaviour.
+    rather than start refusing requests -- but note what "keep working" means
+    for a URL, which is a request that hands ARK something to fetch and
+    therefore gambles on its 5 s cap. That is why the fallthrough is stated
+    here rather than left implicit.
     """
 
     @pytest.mark.asyncio
-    async def test_v1_still_hands_ark_the_url_even_in_data_uri_mode(
-        self, monkeypatch
-    ):
-        """The pre-fix behaviour, kept reachable by pinning `@v1`."""
-        ctx, spy = _ctx(monkeypatch, image_ref_mode="data_uri")
-        body = await ark_v1.transform(
-            ctx, {"prompt": "replace the circle", "image": URL}, "request"
-        )
-        assert body["image"] == URL
+    async def test_a_url_is_still_passed_through(self, monkeypatch):
+        ctx, spy = _ctx(monkeypatch, image_ref_mode="data-url")
+        assert await _image_field(ctx, URL) == URL
         assert spy.downloads == []
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("module", [ark_v1, ark], ids=["v1", "v2"])
-    async def test_the_default_mode_is_identical_on_both_versions(
-        self, monkeypatch, module
-    ):
-        """No mode set means no behaviour change, which is what makes @v2 safe.
+    async def test_an_inline_reference_is_rehosted(self, monkeypatch):
+        """The fallthrough is not a no-op: it is `url` mode by another route."""
+        ctx, spy = _ctx(monkeypatch, image_ref_mode="data-url")
+        assert await _image_field(ctx, BARE) == REHOSTED
+        assert spy.uploads == [PNG]
 
-        A channel that never sets `image_ref_mode` cannot tell the two versions
-        apart by anything these tests can observe -- zero downloads either way.
+
+class TestRefPolicy:
+    """The `ref_*` options: what they shrink, and what they refuse to touch.
+
+    Every case here is about a decision that could go quietly wrong. A policy
+    that does not apply to one input shape, a policy that turns a request into
+    a 400, a policy that reports the operator's mistake against the client's
+    file -- all three are worse than no policy at all, and all three have a
+    test below.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_ceiling_shrinks_the_reference_before_it_is_uploaded(
+        self, monkeypatch
+    ):
+        ctx, spy = _ctx(monkeypatch, payload=REAL_PNG, ref_max_edge=64)
+        assert await _image_field(ctx, REAL_BARE) == REHOSTED
+        assert _size_of(spy.uploads[0]) == (64, 48)
+        assert spy.uploads[0] != REAL_PNG
+
+    @pytest.mark.asyncio
+    async def test_the_uploaded_extension_follows_the_format_we_chose(
+        self, monkeypatch
+    ):
+        """The extension is the object store's contract, and the evidence.
+
+        It is also how an operator can tell from the `storage_put` span that the
+        policy ran at all, so it is not decoration.
         """
-        ctx, spy = _ctx(monkeypatch)
-        body = await module.transform(
-            ctx, {"prompt": "replace the circle", "image": URL}, "request"
-        )
-        assert body["image"] == URL
+        ctx, spy = _ctx(monkeypatch, payload=REAL_PNG, ref_fmt="jpeg")
+        await _image_field(ctx, REAL_BARE)
+        assert spy.exts == ["jpeg"]
+
+    @pytest.mark.asyncio
+    async def test_a_url_in_url_mode_is_never_fetched_in_order_to_be_shrunk(
+        self, monkeypatch
+    ):
+        """The one exemption, stated rather than discovered.
+
+        Fetching a reference to compress it would spend exactly the 5 s gamble
+        that `image_ref_mode: "url"` exists to avoid, so the policy cannot apply
+        here -- and the operator is told so in the module docstring instead of
+        finding out from a timeout.
+        """
+        ctx, spy = _ctx(monkeypatch, ref_max_edge=64)
+        assert await _image_field(ctx, URL) == URL
         assert spy.downloads == []
         assert spy.uploads == []
 
+    @pytest.mark.asyncio
+    async def test_the_policy_applies_in_data_uri_mode(self, monkeypatch):
+        """No input shape is exempt, which is the invariant this group keeps."""
+        ctx, spy = _ctx(
+            monkeypatch, payload=REAL_PNG, image_ref_mode="data_uri", ref_max_edge=64
+        )
+        image = await _image_field(ctx, URL)
+        assert spy.downloads == [URL]
+        assert image.startswith("data:image/png;base64,")
+        assert _b64_size(image) == (64, 48)
 
-@pytest.mark.parametrize("filename", ["images@v1.py", "images@v2.py"])
-def test_both_versions_are_within_the_script_sandbox(filename):
+    @pytest.mark.asyncio
+    async def test_the_policy_applies_in_base64_mode(self, monkeypatch):
+        ctx, spy = _ctx(
+            monkeypatch, payload=REAL_PNG, image_ref_mode="base64", ref_max_edge=64
+        )
+        image = await _image_field(ctx, URL)
+        assert not image.startswith("data:")
+        assert _b64_size(image) == (64, 48)
+
+    @pytest.mark.asyncio
+    async def test_every_reference_in_an_array_is_shrunk(self, monkeypatch):
+        ctx, spy = _ctx(monkeypatch, payload=REAL_PNG, ref_max_edge=64)
+        image = await _image_field(ctx, [REAL_BARE, REAL_BARE, REAL_BARE])
+        assert image == [REHOSTED, REHOSTED, REHOSTED]
+        assert [_size_of(data) for data in spy.uploads] == [(64, 48)] * 3
+
+    @pytest.mark.asyncio
+    async def test_a_reference_we_cannot_decode_is_uploaded_as_it_arrived(
+        self, monkeypatch
+    ):
+        """The fallback that stops an optimisation becoming a 400.
+
+        The stub PNG is accepted by the front door and cannot be opened by
+        Pillow, which is the shape a BMP or AVIF reference has from in here. It
+        must reach ARK exactly as the client sent it.
+        """
+        ctx, spy = _ctx(monkeypatch, ref_max_edge=64)
+        assert await _image_field(ctx, BARE) == REHOSTED
+        assert spy.uploads == [PNG]
+        assert spy.exts == ["png"]
+
+    @pytest.mark.asyncio
+    async def test_a_numeric_option_may_be_written_as_a_digit_string(
+        self, monkeypatch
+    ):
+        ctx, spy = _ctx(
+            monkeypatch,
+            payload=REAL_PNG,
+            ref_max_edge="64",
+            ref_fmt="webp",
+            ref_quality="85",
+        )
+        await _image_field(ctx, REAL_BARE)
+        assert spy.exts == ["webp"]
+        assert _size_of(spy.uploads[0]) == (64, 48)
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_spent_when_no_policy_is_set(self, monkeypatch):
+        ctx, spy = _ctx(monkeypatch, payload=REAL_PNG)
+        assert await _image_field(ctx, REAL_BARE) == REHOSTED
+        assert spy.uploads == [REAL_PNG]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"ref_fmt": "tiff"},
+            {"ref_max_edge": 0},
+            {"ref_max_edge": -1},
+            {"ref_max_edge": "abc"},
+            {"ref_max_edge": True},
+            {"ref_max_edge": 1.5},
+            {"ref_max_bytes": 0},
+            {"ref_quality": 85},  # cannot apply: no format named
+            {"ref_quality": 85, "ref_fmt": "png"},  # named, and has no knob
+            {"ref_quality": 500, "ref_fmt": "webp"},
+            {"ref_quality": 1.5, "ref_fmt": "webp"},
+        ],
+    )
+    async def test_a_malformed_option_is_a_channel_error_not_a_client_error(
+        self, monkeypatch, options
+    ):
+        """`channel_config_error` says "the headers are wrong", which they are.
+
+        A 400 carrying `image_invalid` would send whoever reads it to the
+        client's file, and the client cannot fix a typo in `X-Channel-Options`.
+        The refusal also happens before any upstream call, so it costs nothing
+        but the operator's attention.
+        """
+        ctx, _ = _ctx(monkeypatch, **options)
+        with pytest.raises(AdapterError) as excinfo:
+            await _image_field(ctx, REAL_BARE)
+        assert excinfo.value.code == "channel_config_error"
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_option_does_not_break_text_to_image(
+        self, monkeypatch
+    ):
+        """A reference policy is not consulted when there is no reference.
+
+        Failing a text-to-image request over an option that cannot apply to it
+        would make the operator's typo into the client's outage.
+        """
+        ctx, spy = _ctx(monkeypatch, ref_fmt="tiff")
+        body = await _body(ctx, {"prompt": "a red circle"})
+        assert "image" not in body
+
+
+class TestRetry:
+    """The answer to ARK's own fetch timeout, and its judgement.
+
+    Two things have to hold for the retry to be worth having, and both are
+    negative: the first attempt must still take the cheap path, and the second
+    must actually take the different one. The judgement about *which* failure is
+    worth answering lives here too -- the engine offers the extra request phase
+    unconditionally and the script reads the message.
+    """
+
+    def test_both_wordings_are_named(self):
+        assert ark.REFERENCE_FAILURES == (
+            "Timeout while downloading url=",
+            "invalid url specified",
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_first_attempt_still_takes_the_cheap_path(self, monkeypatch):
+        """No `ctx.upstream_error` means no retry is in progress, so the URL is
+        forwarded and we download nothing."""
+        ctx, spy = _ctx(monkeypatch)
+        assert await _image_field(ctx, URL) == URL
+        assert spy.downloads == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reason",
+        ["Timeout while downloading url=https://x/y", "invalid url specified."],
+        ids=["could-not-fetch", "would-not-parse"],
+    )
+    async def test_a_retry_attempt_inlines_the_reference(self, monkeypatch, reason):
+        """The answer to the failure: ARK gets no URL to fetch this time.
+
+        Both wordings are answered, because they are the same refusal reached
+        two ways: ARK gave up on the download, or would not accept the value as
+        a URL at all.
+        """
+        ctx, spy = _ctx(monkeypatch)
+        ctx.upstream_error = {
+            "message": f"Upstream returned 400: The parameter `image` ... {reason}",
+            "upstream_status": 400,
+        }
+        assert await _image_field(ctx, URL) == DATA_URI
+        assert spy.downloads == [URL]
+
+    @pytest.mark.asyncio
+    async def test_a_failure_it_does_not_recognise_is_left_alone(self, monkeypatch):
+        """The judgement, at its most important point.
+
+        A content refusal arrives as the same 400 with different wording. On
+        something this script cannot fix, inlining would change the request for
+        no reason -- and the changed body would buy a second generation to
+        collect the same refusal. Declining keeps the request identical, which is
+        what lets the engine withhold the second call.
+        """
+        ctx, spy = _ctx(monkeypatch)
+        ctx.upstream_error = {
+            "message": "Upstream returned 400: The parameter `prompt` is not valid",
+            "upstream_status": 400,
+        }
+        assert await _image_field(ctx, URL) == URL
+        assert spy.downloads == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["base64", "url", "data-url"])
+    async def test_a_retry_attempt_overrides_whatever_mode_was_configured(
+        self, monkeypatch, mode
+    ):
+        """The override is read before the `url` fast path, and it wins.
+
+        `base64` is the form measured to be rejected, so a retry must not spend
+        itself on it; a URL must not be handed over again for the same reason.
+        Both are the same rule: on a retry, the wire form is not the caller's to
+        choose.
+        """
+        ctx, spy = _ctx(monkeypatch, image_ref_mode=mode)
+        ctx.upstream_error = {
+            "message": "Upstream returned 400: Timeout while downloading url=https://x",
+            "upstream_status": 400,
+        }
+        assert await _image_field(ctx, URL) == DATA_URI
+        assert spy.downloads == [URL]
+
+    @pytest.mark.asyncio
+    async def test_the_retry_still_shrinks_when_a_policy_is_set(self, monkeypatch):
+        """A retry inlines, and an inlined reference is one whose bytes we hold
+        -- so the compression policy applies to it like any other."""
+        ctx, spy = _ctx(monkeypatch, payload=REAL_PNG, ref_max_edge=64)
+        ctx.upstream_error = {
+            "message": "Upstream returned 400: Timeout while downloading url=https://x",
+            "upstream_status": 400,
+        }
+        image = await _image_field(ctx, URL)
+        assert image.startswith("data:image/png;base64,")
+        assert _b64_size(image) == (64, 48)
+
+
+class TestWatermarkIsOffByDefault:
+    """What leaves the adapter when nobody mentions watermark."""
+
+    @pytest.mark.asyncio
+    async def test_a_bare_request_asks_for_no_watermark(self, monkeypatch):
+        ctx, _ = _ctx(monkeypatch)
+        body = await _body(ctx, {"prompt": "a red circle"})
+        assert body["watermark"] is False
+
+    @pytest.mark.asyncio
+    async def test_the_field_is_sent_rather_than_left_out(self, monkeypatch):
+        """Omitting it would mean "on", which is the bug, not the fix.
+
+        ARK defaults this parameter to `true`, so the only way to turn it off is
+        to say so. This assertion is what stops a later "tidy-up" that drops a
+        field it reads as redundant from silently restoring the mark.
+        """
+        ctx, _ = _ctx(monkeypatch)
+        body = await _body(ctx, {"prompt": "a red circle"})
+        assert "watermark" in body
+        assert body["watermark"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_channel_option_of_false_is_the_same_as_unset(self, monkeypatch):
+        ctx, _ = _ctx(monkeypatch, watermark=False)
+        body = await _body(ctx, {"prompt": "a red circle"})
+        assert body["watermark"] is False
+
+    @pytest.mark.asyncio
+    async def test_the_request_body_can_ask_for_it(self, monkeypatch):
+        """The default is reversed; the capability is not removed."""
+        ctx, _ = _ctx(monkeypatch)
+        body = await _body(ctx, {"prompt": "a red circle", "watermark": True})
+        assert body["watermark"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_channel_option_can_ask_for_it(self, monkeypatch):
+        """A channel that needs the mark sets it once, not per request."""
+        ctx, _ = _ctx(monkeypatch, watermark=True)
+        body = await _body(ctx, {"prompt": "a red circle"})
+        assert body["watermark"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_body_still_wins_over_the_channel_option(self, monkeypatch):
+        """The precedence chain runs payload > channel option > default.
+
+        A channel that turned the mark on for its own reasons must not be able
+        to override a caller who asked for a clean image -- otherwise the
+        default would move the decision away from the caller rather than away
+        from the vendor's default.
+        """
+        ctx, _ = _ctx(monkeypatch, watermark=True)
+        body = await _body(ctx, {"prompt": "a red circle", "watermark": False})
+        assert body["watermark"] is False
+
+
+class TestANullIsNotAWayToSayUnset:
+    """Pinned, not blessed: an explicit `null` is forwarded as `null`.
+
+    The field is taken from the body verbatim when the key is present, and
+    `dict.get` only falls back to the default when the key is *missing* -- so
+    `{"watermark": null}`, which several SDKs emit for an unset boolean, reaches
+    the vendor as `null` rather than as the default. Whether the front door
+    should normalise that, the way it already does for `image` and
+    `response_format`, is an open decision; this test records today's behaviour
+    so a change to it is deliberate.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_null_reaches_the_upstream_as_a_null(self, monkeypatch):
+        ctx, _ = _ctx(monkeypatch)
+        body = await _body(ctx, {"prompt": "a red circle", "watermark": None})
+        assert "watermark" in body
+        assert body["watermark"] is None
+
+
+class TestTheWireShape:
+    """How the `image` field is shaped on its way out."""
+
+    @pytest.mark.asyncio
+    async def test_an_empty_image_key_is_treated_as_absent(self, monkeypatch):
+        ctx, _ = _ctx(monkeypatch)
+        body = await _body(ctx, {"prompt": "a red circle", "image": []})
+        assert "image" not in body
+
+    @pytest.mark.asyncio
+    async def test_a_single_element_array_collapses_to_a_scalar(self, monkeypatch):
+        """ARK takes one reference as a scalar; the array is the caller's shape,
+        not the wire form."""
+        ctx, _ = _ctx(monkeypatch)
+        assert await _image_field(ctx, [URL]) == URL
+
+    @pytest.mark.asyncio
+    async def test_two_url_references_stay_an_array(self, monkeypatch):
+        ctx, _ = _ctx(monkeypatch)
+        assert await _image_field(ctx, [URL, OTHER_URL]) == [URL, OTHER_URL]
+
+    @pytest.mark.asyncio
+    async def test_the_body_carries_the_vendor_defaults(self, monkeypatch):
+        """The fields this script always sends, and the two it never does.
+
+        `stream` is always off (the adapter is synchronous by contract) and
+        `response_format` defaults to a link, since ARK honours both values and
+        the caller asking for nothing should not be routed through storage.
+        """
+        ctx, _ = _ctx(monkeypatch)
+        body = await _body(ctx, {"prompt": "a red circle"})
+        assert body["model"] == "doubao-seedream-5-0-260128"
+        assert body["stream"] is False
+        assert body["response_format"] == "url"
+        assert "sequential_image_generation" not in body
+
+    @pytest.mark.asyncio
+    async def test_a_passthrough_field_only_travels_when_it_is_supplied(
+        self, monkeypatch
+    ):
+        """`sequential_image_generation` is model-gated: the 5-0-pro variants
+        reject it with a 400, so it is forwarded on request and never defaulted
+        on."""
+        ctx, _ = _ctx(monkeypatch)
+        body = await _body(
+            ctx, {"prompt": "a red circle", "sequential_image_generation": "auto"}
+        )
+        assert body["sequential_image_generation"] == "auto"
+
+
+@pytest.mark.parametrize("filename", ["images@v1.py"])
+def test_every_version_is_within_the_script_sandbox(filename):
     """A script edit the loader would refuse must fail here, not on deploy."""
     from adapter.sandbox import scan_source
 

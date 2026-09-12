@@ -96,8 +96,8 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | Redis | `job_lock:{job_id}` | 异步轮询分布式锁 | poll_interval+1s |
 | Redis | `resp_ctx:{response_id}` | responses 状态链上下文 | 1h |
 | Redis | `ratelimit:{token}:{window}` | 滑动窗口限流 | 窗口期 |
-| 对象存储 | `[<prefix>/]<yyyymmdd>/{request_id}/{uuid}.{ext}` | 临时图片（键由引擎构造，与后端无关；日期段恒定，前缀默认空 ⇒ 日期落在桶根） | minio：预签名 URL，TTL=`temp_image_ttl`（默认 1h，上限 7d）(BR-005)；fal：公网长期，仅取 basename |
-| 对象存储 | `[<prefix>/]<yyyymmdd>/{request_id}/step_{name}.{ext}` | 管线中间产物（大图引用传递）——**约定，非当前 API 能力**：`upload_temp_image` 不接受命名键，现无脚本产生此形态 | 同上 (BR-016) |
+| 对象存储 | `<yyyymmdd>/[<prefix>/]<uuid>.{ext}` | 临时图片（键由引擎构造，与后端无关；**日期段恒定且落在桶根**；前缀默认空、存在时位于日期之内；**键里既无 model 也无 request-id 段**——键会变成交给调用方的 URL，无签名后端下等于公开，而 model 与 request_id 在 trace 里本就有） | minio：预签名 URL，TTL=`temp_image_ttl`（默认 1h，上限 7d）(BR-005)；fal：公网长期，仅取 basename |
+| 对象存储 | `<yyyymmdd>/[<prefix>/]step_{name}.{ext}` | 管线中间产物（大图引用传递）——**约定，非当前 API 能力**：`upload_temp_image` 不接受命名键，现无脚本产生此形态 | 同上 (BR-016) |
 
 **降级规则（锁定）**：`REDIS_URL`/所选后端必填项（`minio` 看 `MINIO_ENDPOINT`，`fal` 看 `FAL_KEY`）未配置时，dev 模式降级为进程内内存缓存 + data URI 输出并打 warning 日志；docker compose 生产编排必须配齐，不允许降级。
 
@@ -126,14 +126,14 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 | AC-11 | 沙箱 | If 脚本含 `import subprocess` / `exec(` / `eval(` / `__import__` / `open(`，加载必须抛 SecurityError 拒绝执行 | P0 |
 | AC-12 | 沙箱白名单 | While 脚本仅 import 白名单标准库（json/re/base64/datetime/time/math/random/string/typing/collections/itertools/functools/hashlib/uuid/urllib.parse），加载必须成功；合法的 `await` / 下标访问不得误杀 | P0 |
 | AC-13 | 热重载 | When scripts/ 下文件被修改，系统必须在 5s 内使缓存失效，下次请求加载新代码并重新 AST 扫描 | P1 |
-| AC-14 | 异步 Job | When mock 上游返回 job_id，系统必须按 poll_interval 轮询至 completed 并返回结果；If 超过 poll_timeout，必须返回 500 超时错误（BR-004） | P0 |
+| AC-14 | 异步 Job | When mock 上游返回 job_id，系统必须按 poll_interval 轮询至 completed 并返回结果；If 超过 poll_timeout，必须返回 **504** `code=poll_timeout`（BR-004；实现见 `adapter/errors.py::PollTimeoutError`） | P0 |
 | AC-15 | 路由 | If model 未在注册表登记，系统必须返回 404 + `code=model_not_found` | P0 |
 | AC-16 | Mock 上游 | Mock 服务必须提供：同步生图、异步 Job（提交/查询）、AK-SK 签名校验 三组端点，返回 1x1 PNG 真实字节 | P0 |
 | AC-17 | 可观测 | While LOGFIRE_TOKEN 已配置，每请求必须产生含 registry_resolve/script_load/script_transform_request/upstream_http_call/script_transform_response Span 的 Trace；未配置时本地运行不报错 | P1 |
 | AC-18 | 健康检查 | When GET /health，系统必须返回 200 + Redis/对象存储连通状态。存储项的键名＝当前 `STORAGE_BACKEND`（默认 `minio`），使运维一眼看出探针实际打到了哪个后端 | P1 |
 | AC-19 | 鉴权 | If Authorization 缺失或 Token 错误（且 ADAPTER_AUTH_ENABLED=true），系统必须返回 401 标准错误 | P1 |
 | AC-20 | 编排 | docker compose config 必须校验通过；adapter 容器非 root、脚本只读挂载 | P1 |
-| AC-21 | 超时 | If 脚本执行超过 SANDBOX_TIMEOUT(30s)，系统必须返回 504（BR-003） | P0 |
+| AC-21 | 超时 | If 脚本执行超过 `script_timeout`（代码默认 30s；本部署 `.env` 为 240s），系统必须返回 504 `code=script_timeout`（BR-003）。⚠️ 该上限**只在 await 点生效**：纯同步忙等（如 `time.sleep`）会完全逃逸它 | P0 |
 
 ### 9.1 v1.1 级联编排验收标准
 
@@ -297,7 +297,9 @@ curl -s -X POST localhost:8080/v1/images -H "Content-Type: application/json" \
 1. ~~**分层超时 + `ctx.deadline`/`remaining`**（AC-22/27）~~ ✅ 已实现 —— `adapter/budget.py`，
    预算检查点在 `_do_upstream` 入口，实际超时取 `min(plan.timeout or upstream_timeout, remaining)`
 2. ~~**`ctx.image` 门面**（AC-23）~~ ✅ 已实现 —— `adapter/utils/imageops.py`，
-   `info`/`resize`/`convert`/`to_data_url` 四个算子（`crop`/`pad`/`compose_mask` 按 YAGNI 暂缓）
+   `info`/`resize`/`convert`/`compress`/`to_data_url` 五个算子（`crop`/`pad`/`compose_mask` 按 YAGNI 暂缓）；
+   `compress` 是 2026-09-12 补的第五个：接 `max_edge`/`fmt`/`quality`/`max_bytes`，`max_bytes` 为**目标非保证**
+   （先降质量到下限 40，再降尺寸，且只在缩小确实达标时才动尺寸）；脚本侧入口 `ctx.compress_image(ref, …)`
 3. ~~**`STAGES` 声明 + `phase` 分发**（AC-24/25）~~ ✅ 已实现 —— `adapter/stages.py::execute_staged`，
    无 `STAGES` 时走原 `execute()` 路径
 4. ~~**`ctx.stage` + `ctx.SKIP`**（AC-26/31）~~ ✅ 已实现 —— 级间产物 dict + `_Skip` 单例哨兵

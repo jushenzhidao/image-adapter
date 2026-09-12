@@ -252,6 +252,31 @@ def init_logfire(app: FastAPI, settings: Settings) -> None:
         ),
     )
 
+    # ``logging`` is a separate pipeline from the tracing above, and until this line was
+    # added nothing connected them: the app logged to stdout and to Logfire's own spans,
+    # and every ``logger.warning`` in the codebase -- including the storage layer's report
+    # that an address went dark -- stopped at the container boundary.
+    #
+    # WARNING and above, not NOTSET. This app logs progress at INFO, and shipping every
+    # line of it to a hosted backend is a different (and much larger) decision than
+    # shipping the lines that say something went wrong. INFO keeps going to stdout for the
+    # platform's own collector, so nothing is lost, only unshipped.
+    #
+    # The fallback is a NullHandler because ``main.py`` already installs a stderr handler
+    # through ``logging.basicConfig``: the fallback only runs when logfire instrumentation
+    # is suppressed, and leaving logfire's default in place would print those records
+    # twice.
+    #
+    # Attached once. ``init_logfire`` runs per app and the test suite builds several, and
+    # a second handler would ship every record twice rather than failing.
+    root = logging.getLogger()
+    if not any(isinstance(h, logfire.LogfireLoggingHandler) for h in root.handlers):
+        root.addHandler(
+            logfire.LogfireLoggingHandler(
+                level=logging.WARNING, fallback=logging.NullHandler()
+            )
+        )
+
     if settings.logfire_token:
         logger.info(
             "Logfire enabled: service=%s version=%s sampling=%.2f excluded=%s "
@@ -263,7 +288,6 @@ def init_logfire(app: FastAPI, settings: Settings) -> None:
         )
     else:
         logger.warning("Logfire running in local-only mode (LOGFIRE_TOKEN not set)")
-
     logfire.instrument_fastapi(
         app,
         # Refused above rather than merely documented: see the module docstring.

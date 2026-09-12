@@ -1,19 +1,19 @@
-"""google/images@v2 against v1: does the fan-out happen, and is the body identical?
+"""google/images@v1 through real sockets: does the fan-out reach the network?
 
-Same two-part question as ``test_fanout_materialisation.py`` asks of
-``openai/images``, and the same method -- a differential pair, where one request
-goes to each version and the observations must differ in exactly one way.
-
-google needs its own file because its inbound change is a *hoist* rather than an
-in-place rewrite: the reference downloads were pulled out in front of a loop
-whose inline-budget arithmetic is read-then-written and must stay serial. The
-risk that creates is not "the fan-out is missing" but "the fan-out changed which
-image got inlined", so the body comparison here is the load-bearing assertion and
-it is run in ``auto`` mode -- the only mode where the budget decides anything.
+Two questions, both of which a unit test cannot answer. First, whether the
+concurrency is real end to end -- the script asks `ctx.fanout`, and the pool,
+the client and the loader all sit between that call and an overlapping pair of
+requests, so the peak is measured at the image host rather than at the stub.
+Second, whether the *video* of the request is unchanged: google's inbound change
+is a hoist rather than an in-place rewrite, and the risk that creates is not "the
+fan-out is missing" but "the fan-out changed which image got inlined". The
+budget test is that assertion, and it runs in ``auto`` mode -- the only mode
+where the budget decides anything.
 
 Real sockets on both sides. The image source is a ``ThreadingHTTPServer``: a
 plain ``HTTPServer`` serves one request at a time, so a concurrent client would
-look serial and the pair would be vacuous.
+look serial and every peak assertion here would read 1 for a reason unrelated to
+the adapter.
 """
 
 from __future__ import annotations
@@ -196,90 +196,68 @@ def _edit(client, vendor, image_source, script_ref: str, count: int, **options):
     )
 
 
-def _normalised(body: dict) -> dict:
-    """A vendor body with the per-request storage URLs blanked out.
+def _body_shape(body: dict) -> list[str]:
+    """The part sequence of a vendor body, hosts and bytes abstracted away.
 
-    The object key is deliberately unguessable and carries the request id, so two
-    runs of the *same* request cannot share one -- comparing those verbatim would
-    fail for a reason unrelated to what is being tested. Everything else is what
-    the comparison is about: which reference was inlined, which was re-hosted,
-    and in what order.
+    The object key is deliberately unguessable and carries the request id, so a
+    stored URL cannot be compared verbatim between runs -- but which reference
+    was inlined, which was re-hosted, and in what order is exactly what these
+    tests are about.
     """
-    out = json.loads(json.dumps(body))
-    for part in out["contents"][0]["parts"]:
-        if "fileData" in part:
-            part["fileData"]["fileUri"] = "<hosted>"
-    return out
+    return [next(iter(part)) for part in body["contents"][0]["parts"]]
 
 
-# --- the differential: the downloads overlap in v2 only -------------------
+# --- the downloads overlap ------------------------------------------------
 
 
-def test_v1_fetches_client_references_one_at_a_time(client, vendor, image_source):
-    """The baseline. If this ever overlapped, the pair below would be vacuous.
+def test_client_references_are_fetched_concurrently(client, vendor, image_source):
+    """The fan-out has to reach the network, not just the script.
 
     ``inline`` mode is what makes the adapter fetch at all: by default a client
     URL is handed to Gemini verbatim (``client_url_passthrough``), so there is no
-    download to measure. This is the mode that forces one.
+    download to measure.
+
+    The hit count is asserted alongside the peak: an overlap of one would satisfy
+    a peak assertion on a request that only ever fetched one reference.
     """
     response = _edit(
         client, vendor, image_source, "google/images@v1", 3, image_ref_mode="inline"
     )
 
     assert response.status_code == 200, response.text
-    assert _ImageSource.peak == 1, (
-        f"v1 overlapped {_ImageSource.peak} fetches; the baseline is not serial"
-    )
-
-
-def test_v2_fetches_client_references_concurrently(client, vendor, image_source):
-    """Same request, only the ref changed. The observation must flip."""
-    response = _edit(
-        client, vendor, image_source, "google/images@v2", 3, image_ref_mode="inline"
-    )
-
-    assert response.status_code == 200, response.text
-    assert _ImageSource.peak > 1, (
-        f"v2 fetched serially too (peak {_ImageSource.peak}); the hoisted "
-        "prefetch is not reaching the downloads"
-    )
     assert len(_ImageSource.hits) == 3
+    assert _ImageSource.peak > 1, (
+        f"the references were fetched serially (peak {_ImageSource.peak}); the "
+        "hoisted prefetch is not reaching the downloads"
+    )
 
 
-def test_v2_leaves_a_single_reference_serial(client, vendor, image_source):
+def test_a_single_reference_is_left_serial(client, vendor, image_source):
+    """N=1 is the case every fan-out site must leave alone."""
     response = _edit(
-        client, vendor, image_source, "google/images@v2", 1, image_ref_mode="inline"
+        client, vendor, image_source, "google/images@v1", 1, image_ref_mode="inline"
     )
 
     assert response.status_code == 200, response.text
     assert _ImageSource.peak == 1
 
 
-# --- and the body it produces is unchanged --------------------------------
+# --- and the body it produces is the one the budget decided ---------------
 
 
-def test_the_two_versions_send_the_same_body_in_inline_mode(
+def test_inlining_a_batch_produces_one_inline_part_per_reference(
     client, vendor, image_source
 ):
-    """Hoisting the fetches must not change what the upstream receives.
-
-    ``inline`` mode is unconditional: every reference is inlined whatever its
-    size, so this isolates ordering and encoding from the budget arithmetic.
-    """
-    assert _edit(
+    """``inline`` mode is unconditional: every reference is inlined whatever its
+    size, so this isolates ordering and encoding from the budget arithmetic."""
+    response = _edit(
         client, vendor, image_source, "google/images@v1", 3, image_ref_mode="inline"
-    ).status_code == 200
-    v1_body = json.loads(_Vendor.bodies[0])
+    )
 
-    assert _edit(
-        client, vendor, image_source, "google/images@v2", 3, image_ref_mode="inline"
-    ).status_code == 200
-    v2_body = json.loads(_Vendor.bodies[1])
-
-    assert v1_body == v2_body
-    parts = v1_body["contents"][0]["parts"]
-    inlined = [p for p in parts if "inlineData" in p]
-    assert len(inlined) == 3
+    assert response.status_code == 200, response.text
+    body = json.loads(_Vendor.bodies[0])
+    assert _body_shape(body) == ["text", "inlineData", "inlineData", "inlineData"]
+    inlined = [p for p in body["contents"][0]["parts"] if "inlineData" in p]
     assert {p["inlineData"]["data"] for p in inlined} == {PNG_B64}
 
 
@@ -290,16 +268,17 @@ def test_the_budget_still_decides_in_input_order(
 
     ``auto`` mode is the only mode where the inline budget decides anything, and
     that budget is read-then-written as the loop walks the references. If the
-    hoisted prefetch had also parallelised the *decisions*, which image ends up
+    hoisted prefetch also parallelised the *decisions*, which image ends up
     inlined would depend on which download finished first -- the same request
     would produce different bodies run to run, and the
     ``inline_total_max_bytes`` guard would stop being a guard.
 
     The budget is set to fit exactly one 68-byte image, so the split is forced
-    and the second and third must be re-hosted. ``client_url_passthrough`` is
-    turned off because otherwise the references never reach us at all, and the
-    store is installed because a reference that has to be hosted with no storage
-    fails loudly by design (413) rather than silently inlining.
+    and the second and third must be re-hosted -- in that order, which is what
+    the part sequence pins. ``client_url_passthrough`` is turned off because
+    otherwise the references never reach us at all, and the store is installed
+    because a reference that has to be hosted with no storage fails loudly by
+    design (413) rather than silently inlining.
     """
     options = {
         "image_ref_mode": "auto",
@@ -308,32 +287,24 @@ def test_the_budget_still_decides_in_input_order(
         "inline_total_max_bytes": 100,
     }
 
-    assert _edit(
-        client, vendor, image_source, "google/images@v1", 3, **options
-    ).status_code == 200
-    v1_body = json.loads(_Vendor.bodies[0])
+    response = _edit(client, vendor, image_source, "google/images@v1", 3, **options)
 
-    # The premise: the budget really did split the batch, or this proves nothing.
-    parts = v1_body["contents"][0]["parts"]
+    assert response.status_code == 200, response.text
+    parts = json.loads(_Vendor.bodies[0])["contents"][0]["parts"]
+    assert _body_shape(json.loads(_Vendor.bodies[0])) == [
+        "text",
+        "inlineData",
+        "fileData",
+        "fileData",
+    ]
     assert sum("inlineData" in p for p in parts) == 1
     assert sum("fileData" in p for p in parts) == 2
 
-    assert _edit(
-        client, vendor, image_source, "google/images@v2", 3, **options
-    ).status_code == 200
-    v2_body = json.loads(_Vendor.bodies[1])
 
-    assert _normalised(v2_body) == _normalised(v1_body)
-    # And once more on the raw body, so the split is pinned rather than merely
-    # compared: one inlined, two hosted, in that order.
-    v2_parts = v2_body["contents"][0]["parts"]
-    assert [next(iter(p)) for p in v2_parts] == ["text", "inlineData", "fileData", "fileData"]
+# --- the reply side: uploads, concurrently --------------------------------
 
 
-# --- the reply side: uploads, concurrently -------------------------------
-
-
-def test_v1_uploads_hosted_replies_one_at_a_time(client, vendor, image_source, store):
+def test_hosted_replies_are_uploaded_concurrently(client, vendor, image_source, store):
     _Vendor.image_count = 3
     response = client.post(
         "/v1/images/generations",
@@ -342,19 +313,8 @@ def test_v1_uploads_hosted_replies_one_at_a_time(client, vendor, image_source, s
     )
 
     assert response.status_code == 200, response.text
-    assert _CountingStore.peak == 1, "baseline: v1 uploaded the reply serially"
-
-
-def test_v2_uploads_hosted_replies_concurrently(client, vendor, image_source, store):
-    _Vendor.image_count = 3
-    response = client.post(
-        "/v1/images/generations",
-        headers=_headers(vendor, "google/images@v2"),
-        json={"model": MODEL, "prompt": "x", "response_format": "url"},
-    )
-
-    assert response.status_code == 200, response.text
-    assert _CountingStore.peak > 1, "v2 did not overlap the reply uploads"
+    assert _CountingStore.peak > 1, "the reply uploads did not overlap"
     data = response.json()["data"]
     assert len(data) == 3
+
     assert all(item["url"].startswith("https://cdn.test/") for item in data)

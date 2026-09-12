@@ -11,9 +11,18 @@ Two hazards shape the implementation:
   Byte caps do not catch this; the guard has to be on the decoded pixel count,
   checked from the header before the pixels are ever materialised.
 
-  Event-loop blocking. resize and convert are synchronous CPU work. Called
+  Event-loop blocking. Every operator here is synchronous CPU work. Called
   directly they would stall every other in-flight request on the worker, so
-  each operator hops to a thread.
+  each one hops to a thread.
+
+The difference between ``convert`` and ``compress`` is the difference between an
+instruction and a goal. ``convert`` re-encodes into the named format and stops
+there. ``compress`` takes the *limits* a caller wants the result to fit inside
+(max edge, byte target) and finds the smallest encoding that meets them, so the
+caller does not have to reimplement the search. It is still a mechanism, not a
+policy: whether a reference should be shrunk at all, and to what, is decided
+outside this module -- the framework never guesses what a channel wants, and
+``docs/07`` §2 makes that an explicit rule.
 """
 
 from __future__ import annotations
@@ -39,6 +48,31 @@ FORMAT_ALIASES = {
     "webp": "WEBP",
     "gif": "GIF",
 }
+
+#: Formats where a quality number means something. For PNG and GIF a byte
+#: target can only be met by encoding harder (``optimize``) or by using fewer
+#: pixels, which is why the ladders below are format-aware.
+LOSSY_FORMATS = ("JPEG", "WEBP")
+
+#: The quality a re-encode starts from when the caller named none. Pillow's own
+#: default for JPEG is 75; 85 is chosen here and stated instead of inherited, so
+#: the number is one an operator can reason about rather than one they have to
+#: look up.
+DEFAULT_QUALITY = 85
+
+#: Quality steps a byte target may fall back through, tried in this order and
+#: only ever downwards, so a caller who asked for 60 never gets 70.
+QUALITY_LADDER = (70, 55, 40)
+
+#: How far a byte target may shrink the image when trading quality alone is not
+#: enough. Reached only after the quality ladder is exhausted. Deliberately a
+#: short, fixed list rather than a loop: it bounds the work a single reference
+#: can cost, and every step is a decision the caller would have recognised.
+SCALE_LADDER = (0.75, 0.5, 0.35)
+
+#: Bottom of the quality ladder. The caller asked for a smaller file, not for a
+#: visibly damaged one, and below this the second is what they would get.
+QUALITY_FLOOR = 40
 
 
 def _fail(message: str, code: str = "image_invalid") -> NoReturn:
@@ -184,13 +218,22 @@ class ImageOps:
             img = img.resize((width, height), Image.LANCZOS)
         return self._encode(img, target)
 
+    def _check_positive_int(self, name: str, value: Any) -> None:
+        """One dimension-like argument: a positive int, and not a bool.
+
+        ``bool`` is rejected even though it is an ``int`` subclass, because
+        ``True`` arriving where a pixel count belongs means the caller passed a
+        flag, and 1 pixel is not what they meant.
+        """
+        if not isinstance(value, int) or isinstance(value, bool):
+            _fail(f"{name} must be an integer")
+        if value <= 0:
+            _fail(f"{name} must be positive, got {value}")
+
     def _check_dims(self, width: int, height: int) -> None:
         """Rejects nonsense targets before any allocation happens."""
         for name, value in (("width", width), ("height", height)):
-            if not isinstance(value, int) or isinstance(value, bool):
-                _fail(f"{name} must be an integer")
-            if value <= 0:
-                _fail(f"{name} must be positive, got {value}")
+            self._check_positive_int(name, value)
         if width * height > self._settings.max_image_pixels:
             _fail(
                 f"Target {width}x{height} exceeds the "
@@ -198,22 +241,187 @@ class ImageOps:
                 code="image_too_large",
             )
 
+    def _check_edge(self, max_edge: int) -> None:
+        """``max_edge`` is a ceiling, so it needs no pixel-budget check.
+
+        Unlike ``resize``'s target, it never allocates: an image already inside
+        the box is returned untouched, so a value larger than the source -- or
+        larger than ``max_image_pixels`` -- is merely a no-op rather than an
+        error.
+        """
+        self._check_positive_int("max_edge", max_edge)
+
+    def _check_max_bytes(self, max_bytes: int) -> None:
+        """Same shape of argument as a dimension; the same check applies."""
+        self._check_positive_int("max_bytes", max_bytes)
+
     async def convert(self, data: bytes, fmt: str, quality: int | None = None) -> bytes:
         """Re-encodes to another format. quality applies to JPEG and WEBP."""
         return await asyncio.to_thread(self._do_convert, data, fmt, quality)
+
+    def _check_quality(self, quality: Any) -> None:
+        """Range check shared by convert and compress, so the two cannot drift."""
+        if not isinstance(quality, int) or isinstance(quality, bool):
+            _fail("quality must be an integer")
+        if not 1 <= quality <= 100:
+            _fail(f"quality must be between 1 and 100, got {quality}")
 
     def _do_convert(self, data: bytes, fmt: str, quality: int | None) -> bytes:
         img = self._open(data)
         target = self._format_of(img, fmt)
         params: dict[str, Any] = {}
         if quality is not None:
-            if not isinstance(quality, int) or isinstance(quality, bool):
-                _fail("quality must be an integer")
-            if not 1 <= quality <= 100:
-                _fail(f"quality must be between 1 and 100, got {quality}")
-            if target in ("JPEG", "WEBP"):
+            self._check_quality(quality)
+            if target in LOSSY_FORMATS:
                 params["quality"] = quality
         return self._encode(img, target, **params)
+
+    async def compress(
+        self,
+        data: bytes,
+        *,
+        max_edge: int | None = None,
+        fmt: str | None = None,
+        quality: int | None = None,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        """Re-encodes so the result fits the limits given, or as close as it gets.
+
+        ``max_edge`` is a hard ceiling on the longest edge: the image is scaled
+        down when it exceeds it and left alone otherwise, so this never upscales
+        and never changes the aspect ratio.
+
+        ``max_bytes`` is a *target*, not a guarantee, and the two are kept apart
+        deliberately. Meeting it can only be paid for with something the caller
+        did not name -- quality, or pixels -- so the search is bounded and gives
+        up instead of looping: quality is traded down to ``QUALITY_FLOOR``
+        first, and dimensions are only reduced when the reduction actually meets
+        the target. A caller that needs to know whether the target was met
+        compares ``len(result)``, which is why this returns bytes rather than
+        raising.
+
+        One case is *not* passed through as computed: a re-encode that came out
+        no smaller than its input, when the format was not being changed. That
+        encode bought nothing, so the original bytes are handed back -- a format
+        the encoder happens to be bad at cannot make a compression step grow a
+        request.
+        """
+        return await asyncio.to_thread(
+            self._do_compress, data, max_edge, fmt, quality, max_bytes
+        )
+
+    def _do_compress(
+        self,
+        data: bytes,
+        max_edge: int | None,
+        fmt: str | None,
+        quality: int | None,
+        max_bytes: int | None,
+    ) -> bytes:
+        from PIL import Image
+
+        img = self._open(data)
+        target = self._format_of(img, fmt)
+        if quality is not None:
+            self._check_quality(quality)
+        params = self._encoder_params(target, quality)
+        resized = False
+
+        if max_edge is not None:
+            self._check_edge(max_edge)
+            if max(img.size) > max_edge:
+                img = img.copy()
+                # thumbnail() fits inside the box and keeps the ratio, and the
+                # guard above has already established the source is larger.
+                img.thumbnail((max_edge, max_edge), Image.LANCZOS)
+                resized = True
+
+        out = self._encode(img, target, **params)
+        if max_bytes is not None:
+            self._check_max_bytes(max_bytes)
+            if len(out) > max_bytes:
+                out = self._shrink_to_fit(img, target, params, max_bytes, out)
+
+        if not resized and target == (img.format or "PNG") and len(out) >= len(data):
+            # Same format, same dimensions, nothing gained: the encode cost CPU
+            # and bought nothing, so the original is the better answer. Asking
+            # for the format an image already has must not inflate it -- a
+            # re-encode at quality 85 of a JPEG saved at 30 is much larger than
+            # the file it replaces.
+            return data
+        return out
+
+    def _encoder_params(self, target: str, quality: int | None) -> dict[str, Any]:
+        """Encoder arguments for one target format.
+
+        ``optimize`` is on wherever it is supported. It is a lossless pass whose
+        only cost is CPU, and the caller reached this operator by asking for a
+        smaller file.
+        """
+        params: dict[str, Any] = {"optimize": True}
+        if target in LOSSY_FORMATS:
+            params["quality"] = DEFAULT_QUALITY if quality is None else quality
+        return params
+
+    def _shrink_to_fit(
+        self,
+        img: Any,
+        target: str,
+        params: dict[str, Any],
+        max_bytes: int,
+        current: bytes,
+    ) -> bytes:
+        """Walks the two ladders, stopping at the first result that fits.
+
+        Bounded by construction: at most ``len(QUALITY_LADDER) +
+        len(SCALE_LADDER)`` extra encodes, whatever the input size. A reference
+        that is slow to compress must not be able to eat a phase's budget.
+
+        The two ladders are not equal partners. Quality is the cheap lever and
+        is spent first. Pixels are only spent when they actually buy the target:
+        an image that had *most* of its pixels removed and still missed the
+        ceiling would be the worst of both, so a scale step is kept only if it
+        fits, and otherwise the best dimension-preserving result is what comes
+        back -- an honest "this is as far as it goes".
+        """
+        from PIL import Image
+
+        best = current
+        start = params.get("quality")
+
+        if target in LOSSY_FORMATS:
+            for step in QUALITY_LADDER:
+                if start is not None and step >= start:
+                    # Never spend quality the caller did not offer: a request
+                    # for 60 must not be answered with a 70.
+                    continue
+                candidate = self._encode(img, target, **{**params, "quality": step})
+                if len(candidate) < len(best):
+                    best = candidate
+                if len(best) <= max_bytes:
+                    return best
+
+        # Everything from here changes the dimensions, so the current best is
+        # the fallback rather than a step in the ladder.
+        fallback = best
+        floor = {**params}
+        if target in LOSSY_FORMATS:
+            floor["quality"] = min(start, QUALITY_FLOOR) if start else QUALITY_FLOOR
+
+        # Pixels are the only lever PNG and GIF have, so this ladder is what
+        # makes a byte target reachable for them at all -- which is the case
+        # that matters in practice, because the reference an operator wants
+        # shrunk is usually a screenshot-sized PNG.
+        for scale in SCALE_LADDER:
+            smaller = img.copy()
+            smaller.thumbnail(
+                (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                Image.LANCZOS,
+            )
+            candidate = self._encode(smaller, target, **floor)
+            if len(candidate) <= max_bytes:
+                return candidate
+        return fallback
 
     async def to_data_url(self, data: bytes) -> str:
         """Encodes as a data: URL, the form most upstreams accept inline."""
