@@ -36,7 +36,7 @@ from adapter.api.images import images_handler
 from adapter.api.responses import responses_handler
 from adapter.context import build_cache
 from adapter.error_handlers import install_error_handlers
-from adapter.logfire_setup import init_logfire, resolve_service_version
+from adapter.logfire_setup import flush_spans, init_logfire, resolve_service_version
 from adapter.middleware.body_limit import BodyLimitMiddleware
 from adapter.middleware.cors import build_cors_middleware
 from adapter.middleware.logging import LoggingMiddleware
@@ -188,6 +188,10 @@ async def lifespan(app: FastAPI):
     if close is not None:
         await close()
     await app.state.state_store.close()
+    # Last, so the spans the closes above produced are in the queue being
+    # drained. Without this the batch exporter's daemon thread is torn down with
+    # whatever it still holds -- see adapter/logfire_setup.flush_spans.
+    flush_spans()
 
 
 # Outermost first. The body limit sits innermost on purpose: it must not

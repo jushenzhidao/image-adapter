@@ -304,11 +304,12 @@ class Settings(BaseSettings):
     # Paths excluded from tracing. Every orchestrator probes /health on a
     # timer, so tracing it buries the requests that matter.
     logfire_excluded_urls: str = "/health"
-    # Request headers are never captured by default, and turning this on is a
-    # credential leak: the channel contract puts X-Adapter-Key (data-plane
-    # credential), Authorization (vendor credential) and X-Script (executable
-    # source) in headers. Enabling it requires scrubbing rules in
-    # adapter/logfire_setup.py first.
+    # Request headers are never captured, and turning this on is refused rather
+    # than honoured: the channel contract puts X-Adapter-Key (data-plane
+    # credential), Authorization (vendor credential), X-Auth-Emit (which names
+    # the credential header per channel, e.g. x-goog-api-key) and X-Script
+    # (executable source) in headers, so no fixed redaction list can cover them.
+    # init_logfire raises rather than exporting them.
     logfire_capture_headers: bool = False
 
     # --- TTLs (seconds) ----------------------------------------------------

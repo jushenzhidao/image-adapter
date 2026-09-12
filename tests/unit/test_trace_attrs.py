@@ -16,6 +16,8 @@ anything at all.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from adapter.trace_attrs import (
@@ -336,3 +338,44 @@ def test_no_shape_of_reply_raises(payload):
     """Runs while the span is open, after the response phase: raising here
     would turn a produced image into a 500."""
     assert isinstance(summarise_result(payload), dict)
+
+
+#: The ceiling on one exported span, in bytes.
+#:
+#: Not a round number picked for looks. A maximal canonical request carries
+#: PROMPT_LIMIT of prompt plus a capped link list on each side
+#: (URL_COUNT_LIMIT x URL_LIMIT for the references and again for the results), so
+#: the real worst case lands near 35 KB; 64 KB leaves room for a field or two
+#: while still failing the moment anything image-sized or body-sized reaches an
+#: attribute.
+SPAN_ATTRIBUTE_BUDGET_BYTES = 64 * 1024
+
+
+def test_a_span_cannot_carry_a_file():
+    """The size ceiling, so "no large payloads" is a property, not a hope.
+
+    Both halves are needed, and they guard different things. The first pins the
+    ceiling over the values that are legitimately large: a maximal prompt and
+    two capped link lists. The second is the one that protects the deployment --
+    an inline image produces *nothing* carrying it, not a truncated copy and not
+    a hash of it, because the rule is counting rather than capping.
+    """
+    url = "https://cdn.test/" + "a" * (URL_LIMIT + 500)
+    attrs = summarise_request(
+        {
+            "prompt": "p" * (PROMPT_LIMIT + 500),
+            "model": "m" * (MODEL_LIMIT + 500),
+            "image": [url] * (URL_COUNT_LIMIT + 4),
+            "mask": url,
+        }
+    )
+    attrs.update(summarise_result({"data": [{"url": url}] * (URL_COUNT_LIMIT + 4)}))
+    assert len(json.dumps(attrs)) <= SPAN_ATTRIBUTE_BUDGET_BYTES
+
+    # Two orders of magnitude past the budget, in both directions: a reference
+    # the caller inlined, and a result the channel answered in base64.
+    payload = "A" * 2_000_000
+    inline = summarise_request({"prompt": "x", "image": payload, "mask": payload})
+    inline.update(summarise_result({"data": [{"b64_json": payload}]}))
+    assert len(json.dumps(inline)) < 300
+    assert "AAAA" not in json.dumps(inline)

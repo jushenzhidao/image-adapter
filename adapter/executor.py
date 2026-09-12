@@ -39,6 +39,7 @@ from adapter.errors import (
 from adapter.script_cache import CompiledScript
 from adapter.settings import Settings
 from adapter.trace_attrs import (
+    URL_LIMIT,
     phase_summary,
     record_result,
     span_elapsed_ms,
@@ -151,8 +152,12 @@ async def _do_upstream(
         timeout = budget.cap(timeout)
     kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
 
+    # The one attribute here the caller picks: `url` comes from the channel's
+    # `X-Upstream-Url`, so it is capped like the reference links are, rather than
+    # letting the caller decide how large this span gets (docs/03 §5.2 publishes
+    # the attribute, not its length).
     with logfire.span(
-        "upstream_call", method=method, url=url, timeout=timeout
+        "upstream_call", method=method, url=url[:URL_LIMIT], timeout=timeout
     ) as span, span_elapsed_ms(span):
         try:
             async with ctx.http.request(method, url, **kwargs) as resp:
