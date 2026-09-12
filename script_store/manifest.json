@@ -3,7 +3,7 @@
     "openai/images": {
       "latest": "v2",
       "aliases": {
-        "stable": "v1"
+        "stable": "v2"
       },
       "digests": {
         "v1": "d392b782ee003ac6f0aa7c1f4b62b4e7510fbe5ab0e662c3a2912cf46f22f872",
@@ -11,19 +11,25 @@
       }
     },
     "volcengine_ark/images": {
-      "latest": "v2",
+      "latest": "v8",
       "aliases": {
-        "stable": "v2"
+        "stable": "v8"
       },
       "digests": {
         "v1": "aea29194912d20de8b0e5178918139773eae734f745a84f52d025609e57d206d",
-        "v2": "170051d7b5d59937b850b96ce0a03e45783e403e23ff48971c39c31fcfc254d4"
+        "v2": "170051d7b5d59937b850b96ce0a03e45783e403e23ff48971c39c31fcfc254d4",
+        "v3": "bfd42f254d243497a13100233bfc0423a5f91f6116cf582d109e2468648eb4e4",
+        "v4": "c18acd91f034670a8ca1b0d82a7671578153c0c65998e1934cf2c58d613e36ee",
+        "v5": "bb37593233ede3f65604d27fd55ea446fb6b05e58deed331166c92a237b99f75",
+        "v6": "2cdd3fe09afad338f64b92812bb354aefc5aa02314188e6349d9be1acb7233c9",
+        "v7": "ac2e7281c20ba8273a58af688d96d3d35064945adf8ddf30da24c6fb57e50bdf",
+        "v8": "a3268580b1c03490d041328e55bd2d7e81ac3ead41da10da58f13444a48bf8ac"
       }
     },
     "google/images": {
       "latest": "v2",
       "aliases": {
-        "stable": "v1"
+        "stable": "v2"
       },
       "digests": {
         "v1": "6937809539e5351cedfe32407e81cff305358adf774b23b752dc0914768d3210",
