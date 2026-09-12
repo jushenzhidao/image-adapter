@@ -376,3 +376,41 @@ def test_the_references_are_materialised_concurrently(
         "did not reach the network"
     )
     assert len(_Ark.received["image"]) == 3
+
+
+# The deployment-relevant half of dropping the version split. The files are gone,
+# so a channel header left on an old version is the normal state right after the
+# change -- and it must still produce a picture, from the one version that exists.
+
+RETIRED_REF = "volcengine_ark/images@v3"
+
+
+def test_a_retired_version_still_serves_the_script_that_exists(client, ark):
+    """`@v3` no longer exists as a file; the request succeeds anyway.
+
+    `ChainStore` degrades a concrete version that no root carries to `@stable`,
+    and every entry in this store defines it -- so the channel gets v1 instead of
+    a `script_not_found`. Asserted through a real request, with the digest
+    compared against the pinned ref's: that header is the only thing telling a
+    caller it did not get the revision it asked for.
+    """
+    resp = _post(client, ark, REAL_DATA_URI, script_ref=RETIRED_REF)
+
+    assert resp.status_code == 200, resp.text
+    pinned = _post(client, ark, REAL_DATA_URI, script_ref=SCRIPT_REF)
+    assert pinned.status_code == 200, pinned.text
+    assert resp.headers["X-Script-Sha256"] == pinned.headers["X-Script-Sha256"]
+
+
+def test_a_ref_without_a_version_is_not_served(client, ark):
+    """The one deliberate non-case: "no version" is a malformed header, not a
+    retired one, so the degradation refuses to invent a target for it.
+
+    Pinned because it is the only way this ref can fail, and because a reader who
+    learns "old refs still work" is entitled to know where that stops.
+    """
+    resp = _post(client, ark, REAL_DATA_URI, script_ref="volcengine_ark/images")
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "script_not_found"
+    assert _Ark.received == {}
