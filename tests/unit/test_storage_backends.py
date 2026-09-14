@@ -15,6 +15,7 @@ from datetime import timedelta
 import logfire
 import pytest
 from logfire.testing import SimpleSpanProcessor, TestExporter
+from minio.error import S3Error
 from pydantic import ValidationError
 
 from adapter.channel import ChannelSpec
@@ -31,6 +32,7 @@ from adapter.storage import (
     storage_configured,
 )
 from adapter.storage import factory as storage_factory
+from adapter.storage.minio_store import _PROBE_START_AFTER
 
 PNG = b"\x89PNG\r\n\x1a\n"
 
@@ -53,6 +55,25 @@ def test_an_unknown_backend_fails_at_startup_instead_of_falling_back():
         ("minio", {"minio_endpoint": "s3.example"}, None),
         ("minio_public", {"minio_endpoint": ""}, "MINIO_ENDPOINT"),
         ("minio_public", {"minio_endpoint": "s3.example"}, None),
+        # The only backend with two required keys, so the only one where "which key is
+        # missing" has more than one answer. Pinned here and not only in
+        # test_minio_colocated, because emptying the internal address looks like a
+        # reasonable way to say "domain only" -- and it turns storage off instead.
+        (
+            "minio_colocated",
+            {"minio_endpoint": "", "minio_internal_endpoint": ""},
+            "MINIO_ENDPOINT",
+        ),
+        (
+            "minio_colocated",
+            {"minio_endpoint": "s3.example", "minio_internal_endpoint": ""},
+            "MINIO_INTERNAL_ENDPOINT",
+        ),
+        (
+            "minio_colocated",
+            {"minio_endpoint": "s3.example", "minio_internal_endpoint": "minio:9000"},
+            None,
+        ),
         ("fal", {"fal_key": ""}, "FAL_KEY"),
         ("fal", {"fal_key": "k"}, None),
     ],
@@ -113,12 +134,22 @@ def test_the_shared_session_reaches_the_backend_that_needs_it(monkeypatch):
 
 
 class _FakeMinio:
-    """The slice of minio-py this backend uses. Records what it was asked."""
+    """The slice of minio-py this backend uses. Records what it was asked.
+
+    There is deliberately **no** ``bucket_exists``. The probe used to be that
+    one call, and it is the thing this file must not grow back: a gateway in
+    front of MinIO can refuse signed ``HEAD`` while accepting every other
+    signed verb from the same credential (measured 2026-09-15 on
+    ``oss.s3ai.cn``), which made a store that uploaded fine report itself
+    unusable and hand every upload to the fallback. Reaching for ``HEAD`` here
+    fails loudly instead of passing.
+    """
 
     def __init__(self, bucket_exists: bool = True, policy: str | None = None) -> None:
         self.objects: list[dict] = []
         self.presigns: list[tuple] = []
         self.policy_reads: list[str] = []
+        self.probes: list[tuple] = []
         self._bucket_exists = bucket_exists
         self._policy = policy
 
@@ -137,8 +168,20 @@ class _FakeMinio:
         self.presigns.append((bucket, key, expires))
         return f"https://s3.test/{bucket}/{key}?X-Amz-Signature=abc"
 
-    def bucket_exists(self, bucket):
-        return self._bucket_exists
+    def list_objects(self, bucket, start_after=None):
+        """The probe. One request, and nothing to yield -- see ``MinioStore.ping``."""
+        self.probes.append((bucket, start_after))
+        if not self._bucket_exists:
+            raise S3Error(  # type: ignore[arg-type] - minio-py wants a response object
+                None,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+                f"/{bucket}",
+                "request-id",
+                "host-id",
+                bucket,
+            )
+        return iter([])
 
     def get_bucket_policy(self, bucket):
         self.policy_reads.append(bucket)
@@ -200,6 +243,24 @@ async def test_minio_ping_is_degraded_when_the_bucket_is_gone():
     round-trip alone would call a broken deployment healthy."""
     assert await _minio_store(_FakeMinio(bucket_exists=False)).ping() is False
     assert await _minio_store(_FakeMinio(bucket_exists=True)).ping() is True
+
+
+async def test_minio_ping_probes_with_a_listing_and_not_with_head():
+    """``HEAD /<bucket>`` is the one verb this must not depend on.
+
+    ``MinioStore.ping`` spells out why; the short version is that a gateway can
+    refuse it while the store is perfectly usable, and a probe that says
+    "unusable" parks the backend and silently moves every upload to the
+    fallback. ``_FakeMinio`` has no ``bucket_exists``, so a return to ``HEAD``
+    raises here rather than passing.
+    """
+    client = _FakeMinio()
+
+    assert await _minio_store(client).ping() is True
+    assert not hasattr(client, "bucket_exists")
+    # One request, on the configured bucket, and bounded: dropping
+    # start-after would turn every probe into a 1000-key page.
+    assert client.probes == [("adapter-temp", _PROBE_START_AFTER)]
 
 
 # --- fal backend -----------------------------------------------------------

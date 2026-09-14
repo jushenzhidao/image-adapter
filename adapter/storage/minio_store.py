@@ -19,7 +19,18 @@ import io
 import time
 from datetime import timedelta
 
+from minio.error import S3Error
+
 from adapter.storage.base import StoredObject
+
+#: Sorts after every real key, so ``start-after`` turns a listing into an empty
+#: page. ``ping`` says why the probe is a listing at all, and why it has to be
+#: bounded: minio-py's public ``list_objects`` takes no ``max-keys`` (only the
+#: private ``_list_objects`` does), so an unbounded probe would ask for a
+#: 1000-key page on every health check -- a couple hundred kilobytes, from a
+#: load balancer that asks every few seconds. An empty page answers the same
+#: question for a few hundred bytes.
+_PROBE_START_AFTER = "\uffff"
 
 
 class MinioStore:
@@ -92,13 +103,53 @@ class MinioStore:
         )
 
     async def ping(self) -> bool:
-        """A bucket lookup: the cheapest S3 call that proves credentials work.
+        """One listing: the cheapest signed call that still proves the bucket.
 
-        The bucket existing is part of the answer, not a detail -- every
-        upload would fail without it, so reporting the round-trip alone would
-        call a broken deployment healthy.
+        Why not ``bucket_exists``. That one is a signed ``HEAD /<bucket>``, and
+        a gateway in front of MinIO can answer *that one verb* with
+        AccessDenied while accepting every other signed request from the same
+        credential. Measured on 2026-09-15 against ``oss.s3ai.cn``: signed
+        ``HEAD`` on the bucket and on an object both returned AccessDenied,
+        6/6, while signed ``GET`` (bucket and object), ``PUT`` and listing all
+        succeeded -- so it is neither a missing ``s3:ListBucket`` (the listing
+        proves that is granted) nor a broken signature (a presigned fetch
+        proves that works). It is the endpoint.
+
+        A ping that calls a healthy store unusable is worse than no ping: the
+        health probe parks the backend, and every upload in the cooldown window
+        is then served by the fallback instead -- a deployment that configured
+        its own bucket silently uploads somewhere else, while /health still
+        reads ok because the fallback is what answered it.
+
+        The replacement asks for the same permission (``s3:ListBucket``, which
+        ``HeadBucket`` needs too) and costs the same one round trip.
+
+        The bucket existing is part of the answer, not a detail -- every upload
+        would fail without it, so reporting the round-trip alone would call a
+        broken deployment healthy. A missing bucket is reported as False rather
+        than raised, exactly as ``bucket_exists`` did, so a caller can tell
+        "not there" apart from "not usable".
         """
-        exists = await asyncio.to_thread(
-            self._client.bucket_exists, self._settings.minio_bucket
+        try:
+            await asyncio.to_thread(self._probe)
+        except S3Error as exc:
+            if exc.code != "NoSuchBucket":
+                raise
+            return False
+        return True
+
+    def _probe(self) -> None:
+        """Issues the listing and stops after the first page. See ``ping``.
+
+        ``next(..., None)`` rather than consuming the iterator: the public
+        helper pages on demand, so draining it would walk the whole bucket,
+        while one ``next`` is exactly one request. The response is preloaded
+        either way (minio-py reads it whole), so abandoning the generator
+        leaves nothing to clean up and the connection stays reusable.
+        """
+        next(
+            self._client.list_objects(
+                self._settings.minio_bucket, start_after=_PROBE_START_AFTER
+            ),
+            None,
         )
-        return bool(exists)

@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import logfire
 import pytest
 from logfire.testing import SimpleSpanProcessor, TestExporter
+from minio.error import S3Error
 
 from adapter.settings import Settings
 from adapter.storage.factory import build_storage, missing_storage_config, storage_configured
@@ -59,11 +60,24 @@ class _FakeMinio:
         )
         return SimpleNamespace(etag="etag", size=length)
 
-    def bucket_exists(self, bucket):
+    def list_objects(self, bucket, start_after=None):
+        """The probe: see ``MinioStore.ping`` for why it is a listing and not HEAD."""
         self.pings += 1
-        if self._ping_raises:
+        if self._ping_raises or self._dead:
+            # Unreachable is a connection failure, not a missing bucket: it must
+            # raise so the probe reports it with something to quote.
             raise ConnectionError("simulated unreachable address")
-        return self._bucket and not self._dead
+        if not self._bucket:
+            raise S3Error(  # type: ignore[arg-type] - minio-py wants a response object
+                None,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+                f"/{bucket}",
+                "request-id",
+                "host-id",
+                bucket,
+            )
+        return iter([])
 
     def get_bucket_policy(self, bucket):
         return ANON_POLICY

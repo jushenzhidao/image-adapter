@@ -124,7 +124,7 @@ class MinioPublicStore(MinioStore):
         return StoredObject(url=url, key=key, visibility="public", expires_at=None)
 
     async def ping(self) -> bool:
-        """``bucket_exists``, plus proof that anonymous reads are allowed.
+        """The base probe, plus proof that anonymous reads are allowed.
 
         A public-URL backend over a private bucket is the worst failure this
         layer can have: uploads succeed, every link 403s at the caller, and
@@ -132,6 +132,14 @@ class MinioPublicStore(MinioStore):
         without writing an object, which a health check must never do, so the
         policy is read instead -- it is the thing that makes the URL work, and
         reading it is one authenticated call.
+
+        Note the shape: the first step *raises* when it cannot answer, and a
+        raise skips the policy check rather than reporting it. That is intended
+        -- a store whose bucket cannot be reached is not a store whose policy
+        matters -- but it does mean a first step that fails for the wrong
+        reason (see ``MinioStore.ping``) hides this one entirely, with the
+        check looking absent rather than unreachable. Probe each step on its
+        own when a deployment reports degraded.
 
         Skipped when ``MINIO_PUBLIC_BASE_URL`` is set: URLs then do not address
         the bucket at all, so its policy says nothing about whether they
