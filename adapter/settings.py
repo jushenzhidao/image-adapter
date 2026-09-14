@@ -234,10 +234,12 @@ class Settings(BaseSettings):
     # turn "STORAGE_BACKND=fal" into a silent fallback to minio.
     #
     # minio_colocated is the two-address shape of one bucket: uploads prefer
-    # MINIO_ENDPOINT (the internal address) and fall back to
-    # MINIO_FALLBACK_ENDPOINT (the domain), while the URL handed back is always
-    # the domain -- see storage/minio_colocated_store.py for why the two halves
-    # are not interchangeable.
+    # MINIO_INTERNAL_ENDPOINT (the in-cluster address, plaintext unless its value
+    # carries https://) and fall back to MINIO_ENDPOINT (the domain), while the URL
+    # handed back is always the domain -- see storage/minio_colocated_store.py for why
+    # the two halves are not interchangeable. Note that *both* keys are required:
+    # factory._REQUIRED_KEY names each of them, and emptying the internal one turns
+    # object storage off rather than falling back to the domain.
     storage_backend: Literal["minio", "minio_public", "minio_colocated", "fal"] = "minio"
 
     # Optional second backend, tried when the first cannot take an upload.
