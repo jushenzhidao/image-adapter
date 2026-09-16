@@ -27,7 +27,8 @@ VOLCENGINE_ARK_API_KEY=ark-your-api-key-here
 
 | 键 | 作用 |
 |---|---|
-| `model` | 接入点 ID（渠道身份；body 里的 `model` 不读） |
+| `model` | 接入点 ID（渠道身份；body 里的 `model` 不读，除非被 `model_map` 命中改写） |
+| `model_map` | 客户端模型名 → 接入点 ID 的映射，`{"*": "<接入点 ID>"}` 可兜底。命中时**覆盖** `model`；未命中不改。优先级：`model_map` 命中 > `model` > 内置默认（见 README §模型映射） |
 | `image_ref_mode` | `url`（默认）/ `data_uri`（别名 `inline`）/ `base64`，见 §4.1 |
 | `ref_max_edge` / `ref_max_bytes` / `ref_fmt` / `ref_quality` | 参考图压缩策略，见 §4.2 |
 | `watermark` | 透传开关，**默认 `false`**（优先级：请求体 > 渠道选项 > 默认） |

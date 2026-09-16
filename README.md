@@ -56,7 +56,7 @@ New API 在渠道配置里声明适配策略，通过头透传：
 | `X-Auth-Emit` | 否 | 凭证位置非标准时，如 `header:X-API-Key:Bearer` |
 | `X-Async` | 否 | 异步 Job 型上游，如 `poll=2,timeout=300` |
 | `X-Script-Sha256` | 否 | 完整性锁定 |
-| `X-Channel-Options` | 否 | JSON 对象，脚本内通过 `ctx.options` 读取 |
+| `X-Channel-Options` | 否 | JSON 对象，脚本内通过 `ctx.options` 读取；`model_map` 由 adapter 自己解析（见下） |
 
 这 11 个头在代码里由 `adapter/main.py::channel_contract` 用 `Header()` 声明：因此 `/docs`
 可以直接填写试调，契约表不会再与实现漂移。全部声明为**可选**是有意为之——缺失的头仍由
@@ -74,6 +74,42 @@ New API 在渠道配置里声明适配策略，通过头透传：
 ```
 
 请求链路：取 `X-Upstream-Url` + 脚本 + `Authorization` → `transform(phase='request')` 转请求体 → 带凭证调上游 → `transform(phase='response')` 转响应体 → 返回客户端。
+
+### 模型映射（`X-Channel-Options.model_map`）
+
+客户端用什么模型名是它的自由，上游认什么是上游的事。`model_map` 把两者对上，**按渠道生效、
+改数据不发版**：
+
+```
+X-Channel-Options: {"model_map": {"gpt-image-2": "doubao-seedream-5-0-260128"}}
+X-Channel-Options: {"model_map": {"*": "doubao-seedream-5-0-260128"}}
+```
+
+| 规则 | 行为 |
+|---|---|
+| 未声明 `model_map` | **透传**：canonical body 的 `model` 原样发给上游，与不带此功能时逐字节相同 |
+| 精确命中 | 该键的值成为上游模型名 |
+| `"*"` 兜底（**至多一条**） | 任何未被精确命中的请求都用它，**包括没带 `model` 的请求** |
+| 都没命中 | 不改：客户端发什么就是什么（表是翻译，不是白名单） |
+
+命中时 canonical body 的 `model` 被就地改写，脚本拿到的就是上游名——`openai/images@v1`
+（整包转发）与 `google/images@v1`（body 优先）因此**零改动**生效；`volcengine_ark/images@v1`
+的 model 是接入点 ID、不读 body，它读 `ctx.mapped_model`（未命中＝`None`）再回退到自己的
+`model` 选项。优先级：**`model_map` 命中 > 渠道 `model` 选项 > 脚本内置默认**。
+
+解析规则见 `adapter/modelmap.py`，要点五条：
+
+- 表不可用（非对象，键或值为空/非字符串）→ 400 `channel_config_error`，`param` 指向
+  `X-Channel-Options`，且**在任何上游调用之前**失败。
+- **至多一条 `*`**：表永远是「精确条目 + 一条兜底」，不是模式语言。重复的键一律 400，
+  覆盖两种形态：线上写了两次 `"*"`（JSON 解析器默认「后者胜」，会**静默丢掉一个**），
+  以及只差空白的 `" * "` 与 `"*"`（去掉空白后是同一个键）。
+- 只支持裸 `"*"` 作兜底：`"gemini-*"` 这类看着像模式、实际永远匹配不上的键会被**拒绝**，
+  而不是静默不生效（配置里最坏的形态是一个「设了等于没设」的开关）。
+- 匹配区分大小写（模型 id 是）。
+- 客户端可见的回显不受影响：chat / responses 用折叠前的原始 body 标注回复，所以**上游模型名
+  不会泄回客户端**。观测上 `adapt` span 的 `model` 仍＝客户端请求的模型，命中时**额外**记
+  `model_upstream`，一次 trace 即可回答「要的是 X、实际跑的是 Y」。
 
 ## 脚本契约
 
@@ -103,6 +139,7 @@ async def transform(ctx, payload, phase):
 | 成员 | 说明 |
 |---|---|
 | `ctx.options` | `X-Channel-Options` 解析后的 dict |
+| `ctx.mapped_model` | 本次请求经渠道 `model_map` 解析出的上游模型名；**未命中为 `None`**（持有模型的脚本据此回退到自己的选项，见 `volcengine_ark/images@v1`） |
 | `ctx.upstream_url` | 当前渠道 URL |
 | `ctx.request_id` | 贯穿日志的请求 ID |
 | `await ctx.download_image(url)` | 下载图片，Redis 缓存 |

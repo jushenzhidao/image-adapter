@@ -323,7 +323,7 @@ async def execute(
         upstream_url=channel.upstream_url,
         is_async=channel.async_spec.enabled,
         stage=stage,
-        **summarise_request(client_payload),
+        **summarise_request(client_payload, model_upstream=ctx.mapped_model),
     ) as span, phase_summary(span, ctx):
         if _phase_supported(script, PHASE_AUTH):
             emitted = await _call_phase(

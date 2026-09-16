@@ -105,6 +105,11 @@
 
 其它要点：
 
+- 模型名既是 URL 路径段、又要在能力表里查得到，所以渠道可以用 `model_map` 把客户端的
+  OpenAI 风格模型名翻成 Gemini 的 id：`{"*": "gemini-3.1-flash-image"}`。映射**先于**
+  能力表解析，两者叠加——`{"*": "nano-banana-2"}` 也会落到 `gemini-3.1-flash-image`
+  （别名在能力表里，见 §5）。表不可用时在发任何上游请求之前报 `channel_config_error`。
+
 - `responseModalities`：纯出图 `["IMAGE"]`；需要图文混排（infographic、故事配图）或开
   `tools:[{"google_search":{}}]` 时必须含 `"TEXT"`，否则 400。
 - JSON 里字段名可用 snake_case（`inline_data`）或 camelCase（`inlineData`），官方 REST 示例用 snake_case。
@@ -227,7 +232,8 @@ https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:gener
                                                     ^^^^^^^^^^^^^^^^^^ 客户端选的模型
 ```
 
-脚本必须把客户端 `model`（或 `X-Channel-Options.model`）写回路径最后一段：
+脚本必须把生效的模型名（客户端 `model`，被渠道 `model_map` 命中则用它改写后的值，
+否则回退 `X-Channel-Options.model`）写回路径最后一段：
 
 ```python
 def _model_url(url, model):

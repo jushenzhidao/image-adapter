@@ -147,7 +147,9 @@ def _split_refs(value: object) -> tuple[list[str], int, int]:
     return urls[:URL_COUNT_LIMIT], inline, dropped
 
 
-def summarise_request(payload: object, *, genai: bool = True) -> dict[str, Any]:
+def summarise_request(
+    payload: object, *, genai: bool = True, model_upstream: str | None = None
+) -> dict[str, Any]:
     """The tracing attributes for one canonical client body.
 
     ``payload`` is the body the pipeline hands to the executor: already folded
@@ -155,6 +157,14 @@ def summarise_request(payload: object, *, genai: bool = True) -> dict[str, Any]:
     validated. Wrong-shaped input is still tolerated -- see the module
     docstring -- so an unrecognised payload yields no attributes rather than an
     exception.
+
+    ``model_upstream`` is the channel's own model mapping applied
+    (``adapter/modelmap.py``): the name this request will actually be sent
+    as, when a table turned the client's name into something else. It is a
+    separate attribute on purpose -- ``model`` keeps meaning "what the
+    client asked for", so one trace reads as "asked for X, ran Y", and a
+    channel with no table simply has no such attribute rather than an
+    attribute equal to ``model``.
 
     ``genai=False`` withholds the GenAI identity fields. It exists for a span
     describing a request that was refused *before* any upstream call, where
@@ -195,6 +205,12 @@ def summarise_request(payload: object, *, genai: bool = True) -> dict[str, Any]:
         # client's routing label in that column, not its access point.
         if genai:
             attrs["gen_ai.request.model"] = model[:MODEL_LIMIT]
+
+    if isinstance(model_upstream, str) and model_upstream:
+        # The only place the mapping is visible: the body the script receives
+        # already carries the upstream name, so the client's original would
+        # otherwise be lost the moment a table matched.
+        attrs["model_upstream"] = model_upstream[:MODEL_LIMIT]
 
     for field in ("image", "mask"):
         value = payload.get(field)

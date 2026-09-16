@@ -207,7 +207,7 @@ async def execute_staged(
         script_sha256=script.sha256[:12],
         stages=list(stages),
         budget_s=budget.total,
-        **summarise_request(client_payload),
+        **summarise_request(client_payload, model_upstream=ctx.mapped_model),
     ) as cascade_span, phase_summary(cascade_span, ctx):
         # The auth phase is cascade-wide, not per stage: one credential serves
         # every call, and the headers it emits survive each stage's plan reset

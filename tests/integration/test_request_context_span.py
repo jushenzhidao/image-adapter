@@ -315,3 +315,70 @@ async def test_a_refused_request_has_no_result_attributes(vendor, settings, span
     attributes = _attributes(spans)
     assert "result_urls" not in attributes
     assert "result_inline_refs" not in attributes
+
+
+# --- the channel's model mapping ------------------------------------------
+
+
+async def _run_mapped(
+    settings: Settings, url: str, payload: dict, mapped: str | None
+) -> str:
+    """One request whose channel carried a `model_map` that (maybe) matched.
+
+    ``mapped`` is what ``adapter.api.pipeline.adapt`` resolved -- None when the
+    table did not apply -- so this drives the same two attributes production
+    sets, rather than re-deriving them and testing the derivation twice.
+    """
+    channel = ChannelSpec(upstream_url=url)
+    ctx = AdapterContext(
+        request_id="ctx-test",
+        channel=channel,
+        settings=settings,
+        requested_model=payload.get("model"),
+        mapped_model=mapped,
+    )
+    try:
+        await execute(ctx, SCRIPT, channel, settings, payload)
+        return "ok"
+    except AdapterError as exc:
+        return f"err:{exc.code}"
+    finally:
+        await ctx.close()
+
+
+async def test_a_mapped_request_reports_both_names(vendor, settings, spans):
+    """`model` keeps meaning "what the client asked for".
+
+    The mapping is the only thing that makes the two differ, and the trace is
+    the only place the original survives it: the body the script receives
+    already carries the upstream name. Reporting the pair is what turns
+    "the wrong model ran" into a one-line answer.
+    """
+    payload = {"prompt": PROMPT, "model": "gpt-image-2"}
+
+    assert await _run_mapped(
+        settings, vendor("url"), payload, "doubao-seedream-5-0-260128"
+    ) == "ok"
+
+    attributes = _attributes(spans)
+    assert attributes["model"] == "gpt-image-2"
+    assert attributes["model_upstream"] == "doubao-seedream-5-0-260128"
+    # The GenAI identity field stays the client's, so a dashboard that groups by
+    # requested model does not silently split when a channel adopts a table.
+    assert attributes["gen_ai.request.model"] == "gpt-image-2"
+
+
+async def test_an_unmapped_request_has_no_upstream_model(vendor, settings, spans):
+    """The reverse, so the attribute is not a constant that always appears.
+
+    A channel without a table must not look like a channel whose table mapped
+    the model onto itself.
+    """
+    payload = {"prompt": PROMPT, "model": "gpt-image-2"}
+
+    assert await _run_mapped(settings, vendor("url"), payload, None) == "ok"
+
+    attributes = _attributes(spans)
+    assert attributes["model"] == "gpt-image-2"
+    assert "model_upstream" not in attributes
+

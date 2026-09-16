@@ -140,6 +140,8 @@ class ContextCore:
         http: aiohttp.ClientSession | None = None,
         cache: Any = None,
         storage: Any = None,
+        requested_model: str | None = None,
+        mapped_model: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.channel = channel
@@ -152,6 +154,17 @@ class ContextCore:
         # script's, but a script may need it for a signature computation.
         self.key = channel.upstream_key
         self.upstream_url = channel.upstream_url
+        # Model mapping (`X-Channel-Options.model_map`), resolved once by the
+        # pipeline (adapter/modelmap.py). `requested_model` is what the client
+        # asked for; `mapped_model` is what the channel's table turned it into,
+        # and None means no table applied -- which is how a script tells
+        # "unmapped, use your own answer" from "mapped to nothing". The
+        # canonical body already carries the mapped name, so a script that
+        # forwards the body needs nothing from here; a script that owns the
+        # model (volcengine_ark, whose model is an access point id) reads
+        # `mapped_model` first and falls back to its own option.
+        self.requested_model: str | None = requested_model
+        self.mapped_model: str | None = mapped_model
         # Set by the engine when it offers the script a second request phase to
         # answer an upstream failure (see `_retry_offered` in adapter.executor).
         # None on a first attempt, so a script that ignores it behaves exactly as

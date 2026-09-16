@@ -21,11 +21,12 @@ declares only how to talk to that endpoint:
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
 from adapter.errors import ChannelConfigError
-from adapter.jsoncodec import loads as json_loads
+from adapter.modelmap import parse as parse_model_map
 from adapter.settings import Settings
 from adapter.stage_spec import StageSpec
 from adapter.urlguard import check_url
@@ -126,6 +127,7 @@ class ChannelSpec:
     auth: AuthEmit = field(default_factory=AuthEmit)
     async_spec: AsyncSpec = field(default_factory=AsyncSpec)
     options: dict = field(default_factory=dict)
+    model_map: dict[str, str] = field(default_factory=dict)
     stages: StageSpec = field(default_factory=lambda: StageSpec())
 
     @property
@@ -158,6 +160,32 @@ def _unescape_inline(raw: str) -> str:
         return _UNESCAPES.get(char, "\\" + char)
 
     return _ESCAPE_RE.sub(replace, raw)
+
+
+def _object_without_repeats(pairs: list[tuple[str, object]]) -> dict:
+    """A JSON object that refuses a repeated key instead of keeping the last.
+
+    Channel options are hand-written JSON, and a repeated key has no single
+    reading: ``{"*": "a", "*": "b"}`` breaks the one-catch-all rule, while
+    ``{"model": "a", "model": "b"}`` is the same mistake one level up. Every
+    JSON parser keeps the last one and says nothing -- orjson, which decodes the
+    request bodies, cannot even be asked not to -- so the check has to happen
+    here, on the one header that is typed by hand. Nested objects (the mapping
+    table included) go through the same hook, so the repeat is caught wherever it
+    is, and the operator is told which key it was.
+
+    Stdlib ``json`` rather than ``adapter.jsoncodec``: ``object_pairs_hook`` is not
+    part of orjson's API, and this header is a few hundred bytes where orjson's
+    speed is irrelevant.
+    """
+    seen: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ChannelConfigError(
+                f"X-Channel-Options repeats the key {key!r}", "X-Channel-Options"
+            )
+        seen[key] = value
+    return seen
 
 
 def _first_present(headers, *names: str) -> tuple[str | None, str | None]:
@@ -209,7 +237,7 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
     options: dict = {}
     if options_raw:
         try:
-            parsed = json_loads(options_raw)
+            parsed = json.loads(options_raw, object_pairs_hook=_object_without_repeats)
         except ValueError:
             # json.JSONDecodeError and orjson.JSONDecodeError both subclass it.
             raise ChannelConfigError(
@@ -220,6 +248,14 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
                 "X-Channel-Options must be a JSON object", "X-Channel-Options"
             )
         options = parsed
+
+    # `model_map` is the one X-Channel-Options key the adapter itself acts on,
+    # so it is validated here instead of being left to a script: a channel
+    # configuration mistake has to fail before the request reaches an upstream,
+    # and every script -- the inline drafts included -- gets the mapping for
+    # free. What a script does with the resolved model is still its own
+    # business; the framework only supplies the answer (adapter/modelmap.py).
+    model_map = parse_model_map(options.get("model_map"))
 
     authorization = (headers.get("authorization") or "").strip()
     upstream_key = authorization
@@ -239,5 +275,6 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
         auth=auth,
         async_spec=async_spec,
         options=options,
+        model_map=model_map,
         stages=StageSpec.parse(headers, settings),
     )

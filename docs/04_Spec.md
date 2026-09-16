@@ -156,6 +156,7 @@ MVP（v1.0）保持锁定不变，以下为 v1.0 验收通过后启动的增量�
 |------|------|---------------|--------|
 | AC-32 | multipart 载体 | When 脚本在 `request` 相位调用 `ctx.emit(files={...})`，系统必须以 `multipart/form-data` 发起上游调用：返回值（与 `form`）作文本字段、`files` 作二进制部件（文件名/字节/类型），boundary 与 Content-Type 由引擎生成，且不得残留会缺失 boundary 的 Content-Type；`files` 的字段值接受单部件或部件列表，非 bytes 必须报错 | P0 |
 | AC-33 | OpenAI 原生两端点 | When 渠道 `X-Upstream-Url` 指向 generations 且请求含 `image`，脚本 `openai/images@v1` 必须改打同服务的 edits 姊妹端点（末段替换、保留 host 与 query，或按 `X-Channel-Options.edits_url`）并以上传文件的 multipart 发送（多图拼 `image[]`、`mask` 独立部件）；无 `image` 时保持 JSON 打 generations；响应与 `usage` 原样透传 | P0 |
+| AC-34 | 模型映射 | When 渠道声明 `X-Channel-Options.model_map`，系统必须按「精确命中 > `"*"` 兜底 > 不改」解析客户端 `model`，命中时改写 canonical body 的 `model`（四个入口一致，且客户端可见回显仍是客户端所请求的名字），并把解析结果以 `ctx.mapped_model` 交给脚本；未声明该键时不得改动请求中任何字段；表为「精确条目 + **至多一条** `"*"` 兜底」，重复键（含去掉空白后重复）必须在解码处拒绝而非静默取末值；表不可用（非对象、键/值为空或非字符串、非裸 `*` 的通配键）必须在任何上游调用之前报 `channel_config_error`(400) | P0 |
 
 ## 10. 边界与约束
 

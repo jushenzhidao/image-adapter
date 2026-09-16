@@ -22,6 +22,7 @@ from adapter.context import AdapterContext
 from adapter.errors import AdapterError, AdmissionError, ScriptSourceError
 from adapter.executor import execute
 from adapter.jsoncodec import JSONResponse
+from adapter.modelmap import resolve as resolve_model
 from adapter.script_source import resolve_source
 from adapter.settings import Settings
 from adapter.stages import execute_staged
@@ -135,6 +136,27 @@ async def adapt(
         stage = "channel"
         channel = parse_channel(request.headers, settings)
 
+        # Model mapping belongs to the channel, not to the caller: the table
+        # arrives in X-Channel-Options and the canonical body is rewritten
+        # once, here, so every script sees the upstream name and none of them
+        # has to know a table exists. Rewritten before `execute` rather than
+        # inside a script for the same reason the front doors fold the body
+        # here: the alternative is one copy of the rule per script, and the
+        # copy that is missing fails silently.
+        #
+        # `payload` is the canonical body and nothing else, which is what keeps
+        # the rewrite away from the door's bookkeeping: chat and responses label
+        # their reply from the body they kept *before* folding, so the client
+        # still reads back the model it asked for.
+        requested_model = payload.get("model")
+        mapped_model = resolve_model(requested_model, channel.model_map)
+        if mapped_model is not None:
+            payload["model"] = mapped_model
+        # Reported without the mapping, and never as a non-string: an unusable
+        # `model` is the body validator's business, and a trace attribute is not
+        # the place to record a type.
+        requested_model = requested_model if isinstance(requested_model, str) else None
+
         async def fetch(url: str) -> str:
             return await _fetch_remote_script(url, settings)
 
@@ -160,6 +182,8 @@ async def adapt(
         http=getattr(request.app.state, "http", None),
         cache=getattr(request.app.state, "asset_cache", None),
         storage=getattr(request.app.state, "storage", None),
+        requested_model=requested_model,
+        mapped_model=mapped_model,
     )
     extra_headers: dict[str, str] = {}
     try:
