@@ -26,6 +26,15 @@
       "digests": {
         "v1": "bcb45d98bcb6ab95a85b4d02921d37b975067db625d650f2f156a7734f5d7fea"
       }
+    },
+    "qwen/images": {
+      "latest": "v1",
+      "aliases": {
+        "stable": "v1"
+      },
+      "digests": {
+        "v1": "1bca6201c63d8ec647fe86639b27f0f2adc5d7ecb8e392522a815b30a39fcc4d"
+      }
     }
   }
 }
