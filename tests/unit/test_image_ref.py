@@ -20,7 +20,7 @@ import pytest
 from PIL import Image
 
 from adapter.context import AdapterContext
-from adapter.errors import InvalidRequestError
+from adapter.errors import InvalidRequestError, UpstreamError
 from adapter.settings import Settings
 
 
@@ -244,3 +244,91 @@ async def test_compress_image_refuses_an_unknown_target_format():
 async def test_compress_image_refuses_a_non_string_reference():
     with pytest.raises(InvalidRequestError):
         await _ctx().compress_image("")
+
+
+# ------------------------------------------- the download verdict is on the bytes
+#
+# The gate used to read `Content-Type` alone, which is wrong in the direction
+# that costs: measured 2026-09-18 (qwen, reproduced by the reference project),
+# a genuine PNG arrives as `application/octet-stream`. The verdict now needs
+# the header *and* the bytes to disagree with "image".
+
+
+class _FakeBody:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def iter_chunked(self, size: int):
+        yield self._data
+
+
+class _FakeDownload:
+    """The slice of an aiohttp response `_fetch_capped` touches."""
+
+    def __init__(self, body: bytes, headers: dict[str, str]):
+        self.status = 200
+        self.headers = headers
+        self.content_length = len(body)
+        self.content = _FakeBody(body)
+
+
+class _FakeSession:
+    def __init__(self, resp):
+        self.resp = resp
+        self.closed = False   # `ContextCore.http` treats a closed session as absent
+
+    def get(self, url):
+        return _FakeCM(self.resp)
+
+
+class _FakeCM:
+    def __init__(self, resp):
+        self.resp = resp
+
+    async def __aenter__(self):
+        return self.resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _ctx_with(resp) -> AdapterContext:
+    return AdapterContext(
+        request_id="req-1",
+        channel=_ChannelStub(),
+        settings=Settings(minio_endpoint=""),
+        http=_FakeSession(resp),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_real_image_labelled_octet_stream_is_not_refused():
+    """真图可能是 `application/octet-stream`（实测）—— 按头判会把好图误杀。"""
+    data = real_png()
+    ctx = _ctx_with(_FakeDownload(data, {"Content-Type": "application/octet-stream"}))
+    assert await ctx.download_image("https://cdn.example/a.png") == data
+
+
+@pytest.mark.asyncio
+async def test_an_html_error_page_is_still_refused():
+    """死链/挑战页没有图片 magic ⇒ 仍要拒（这是这条判据的正当用途）。"""
+    ctx = _ctx_with(_FakeDownload(b"<!doctype html><title>404</title>",
+                                  {"Content-Type": "text/html; charset=utf-8"}))
+    with pytest.raises(UpstreamError) as excinfo:
+        await ctx.download_image("https://cdn.example/a.png")
+    assert excinfo.value.code == "image_content_type"
+
+
+@pytest.mark.asyncio
+async def test_an_image_header_is_still_enough_on_its_own():
+    data = real_png()
+    ctx = _ctx_with(_FakeDownload(data, {"Content-Type": "image/png"}))
+    assert await ctx.download_image("https://cdn.example/a.png") == data
+
+
+@pytest.mark.asyncio
+async def test_a_missing_header_keeps_being_accepted():
+    """空头本来就放行（旧行为），改判据不该把它变成新拒绝。"""
+    data = b"no-magic-but-the-header-said-nothing"
+    ctx = _ctx_with(_FakeDownload(data, {}))
+    assert await ctx.download_image("https://cdn.example/a.png") == data

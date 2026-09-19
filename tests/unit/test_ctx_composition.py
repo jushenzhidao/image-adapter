@@ -22,6 +22,7 @@ SCRIPT_API = (
     "caps",
     "tier_value",
     "size_to_px",
+    "parse_size",
     "fit_tier",
     "fit_ratio",
     "format_ratio",

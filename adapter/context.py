@@ -171,6 +171,15 @@ class ContextCore:
         # it did before the mechanism existed.
         self.upstream_error: dict[str, Any] | None = None
 
+        # Raw upstream body when it was *not* JSON (SSE streams, challenge
+        # pages): parse_body returns None for those and the bytes would be
+        # dropped right before the response phase, where a script that can
+        # parse them needs them. The qwen integration is the first consumer --
+        # its success path is a text/event-stream the script reads itself.
+        # JSON replies keep this None, so the payload path stays authoritative
+        # and every existing script sees no change.
+        self.upstream_raw: bytes | None = None
+
         self.plan = RequestPlan()
 
         # Wall clock per script phase, accumulated by ``executor._call_phase``

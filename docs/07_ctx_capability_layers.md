@@ -125,6 +125,8 @@ ctx.fit_tier(want, tiers, policy="clamp")     -> (tier, adjusted) # clamp 不越
 ctx.fit_ratio(w, h, allowed)                  -> (w, h) | None   # 最近邻；平手取更方形
 ctx.format_ratio(pair)                        -> "16:9" | None
 ctx.is_extreme_ratio(pair, fold=4)            -> bool            # 由数值推导，不维护列表
+ctx.parse_size(raw, ratios=…, tiers=…, resolutions=True)
+                                              -> SizeReading     # 方言识别与归一化（§5.1）
 
 # --- 还没做（P1）-----------------------------------------------------------
 await ctx.image_info(ref)                     -> ImageInfo(w, h, mime, has_alpha)  # 只读 header
@@ -138,7 +140,33 @@ await ctx.compress_image(ref, *, max_bytes=None, max_edge=None,
                          fmt=None, quality=None) -> bytes          # 三形态归一 + 委托上面那个
 ```
 
-**早期草案里的两个"大函数"没有落地，这是有意的**：
+#### 5.1 `ctx.parse_size`：方言识别与归一化（2026-09-18 落地）
+
+三种方言（比例枚举 / 绝对分辨率 / 档位）在**每个**图片上游都指同一件事 —— `"2688*1536"`
+与 `"16:9"` 可以是同一个请求 —— 而这段"认出是哪种、算出等价值"的逻辑此前在 qwen 脚本里
+又重写了一遍。它现在进 ctx：
+
+```python
+r = ctx.parse_size("2688*1536", ratios={"16:9": "2688*1536"}, tiers=("1K", "2K"))
+r.kind    # "ratio" | "resolution" | "tier" | "auto" | "unknown"
+r.ratio   # "16:9"
+r.hw      # "2688*1536"（规范写法）
+r.tier    # "2K"（回的是厂商表里的拼法）
+r.exact   # True = 像素是调用方自己给的，False = 由表推出来的
+r.notes   # ("2688*1536 is the vendor's 16:9",)
+```
+
+三条边界，都是刻意的：
+
+- **它是"读法"，不是"决定"**：不选出线形态、不拼 payload、不做替换策略。所以 google
+  （`aspectRatio` + `imageSize`）、ARK（一个预设串）、qwen（比例枚举）可以各取所需，
+  它不必为每个厂商长一个参数。
+- **事实全在调用方**：`ratios` / `tiers` / `resolutions` 都是厂商事实（`capabilities/*.json`
+  或脚本常量）。没有事实时 `kind="unknown"`，**绝不凭空造值**（与 `fit_tier` 的"不猜"同源）。
+- **对称**：有分辨率的比例给出分辨率；是某比例规范值的分辨率给出那个比例并记一条 note。
+  "哪个上 wire"是调用方的方言。
+
+**早期草案里的两个"大函数"仍然不做，但缺的那一"零件"现在补上了**：
 
 - `ctx.map_size(size, caps)`（把比例 + 档位 + 说明打包返回）：两个真实用例的**输出形态不同** —— 
   Google 要 `ratio + tier` 两块，ARK 直接要一个预设字符串。硬塞进一个返回值，参数会爆炸，两边都不好用。

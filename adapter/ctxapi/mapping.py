@@ -23,7 +23,8 @@ Two rules shape these helpers:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from adapter.ctxapi.base import CtxMixin
@@ -32,7 +33,35 @@ from adapter.ctxapi.base import CtxMixin
 #: pixels, which is how the whole industry spells these presets.
 _TIER_SUFFIXES = (("px", 1), ("k", 1024), ("m", 1024 * 1024))
 
+#: Spellings that mean "the caller is not asking for a size at all".
+_SIZE_UNSET = frozenset({"", "auto", "none"})
+
 _Size = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class SizeReading:
+    """What one `size` string meant, in every dialect at once.
+
+    A *reading*, not a decision. It says which dialect arrived and what the
+    equivalent values are; the wire format, the payload shape and any
+    substitution policy stay with the caller. That is what lets one parser
+    serve google (`aspectRatio` + `imageSize`), ARK (a preset string) and qwen
+    (a ratio enum) without growing a parameter per vendor -- the reason a
+    monolithic `map_size` was never landed (see docs/07 §5).
+
+    `exact` distinguishes the caller's own pixels from a table lookup: on
+    ``"2688*1536"`` the resolution came from the table via ``"16:9"``, while on
+    ``"1024*1024"`` it is the caller's numbers and means exactly those.
+    """
+
+    raw: str
+    kind: str                      # "ratio" | "resolution" | "tier" | "auto" | "unknown"
+    ratio: str | None = None
+    hw: str | None = None          # canonical "W*H"
+    tier: str | None = None        # the spelling from the caller's tier list
+    exact: bool = False
+    notes: tuple[str, ...] = field(default_factory=tuple)
 
 
 def _as_pair(ratio: Any) -> _Size | None:
@@ -89,6 +118,62 @@ class MappingMixin(CtxMixin):
         except (TypeError, ValueError):
             return None
         return (w, h) if w > 0 and h > 0 else None
+
+    @classmethod
+    def parse_size(
+        cls,
+        raw: Any,
+        *,
+        ratios: Mapping[str, str] | None = None,
+        tiers: Iterable[Any] = (),
+        resolutions: bool = True,
+    ) -> SizeReading:
+        """Recognize one `size` spelling and translate it into the other two.
+
+        Three dialects reach every image upstream and all three mean the same
+        request, so this is the one place that knows ``"2688*1536"`` and
+        ``"16:9"`` can be the same thing. What a *vendor* accepts is not here:
+
+        * ``ratios`` -- its enum -> canonical resolution table (``{"16:9": "2688*1536"}``);
+        * ``tiers``  -- its accepted tier spellings (``("1K", "2K")``);
+        * ``resolutions`` -- whether it accepts an absolute ``W*H`` at all.
+
+        Symmetry is deliberate: a ratio with a known resolution yields the
+        resolution, and a resolution that *is* a vendor ratio yields that ratio
+        (with a note saying so). Which of the two goes on the wire is the
+        caller's dialect, and no value is ever fabricated -- an unrecognized
+        string comes back as ``kind="unknown"`` so the caller can decide between
+        falling back and refusing.
+        """
+        text = str(raw if raw is not None else "").strip()
+        lowered = text.lower()
+        if lowered in _SIZE_UNSET:
+            return SizeReading(raw=text, kind="auto")
+
+        # Tiers first: "2K" is not a resolution and must not be read as one.
+        for tier in tiers:
+            spelling = str(tier)
+            if spelling.strip().lower() == lowered:
+                return SizeReading(raw=text, kind="tier", tier=spelling)
+
+        table = {str(k): str(v) for k, v in (ratios or {}).items()}
+        if text in table:
+            return SizeReading(raw=text, kind="ratio", ratio=text, hw=table[text])
+
+        if resolutions:
+            # `size_to_px` reads the OpenAI "WxH" spelling; "*" is the vendor's
+            # own separator for the same thing, normalized before the parse.
+            pair = cls.size_to_px(text.replace("*", "x"))
+            if pair is not None:
+                hw = f"{pair[0]}*{pair[1]}"
+                for ratio, resolution in table.items():
+                    if resolution == hw:
+                        return SizeReading(
+                            raw=text, kind="resolution", ratio=ratio, hw=hw,
+                            notes=(f"{hw} is the vendor's {ratio}",))
+                return SizeReading(raw=text, kind="resolution", hw=hw, exact=True)
+
+        return SizeReading(raw=text, kind="unknown")
 
     def fit_tier(
         self, want: int, tiers: Sequence[Any], *, policy: str = "clamp"

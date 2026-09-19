@@ -210,6 +210,14 @@ async def _do_upstream(
     parsed = parse_body(raw, content_type)
     raise_for_status(status, parsed)
 
+    # Hand non-JSON bodies to the script as well: parse_body returns None for
+    # them (SSE streams, challenge pages), and without this the bytes are
+    # dropped exactly where a script able to parse them needs them. JSON
+    # replies keep upstream_raw None -- the payload path stays authoritative
+    # and no existing script observes any difference.
+    if parsed is None:
+        ctx.upstream_raw = raw
+
     return UpstreamReply(
         status=status,
         json=parsed,

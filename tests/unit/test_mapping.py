@@ -178,3 +178,64 @@ def test_a_model_that_fixes_its_resolution_is_told_apart_from_a_bad_request():
     assert m.fit_tier(1024, TIERS) == ("1K", False)       # exact match
     assert m.fit_tier(2048, TIERS) == ("2K", False)
     assert m.fit_tier(2500, TIERS) == ("2K", True)        # substituted
+
+
+# --- parse_size：方言识别与归一化（出线形态仍归调用方） ---------------------
+
+#: 一个厂商的方言事实（qwen 的形状）：比例枚举 -> 规范分辨率、档位拼法。
+RATIOS = {"1:1": "2048*2048", "16:9": "2688*1536", "9:16": "1536*2688"}
+QTiers = ("1K", "2K", "4K")
+
+
+def test_parse_size_reads_a_ratio_and_hands_back_its_resolution():
+    r = m.parse_size("16:9", ratios=RATIOS, tiers=QTiers)
+    assert (r.kind, r.ratio, r.hw) == ("ratio", "16:9", "2688*1536")
+    assert r.exact is False            # 像素来自表，不是调用方给的
+
+
+def test_parse_size_recognizes_both_resolution_separators():
+    """`2688x1536` 与 `2688*1536` 是同一件事，且**就是**那个比例。"""
+    for raw in ("2688*1536", "2688x1536", "2688X1536"):
+        r = m.parse_size(raw, ratios=RATIOS, tiers=QTiers)
+        assert (r.kind, r.ratio, r.hw, r.exact) == (
+            "resolution", "16:9", "2688*1536", False), raw
+        assert "16:9" in " ".join(r.notes)   # 说明为什么换了个写法
+
+
+def test_parse_size_keeps_pixels_it_cannot_place():
+    """非规范分辨率原样保留并标 exact：这是调用方自己的数字，不许塑形。"""
+    r = m.parse_size("1024*1024", ratios=RATIOS, tiers=QTiers)
+    assert (r.kind, r.ratio, r.hw, r.exact) == ("resolution", None, "1024*1024", True)
+
+
+def test_parse_size_reads_tiers_case_insensitively_and_keeps_the_spelling():
+    r = m.parse_size("2k", ratios=RATIOS, tiers=QTiers)
+    assert (r.kind, r.tier) == ("tier", "2K")     # 回的是厂商表里的拼法
+    # 档位不能同时被读成分辨率或比例
+    assert r.ratio is None and r.hw is None
+
+
+def test_parse_size_never_reads_a_tier_as_a_resolution():
+    """`1K` 里的 K 不是分隔符；只有 `NxM` 才算分辨率。"""
+    r = m.parse_size("1024", ratios=RATIOS, tiers=())
+    assert r.kind == "unknown"
+
+
+def test_parse_size_reports_what_it_cannot_read_instead_of_guessing():
+    assert m.parse_size("not-a-size", ratios=RATIOS, tiers=QTiers).kind == "unknown"
+    assert m.parse_size("", ratios=RATIOS).kind == "auto"
+    assert m.parse_size("  auto  ", ratios=RATIOS).kind == "auto"
+    assert m.parse_size(None, ratios=RATIOS).kind == "auto"
+
+
+def test_parse_size_honours_a_vendor_that_takes_no_absolute_resolution():
+    """`resolutions=False`（如只认 aspectRatio 的厂商）⇒ W*H 就是读不懂。"""
+    assert m.parse_size("1024x1024", ratios=RATIOS, resolutions=False).kind == "unknown"
+    # 但比例枚举照样认得
+    assert m.parse_size("1:1", ratios=RATIOS, resolutions=False).ratio == "1:1"
+
+
+def test_parse_size_without_facts_reads_nothing():
+    """没有厂商事实时不得凭空造值：比例与档位都无从判定。"""
+    assert m.parse_size("16:9").kind == "unknown"
+    assert m.parse_size("2K").kind == "unknown"

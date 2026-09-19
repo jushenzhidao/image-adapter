@@ -240,6 +240,24 @@ LOGFIRE_TOKEN="" .venv/bin/python -m pytest tests/integration -q
 - **usage 透传**：脚本 response 相位转发 ark 的 `usage`（`generated_images` 对图层拆分
   即返回张数，控制面计费依赖此字段）。
 
+### 5. `mask` 在本渠道**不生效**（静默忽略，2026-09-19 实测）
+
+**现象**：客户端在 `/v1/images/generations` / `/v1/images/edits` 上带 `mask` 时，门面会把它规范化成
+`mask: "data:image/png;base64,..."` 并**正常返回 200**，但该字段**不会出现在发给 ARK 的请求体里** ——
+`volcengine_ark/images@v1.py` 对 `mask` 零引用，既不转发也不报错。
+
+**证据（零计费，可复跑）**：把 `X-Upstream-Url` 指向假上游，用它的回读钩子取**上游侧实际收到的 body**，
+实收键为 `['image', 'model', 'prompt', 'response_format', 'size', 'stream', 'watermark']` —— 没有 `mask`。
+脚本：`reports/2026-09-19_ark-forms-concurrent/probe_mask_zero_cost.py`；原始证据：同目录
+`meta/mask_zero_cost.json`、`raw/mask_upstream_body.json`。
+
+**影响**：调用方以为在做 inpaint（局部重绘），实际拿到的是**普通图生图**，且**没有任何信号**指示这次降级 ——
+属于"成功的静默错误"，比报错更难排查。适配器与控制面都不为此报错，出图也照常计费。
+
+**当前处置（2026-09-19 决定）—— 维持现状 + 文档标注**：不转发、不报错、不改脚本。
+⚠️ **调用方注意**：需要 mask 语义时**不要依赖本渠道**。本仓目前只有本渠道有实测结论；
+换其他渠道前，先确认该渠道的脚本是否转发 `mask`（判法同本节：假上游回读上游侧 body）。
+
 ## 参考文档
 - 官方文档: https://console.volcengine.com/ark/region:cn-beijing/docs/82379/1541523
 - 模型名称: `doubao-seedream-5-0-260128`

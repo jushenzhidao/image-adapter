@@ -127,12 +127,6 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
                         )
                     content_type = (resp.headers.get("Content-Type") or "").split(";")[0]
                     content_type = content_type.strip().lower()
-                    if content_type and not content_type.startswith("image/"):
-                        raise UpstreamError(
-                            f"Expected an image, got Content-Type {content_type!r}",
-                            code="image_content_type",
-                            status=400,
-                        )
 
                     chunks: list[bytes] = []
                     total = 0
@@ -145,7 +139,9 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
                                 status=413,
                             )
                         chunks.append(chunk)
-                    return b"".join(chunks)
+                    data = b"".join(chunks)
+                    self._refuse_non_image(content_type, data)
+                    return data
         except TimeoutError:
             # Covers both this bound and aiohttp's own total timeout: either way
             # the answer is "this URL did not deliver in time".
@@ -159,6 +155,35 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
             raise UpstreamError(
                 "Image download failed", code="image_download_failed"
             ) from exc
+
+    def _refuse_non_image(self, content_type: str, data: bytes) -> None:
+        """Refuse a body that neither claims nor looks like an image.
+
+        The header used to decide on its own, and it is untrustworthy in the
+        direction that costs: measured 2026-09-18, a genuine PNG came back as
+        **``application/octet-stream``**, so a ``Content-Type: image/*`` gate
+        killed good images (the reference project measured the same and moved
+        its verdict to the magic bytes). An absent header was already accepted.
+
+        So the refusal now needs *both* halves -- a header that disclaims an
+        image *and* bytes with no recognisable image magic. That is a strict
+        subset of what the header-only gate rejected: nothing that passed
+        before fails now, while an HTML error page (no image magic) is still
+        refused. The verdict needs the bytes, which is why it moved below the
+        capped read -- the cap, not the header, is what bounds that read.
+
+        ``sniff_mime`` answers ``application/octet-stream`` for "recognised
+        nothing", which is the sentinel used here.
+        """
+        if not content_type or content_type.startswith("image/"):
+            return
+        if self.sniff_mime(data) != "application/octet-stream":
+            return  # an image that the server merely labelled badly
+        raise UpstreamError(
+            f"Expected an image, got Content-Type {content_type!r}",
+            code="image_content_type",
+            status=400,
+        )
 
     def _require_ref(self, ref: str) -> str:
         if not isinstance(ref, str) or not ref.strip():

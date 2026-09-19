@@ -34,7 +34,7 @@ from adapter.ctxapi.codec import CodecMixin
 from adapter.ctxapi.fanout import FanoutMixin
 from adapter.ctxapi.fault import FaultMixin
 from adapter.ctxapi.image_ref import ImageRefMixin
-from adapter.ctxapi.mapping import MappingMixin
+from adapter.ctxapi.mapping import MappingMixin, SizeReading
 from adapter.ctxapi.plan import FilePart, PlanMixin, RequestPlan
 from adapter.ctxapi.storage import StorageMixin
 
@@ -63,6 +63,7 @@ __all__ = [
     "FilePart",
     "ImageRefMixin",
     "MappingMixin",
+    "SizeReading",
     "NeedsCodec",
     "NeedsStorage",
     "PlanMixin",
