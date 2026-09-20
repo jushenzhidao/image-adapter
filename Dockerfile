@@ -36,6 +36,12 @@ COPY adapter /app/adapter
 COPY script_store /app/script_store
 COPY gunicorn.conf.py /app/gunicorn.conf.py
 
+# The outbound-exit bridge (`docker-compose.yml` → `socks-bridge`) runs from this
+# same image, so the two files it needs ship with it. Both are pure stdlib, so
+# nothing new is installed for it; the rest of `tools/` is operator-side and
+# stays out of the image.
+COPY tools/socks_http_bridge.py tools/token_service.py /app/tools/
+
 # Non-root ownership
 RUN chown -R adapter:adapter /app
 

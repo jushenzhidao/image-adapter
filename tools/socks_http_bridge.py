@@ -42,6 +42,7 @@ import argparse
 import base64
 import binascii
 import json
+import os
 import select
 import socket
 import socketserver
@@ -630,8 +631,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--listen", default="127.0.0.1:11080")
     parser.add_argument(
         "--upstream",
-        required=True,
-        help="rotating SOCKS5 pool, e.g. socks5h://user:pass@host:2088",
+        default=os.environ.get("SOCKS_BRIDGE_UPSTREAM", ""),
+        help="rotating SOCKS5 pool, e.g. socks5h://user:pass@host:2088. "
+             "Defaults to $SOCKS_BRIDGE_UPSTREAM, and that is the form to use "
+             "in a deployment: the pool credential carries the exit, and a "
+             "command line is readable by every process on the host (`ps`), "
+             "while an env file is not.",
     )
     parser.add_argument(
         "--bypass",
@@ -641,6 +646,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--idle-ttl", type=float, default=DEFAULT_IDLE_TTL)
     args = parser.parse_args(argv)
+    if not args.upstream:
+        # Said out loud rather than defaulting to something: a bridge without an
+        # upstream would either go direct (silently not rotating) or fail on the
+        # first request, and both look like "the proxy is configured".
+        parser.error("--upstream is required, or set SOCKS_BRIDGE_UPSTREAM")
 
     bypass = tuple(p.strip().lower() for p in args.bypass if p.strip())
     server = build_server(

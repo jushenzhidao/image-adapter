@@ -465,3 +465,39 @@ def test_a_pool_that_refuses_the_auth_method_still_answers_502(
 
     assert "502" in line, f"expected a status line, got {line!r}"
     assert pool.requests == [], "nothing should have reached the target"
+
+
+def test_a_bridge_without_an_upstream_refuses_to_start(monkeypatch) -> None:
+    """Neither `--upstream` nor `SOCKS_BRIDGE_UPSTREAM` ⇒ usage error.
+
+    Defaulting would be worse than failing: a bridge with no upstream either
+    goes direct (silently not rotating, while looking configured) or dies on the
+    first request. `parser.error` exits before any socket is bound, which is
+    also why this test can call `main` at all.
+    """
+    monkeypatch.delenv("SOCKS_BRIDGE_UPSTREAM", raising=False)
+    with pytest.raises(SystemExit):
+        bridge.main([])
+
+
+def test_the_upstream_may_come_from_the_environment(monkeypatch) -> None:
+    """`SOCKS_BRIDGE_UPSTREAM` is the deployment form.
+
+    A command line is readable by every process on the host, and the pool
+    credential is the thing that decides the exit -- so the env var has to reach
+    `build_server`, not just the `--upstream` flag.
+    """
+    monkeypatch.setenv("SOCKS_BRIDGE_UPSTREAM", "socks5h://u:p@127.0.0.1:1")
+    captured: dict[str, str] = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_build(listen, upstream, **kwargs):
+        captured["upstream"] = upstream
+        raise _Stop  # before any socket is bound
+
+    monkeypatch.setattr(bridge, "build_server", fake_build)
+    with pytest.raises(_Stop):
+        bridge.main([])
+    assert captured["upstream"] == "socks5h://u:p@127.0.0.1:1"

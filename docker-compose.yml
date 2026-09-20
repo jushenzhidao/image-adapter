@@ -94,6 +94,45 @@ services:
   # tests/unit/test_config_keys.py flags env keys that map to no field.
   #
   # No `ports`: only the adapter needs to reach it, over the compose network.
+  # The outbound-exit bridge. Optional: a deployment that does not rotate exits
+  # simply does not run it and leaves the channel header unset. Enable with
+  # `docker compose --profile bridge up -d`.
+  #
+  # Why it is separate: the pool speaks SOCKS5 and aiohttp does not, and "one
+  # address per client request" needs a dialer that opens a fresh tunnel for
+  # each one (docs/10 §11 ④). The channel then points at *this* service, not at
+  # the pool:
+  #     X-Upstream-Proxy: http://socks-bridge:11080
+  #     X-Upstream-Proxy-Mode: per-request
+  #
+  # The pool credential is read from this service's environment, never from a
+  # command line: `ps` shows arguments to every user on the host, and that
+  # credential is what decides the exit.
+  socks-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/jushenzhidao/image-adapter:latest
+    container_name: image-adapter-socks-bridge
+    restart: unless-stopped
+    profiles: ["bridge"]
+    # No published port, deliberately: an open HTTP proxy that rotates exits is
+    # exactly what must not be reachable from outside the compose network.
+    environment:
+      SOCKS_BRIDGE_UPSTREAM: ${SOCKS_BRIDGE_UPSTREAM:?set it in .env — the pool credential}
+    command: >
+      python tools/socks_http_bridge.py
+      --listen 0.0.0.0:11080
+      --bypass ${UPSTREAM_PROXY_BYPASS_HOSTS:-*.aliyuncs.com}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:11080/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+
   redis:
     image: redis:7-alpine
     container_name: adapter-redis
