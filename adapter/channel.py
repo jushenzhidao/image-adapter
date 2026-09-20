@@ -4,6 +4,8 @@ One channel == one upstream endpoint. New API owns model/billing/routing and
 declares only how to talk to that endpoint:
 
   X-Upstream-Url   https://api.vendor-x.com/v2/text2img   (required)
+  X-Upstream-Proxy http://127.0.0.1:3128    outbound proxy, this channel only
+  X-Upstream-Proxy-Mode   shared | per-request    one exit per request
   X-Script         inline source, literal \\n as separator (one of three)
   X-Script-64      base64 of the source                   (one of three)
   X-Script-Ref     vendor_y/mj@v1.3 or https://.../mj.py  (one of three)
@@ -24,15 +26,19 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 from adapter.errors import ChannelConfigError
 from adapter.modelmap import parse as parse_model_map
+from adapter.proxyplan import MODES, MODE_PER_REQUEST, ProxyPlan, parse_hosts
 from adapter.settings import Settings
 from adapter.stage_spec import StageSpec
-from adapter.urlguard import check_url
+from adapter.urlguard import check_proxy_url, check_url
 
 H_URL = "x-upstream-url"
 H_METHOD = "x-upstream-method"
+H_PROXY = "x-upstream-proxy"
+H_PROXY_MODE = "x-upstream-proxy-mode"
 H_SCRIPT = "x-script"
 H_SCRIPT_64 = "x-script-64"
 H_SCRIPT_REF = "x-script-ref"
@@ -41,6 +47,13 @@ H_AUTH_EMIT = "x-auth-emit"
 H_ASYNC = "x-async"
 H_OPTIONS = "x-channel-options"
 H_ADAPTER_KEY = "x-adapter-key"
+#: Not an `X-` header: it carries the *vendor* credential, not a directive.
+#: It gets a constant like the rest because it is part of the same contract
+#: (it is declared to FastAPI and allowed through CORS), and a literal at the
+#: one call site was the only thing keeping the three lists from being
+#: checkable against each other -- see
+#: tests/unit/test_channel_headers_contract.py.
+H_AUTHORIZATION = "authorization"
 
 VALID_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 AUTH_TARGETS = frozenset({"header", "query", "body", "none"})
@@ -124,6 +137,16 @@ class ChannelSpec:
     script_ref: str | None = None
     script_sha256: str | None = None
     upstream_key: str = ""
+    # Its own header rather than a key in `options`: how the adapter reaches
+    # the vendor is transport, not vendor dialect, and it has to be validated
+    # by the framework (a bad value leaks the credential to a third party).
+    # `options` is the script's bag, handed over unread.
+    #
+    # A plan rather than a bare URL, because two more decisions travel with it:
+    # which hosts it covers, and whether each client request gets its own exit
+    # (adapter/proxyplan.py). The pipeline attaches the request's session id by
+    # replacing this field, so every layer downstream reads one value.
+    proxy: ProxyPlan = field(default_factory=ProxyPlan)
     auth: AuthEmit = field(default_factory=AuthEmit)
     async_spec: AsyncSpec = field(default_factory=AsyncSpec)
     options: dict = field(default_factory=dict)
@@ -211,6 +234,51 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
             "X-Upstream-Method",
         )
 
+    # Validated on the same rule as the upstream URL, and for a stronger
+    # reason: a proxy that is unreachable, misspelled or unlisted has to fail
+    # before the request goes out, not as an opaque 502 afterwards. Absent
+    # header means "no proxy" and costs nothing.
+    proxy_raw = (headers.get(H_PROXY) or "").strip()
+    proxy_mode_raw = (headers.get(H_PROXY_MODE) or "").strip().lower()
+    if not proxy_raw:
+        # The mode is useless without the address, and a channel that sets it is
+        # a mistake that would otherwise look like it worked: nothing would
+        # rotate, and nothing would say so.
+        if proxy_mode_raw:
+            raise ChannelConfigError(
+                "X-Upstream-Proxy-Mode requires X-Upstream-Proxy to be set as well",
+                "X-Upstream-Proxy",
+            )
+        proxy = ProxyPlan()
+    else:
+        url = check_proxy_url(proxy_raw, settings, "X-Upstream-Proxy")
+        if proxy_mode_raw and proxy_mode_raw not in MODES:
+            raise ChannelConfigError(
+                f"X-Upstream-Proxy-Mode must be one of {sorted(MODES)}",
+                "X-Upstream-Proxy-Mode",
+            )
+        per_request = proxy_mode_raw == MODE_PER_REQUEST
+        if per_request and urlparse(url).username:
+            # The session id travels as the proxy credential, so a URL carrying
+            # its own would either be overridden or start being rejected by the
+            # bridge. Fail here, where the fix is obvious.
+            raise ChannelConfigError(
+                "X-Upstream-Proxy-Mode=per-request needs a proxy URL without "
+                "credentials: the session id is sent as the proxy login, so the "
+                "upstream password belongs on the bridge itself",
+                "X-Upstream-Proxy",
+            )
+        # The bypass list is the deployment's, not this channel's: what has to
+        # stay direct (an object store upload) is the same answer for every
+        # channel, and repeating it on each one is how the copies drift apart.
+        proxy = ProxyPlan(
+            url=url,
+            bypass=parse_hosts(
+                settings.upstream_proxy_bypass_hosts, "UPSTREAM_PROXY_BYPASS_HOSTS"
+            ),
+            per_request=per_request,
+        )
+
     source_name, _ = _first_present(headers, H_SCRIPT, H_SCRIPT_64, H_SCRIPT_REF)
     if source_name is None:
         raise ChannelConfigError(
@@ -257,7 +325,7 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
     # business; the framework only supplies the answer (adapter/modelmap.py).
     model_map = parse_model_map(options.get("model_map"))
 
-    authorization = (headers.get("authorization") or "").strip()
+    authorization = (headers.get(H_AUTHORIZATION) or "").strip()
     upstream_key = authorization
     if authorization.lower().startswith("bearer "):
         upstream_key = authorization[len("bearer ") :].strip()
@@ -272,6 +340,7 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
         script_ref=(headers.get(H_SCRIPT_REF) or "").strip() or None,
         script_sha256=sha,
         upstream_key=upstream_key,
+        proxy=proxy,
         auth=auth,
         async_spec=async_spec,
         options=options,

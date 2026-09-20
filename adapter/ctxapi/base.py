@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     import aiohttp
 
+    from adapter.ctxapi.proxy_http import ProxiedHttp
     from adapter.settings import Settings
     from adapter.storage.base import ObjectStore
 
@@ -31,7 +32,10 @@ class CtxMixin:
         options: dict[str, Any]
 
         @property
-        def http(self) -> aiohttp.ClientSession: ...
+        def http(self) -> aiohttp.ClientSession | ProxiedHttp: ...
+
+        @property
+        def download_http(self) -> aiohttp.ClientSession: ...
 
         @property
         def cache(self) -> Any: ...

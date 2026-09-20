@@ -14,6 +14,8 @@ from adapter.settings import Settings
 CHANNEL_HEADERS = [
     "X-Upstream-Url",
     "X-Upstream-Method",
+    "X-Upstream-Proxy",
+    "X-Upstream-Proxy-Mode",
     "X-Script",
     "X-Script-64",
     "X-Script-Ref",

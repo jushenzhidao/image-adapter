@@ -52,6 +52,7 @@ from adapter.transport import (
     raise_for_status,
     read_capped,
 )
+from adapter.urlguard import redact_proxy
 
 PHASE_AUTH = "auth"
 PHASE_REQUEST = "request"
@@ -162,9 +163,22 @@ async def _do_upstream(
     # `X-Upstream-Url`, so it is capped like the reference links are, rather than
     # letting the caller decide how large this span gets (docs/03 §5.2 publishes
     # the attribute, not its length).
-    with logfire.span(
-        "upstream_call", method=method, url=url[:URL_LIMIT], timeout=timeout
-    ) as span, span_elapsed_ms(span):
+    #
+    # `proxy` is recorded redacted and only when set: which exit a channel used
+    # is the first question a wrong-exit or "why is this channel slow" report
+    # asks, and the URL's userinfo is a credential that must not reach a trace.
+    span_attrs: dict[str, Any] = {
+        "method": method,
+        "url": url[:URL_LIMIT],
+        "timeout": timeout,
+    }
+    if channel.proxy.enabled:
+        span_attrs["proxy"] = redact_proxy(channel.proxy.url)
+        if channel.proxy.per_request and channel.proxy.session_id:
+            # Without this, "why did two identical requests leave from different
+            # addresses" is unanswerable from the trace alone.
+            span_attrs["proxy_session"] = channel.proxy.session_id
+    with logfire.span("upstream_call", **span_attrs) as span, span_elapsed_ms(span):
         try:
             async with ctx.http.request(method, url, **kwargs) as resp:
                 # Status and headers are available as soon as the response

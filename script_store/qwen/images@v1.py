@@ -1169,11 +1169,32 @@ async def _create_chat(ctx, base, headers, mode, chat_type):
     return data["data"]["id"]
 
 
-async def _upload_image(ctx, base, headers, data, mime):
-    """STS -> OSS PUT -> message.files element. Returns (item, filename).
+async def _prepare_input(ctx, ref):
+    """Stage 1, concurrent: the bytes and their type, nothing else yet.
 
-    Free: the upload link is not metered, only the generation call is.
+    Downloads carry no proxy view at all (`ctx.download_http`), so running
+    these side by side cannot widen a request's footprint and costs the vendor
+    nothing.
     """
+    data = await ctx.image_bytes(ref)
+    return data, ctx.sniff_mime(data) or "image/png"
+
+
+async def _fetch_sts(ctx, base, headers, item):
+    """Stage 2, serial: one upload credential per picture. Returns (sts, item).
+
+    **Serial on purpose.** This is the one call in the materialisation that
+    goes through the channel's proxy -- the OSS PUT below is on the bypass
+    list -- and that proxy hands out an address per connection. Calling these
+    concurrently would put a single client request on several exits at once,
+    which is the very thing a per-request rotation exists to prevent.
+
+    What it costs: measured at ~0.3 s per call, so a ten-image request spends a
+    couple of extra seconds here, against a generation that takes tens of
+    seconds and a persistence problem (a request that leaves from five
+    addresses) that has no bound at all.
+    """
+    data, mime = item
     name = "input." + _ext_of(mime)
     if len(data) > SIMPLE_PUT_LIMIT:
         # Loud, not silent: the vendor path for larger bodies is multipart,
@@ -1196,7 +1217,18 @@ async def _upload_image(ctx, base, headers, data, mime):
     if missing:
         _fail_upstream(ctx, "qwen upload credential missing field(s): "
                             + ", ".join(missing))
+    return sts, item
 
+
+async def _put_input(ctx, pair):
+    """Stage 3, concurrent again: the PUT itself, straight to OSS.
+
+    Safe to run in parallel because the destination is on the bypass list:
+    these calls never touch the proxy, so they cannot add exits to the request.
+    This is where the seconds are actually saved, so they stay a fanout.
+    """
+    sts, (data, mime) = pair
+    name = "input." + _ext_of(mime)
     host, region, scheme = _oss_target(sts)
     bucket = str(sts.get("bucketname") or "").strip()
     path = str(sts.get("file_path") or "")
@@ -1215,21 +1247,22 @@ async def _upload_image(ctx, base, headers, data, mime):
     if status >= 400:
         _fail_upstream(ctx, "qwen OSS upload HTTP " + str(status) + ": "
                             + text[:160])
-    return _build_file_item(sts, name, mime, len(data)), name
+    return _build_file_item(sts, name, mime, len(data))
 
 
-async def _materialise_one(ctx, base, headers, ref):
-    """One input picture -> one `messages[0].files[]` entry.
+async def _materialise_files(ctx, base, headers, refs):
+    """N input pictures -> N `messages[0].files[]` entries, order preserved.
 
-    Takes the reference alone (the rest arrives through `functools.partial`)
-    because `ctx.fanout` hands its work one item at a time -- the same shape
-    `openai`/`google`/`ark` already use for their own references, so the four
-    scripts read alike.
+    Three stages rather than one concurrent pass, because the exits decide the
+    shape: downloads and uploads are direct (no proxy view, bypassed host) and
+    stay a fanout, while `getstsToken` -- the one hop that goes through the
+    channel's proxy -- runs serially so that one client request is one address.
+    Each stage keeps `ctx.fanout`'s ordering, so `files[i]` still belongs to
+    `refs[i]`.
     """
-    data = await ctx.image_bytes(ref)
-    mime = ctx.sniff_mime(data) or "image/png"
-    item, _name = await _upload_image(ctx, base, headers, data, mime)
-    return item
+    prepared = await ctx.fanout(refs, partial(_prepare_input, ctx))
+    credentials = [await _fetch_sts(ctx, base, headers, item) for item in prepared]
+    return await ctx.fanout(credentials, partial(_put_input, ctx))
 
 
 # -------------------------------------------------------------- output shape
@@ -1372,6 +1405,27 @@ QUOTA_CODES = ("RateLimited", "quota_limit")
 #: and paid exactly that).
 QUOTA_WORDINGS = ("额度已用完", "额度用完", "额度已耗尽")
 
+#: The **content-moderation** marker, now measured verbatim (2026-09-19):
+#:
+#:     data: {"error": {"code": "data_inspection_failed", "modality": ["text"],
+#:                      "stage": "input",
+#:                      "details": "内容安全警告：输入数据可能包含不适当的内容！"},
+#:            "response_id": "...", "response_index": 0}
+#:
+#: The code sits in `error.code` -- the frontend's `applyGreenNetParentFix` is what turns
+#: it into the UI's `green_error` (reverse-proxy `qwen-image-vision-api.md` §5, from the
+#: bundle; the bundle reading said `error_code`, the frame says `code`, so **both
+#: spellings are checked**). Reading only one lands this in the generic 502 below, which
+#: is exactly backwards for a refusal that can never succeed on a retry.
+#:
+#: `modality` says *what* was flagged (text/image) and `stage` says *where* (input/output)
+#: -- both go into the trace note, because "the prompt was refused" and "the picture was
+#: refused" need different advice.
+CONTENT_CODES = ("data_inspection_failed",)
+#: 自然语言层的拒答词**不再由本脚本持有**：它属于所有渠道，落在
+#: `capabilities/_shared.json`（改数据不发版），由 `ctx.matched_moderation` 统一匹配。
+#: 这里只留**厂商专属**的 code —— 跨厂商共享一张 code 表才是真正的猜。
+
 
 def _fail_qwen_error(ctx, doc, *, hop="generate"):
     """One place for every error shape the vendor uses, in either dialect.
@@ -1402,6 +1456,11 @@ def _fail_qwen_error(ctx, doc, *, hop="generate"):
         to 429, and the transient arm says so in as many words so the next
         reader does not "fix" it back.
 
+    **Content moderation is the deliberate opposite of "treat unknown as transient"**:
+    `data_inspection_failed` means the same prompt will be refused again, so it maps to
+    a 400 rather than a 5xx -- retrying it spends a generation and teaches the caller a
+    false "try again later". See CONTENT_CODES.
+
     The x5sec shape is a bare `{"ret": [...]}` with no `data` at all, which is
     why it needs its own branch instead of falling through to "carried no image
     data" -- and it is *not* a rate-limit body, so it must not reach the quota
@@ -1416,6 +1475,9 @@ def _fail_qwen_error(ctx, doc, *, hop="generate"):
     # `data` for the JSON dialect, `error` for the stream-internal one.
     data = doc.get("data") or doc.get("error") or {}
     code = str(data.get("code") or "")
+    # 审核/风控类走的是 `error_code`（实测：`error.error_code == "data_inspection_failed"`），
+    # 与 `code` 是两个字段；只读 `code` 会让它落进下面的通用 502。
+    err_code = str(data.get("error_code") or "")
     # `details` is the JSON spelling; the measured stream frame carried `detail`.
     details = str(data.get("details") or data.get("detail") or "")
     ret = doc.get("ret")
@@ -1449,6 +1511,20 @@ def _fail_qwen_error(ctx, doc, *, hop="generate"):
         shown = (json.dumps(ret, ensure_ascii=False)[:160] if ret
                  else "code=" + code)
         _fail_upstream(ctx, "qwen x5sec 风控/限流: " + shown + hint)
+    if ctx.matched_moderation(doc, codes=CONTENT_CODES):
+        # 🔴 **内容审核未通过 ⇒ 400，不是 5xx**。判定与出口都由框架 helper 收口
+        # （`ctx.matched_moderation` / `ctx.fail_moderation`，见 `adapter/ctxapi/moderation.py`），
+        # 于是三个渠道对客户端的说法天然一致：**状态码就是给下游的重试信号**，
+        # 而这一类和"静默丢弃"正相反 —— 同一个 prompt 重试**必然**再被拒。
+        # note 里带厂商事实：modality 说**被拒的是什么**（text/image）、stage 说拒在**输入还是输出**，
+        # 两者决定给调用方的建议（改提示词 vs 换素材）。
+        ctx.fail_moderation(
+            "qwen 内容审核未通过（" + (code or err_code or "content_filter")
+            + (("：" + details) if details else "") + "）",
+            error_code=(code or err_code),
+            modality=",".join(str(x) for x in (data.get("modality") or []))[:40],
+            refused_at=str(data.get("stage") or "")[:16],
+            details=details[:120])
     if code in QUOTA_CODES or "额度" in details:
         if hop == "generate" and any(w in details for w in QUOTA_WORDINGS):
             # The daily quota, bound to the device identity rather than the IP
@@ -1675,20 +1751,25 @@ async def transform(ctx, payload, phase):
         headers = _headers(ctx)
 
         refs = _input_refs(payload, opts)
-        # Concurrently (2026-09-19). Materializing input pictures is bounded work,
-        # not a second generation call -- `docs/07` §14.2.1 allows exactly this,
-        # and the other three scripts have done it from the start -- so N
-        # references cost one wait instead of N. Each one is still
-        # fetched-and-uploaded *exactly once*: no retry, no extra generation call.
+        # Materializing input pictures is bounded work, not a second generation
+        # call -- `docs/07` §14.2.1 allows exactly this, and the other three
+        # scripts have done it from the start. Each picture is still
+        # fetched-and-uploaded *exactly once*: no retry, no extra generation.
+        #
+        # Since 2026-09-19 the fanout covers the ends only. The middle hop
+        # (`getstsToken`) is serialised inside `_materialise_files`, because it
+        # is the one call of the three that goes through a rotating exit: run it
+        # concurrently and a single client request leaves from as many addresses
+        # as it has pictures. The downloads and the PUTs stay concurrent -- they
+        # never touch the proxy (see `_fetch_sts`).
+        #
         # `ctx.fanout` preserves input order (`files[i]` belongs to `refs[i]`,
         # which the `files[]` order test pins), bounds the degree
         # (`fanout_concurrency`, 5 by default), and re-raises the earliest
         # failing item's own exception -- so the loud "above the single-PUT
-        # limit" refusal below still reaches the client as itself rather than
-        # being flattened into a generic 502. One reference takes the serial
-        # path, so an ordinary i2i is byte-for-byte what it was before.
-        files = await ctx.fanout(
-            refs, partial(_materialise_one, ctx, base, headers))
+        # limit" refusal still reaches the client as itself rather than being
+        # flattened into a generic 502.
+        files = await _materialise_files(ctx, base, headers, refs)
         chat_type = EDIT_TYPE if files else GEN_TYPE
 
         chat_id = await _create_chat(ctx, base, headers, mode, chat_type)
@@ -1744,11 +1825,26 @@ async def transform(ctx, payload, phase):
             # 只在本来就要失败的路径上跑（理由与形状见 `_recover_images`）。
             urls = await _recover_images(ctx, book["chat_id"], _diagnose(text))
         if not urls:
-            _fail_upstream(ctx, "qwen 未给出图片 URL（" + _diagnose(text)
+            shape = _diagnose(text)
+            if "空 SSE" in shape:
+                # 🔴 **静默丢弃**（200 + 0 条 data 行）：上游"什么都不说就丢了" ——
+                # 实测还会伴随 ~0.2s 就返回、且会话里连消息都没登记（2026-09-19，
+                # 见 `reports/2026-09-19_qwen-stale-fileid/` 的第一发）。
+                # `ctx.fail` 的约定与 `docs/06` 的用法一致：**状态码就是给下游的重试信号**
+                # （4xx＝别重试，5xx＝可重试）⇒ 这里给 **500**，让 new-api 自己重试一次，
+                # 而不是把"上游抽风"报成一个不可重试的 4xx，也不是让调用方看到假的成功。
+                # 兜底取回（上面那步）已经先试过了：这条只在上游会话里也取不到时才走到。
+                ctx.fail("qwen 静默丢弃（" + shape + "，会话历史里也没有）: " + text[:120],
+                         code="upstream_error", err_type="server_error", status=500)
+            _fail_upstream(ctx, "qwen 未给出图片 URL（" + shape
                                 + "，会话历史里也没有）: " + text[:180])
         return await _carry(ctx, urls, book.get("response_format"))
     if payload is None:
-        _fail_upstream(ctx, "qwen returned an empty non-JSON body")
+        # 同一族"静默丢弃"的另一半：**响应体是空的**（连一行 data 都没有）。
+        # 与上面那条"0 条 data 行"合起来才是完整的形状：上游 200 回来却什么都没说、
+        # 会话里也没登记（实测 ~0.2s）⇒ 按可重试处理，让 new-api 自己重试。
+        ctx.fail("qwen 静默丢弃（响应体为空，非 JSON）: 上游 200 但没有可用内容",
+                 code="upstream_error", err_type="server_error", status=500)
 
     if isinstance(payload, dict) and payload.get("success") is False:
         _fail_qwen_error(ctx, payload)
