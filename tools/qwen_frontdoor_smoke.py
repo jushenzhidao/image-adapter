@@ -16,14 +16,19 @@
   1. HTTP 与耗时；
   2. 产物是否落盘（按门各自的响应形状取 URL：`data[0].url` 或响应里第一个 cdn 链接）；
   3. 脚本 trace 自报的 `chat_type` / `input_images`（折叠对了就该是 `image_edit` + 1）；
-  4. **门归属**（产物 `key=<JWT>` 的 `resource_user_id` == 凭据账号 id）。
+  4. **门归属**：jwt 形态比对产物 `key=<JWT>` 的 `resource_user_id` == 账号 id；
+     guest 形态比对脚本自报 `chat_mode == "guest"`（访客产物属于平台临时账号，无账号 id 可比）。
 
 凭据只从环境变量读；产物与 meta 落 `--report-dir`（不含凭据、不含带签名的 URL）。
 
     QWEN_JWT='eyJ…' .venv/bin/python tools/qwen_frontdoor_smoke.py --plan
     QWEN_JWT='eyJ…' .venv/bin/python tools/qwen_frontdoor_smoke.py --yes --doors edits,chat,responses
+    python tools/qwen_frontdoor_smoke.py --yes --key-form guest \
+        --proxy http://127.0.0.1:11082 --doors generations,edits,chat,responses
 
-⚠️ `--yes` 是硬门槛：**每个门消耗 1 发**账号额度（垫图只是输入，不计费）。
+⚠️ `--yes` 是硬门槛：**每个门消耗 1 发**额度（账号门=账号额度；guest 门=访客额度，
+   现铸一个设备身份后四门共用，访客额度约 4~5 张/天 ⇒ 四门恰好贴着上限）。
+⚠️ guest 形态下 chat / responses 两门的白名单折叠不带 `size` ⇒ 档位落脚本兜底值（设计内）。
 """
 from __future__ import annotations
 
@@ -40,6 +45,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
+#: `identity_service`（guest 形态现铸设备身份用）住在 tools/ 下
+sys.path.insert(0, str(REPO / "tools"))
 
 DEFAULT_PROMPT = "把这张图的主体保持原样，只把背景换成明亮的沙漠正午，插画风格"
 DOORS = ("generations", "edits", "chat", "responses")
@@ -150,6 +157,14 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--doors", default="edits,chat,responses",
                     help="要跑的门（逗号分隔，默认三个折叠门；可含 generations 作对照）")
+    ap.add_argument("--key-form", choices=("jwt", "guest"), default="jwt",
+                    help="凭据形态：jwt=账号门（QWEN_JWT）；guest=现铸访客身份（默认 jwt）")
+    ap.add_argument("--proxy", default="",
+                    help="让本渠道走出站代理，如 http://127.0.0.1:11082"
+                         "（本地 SOCKS→HTTP 桥见 tools/socks_http_bridge.py）；"
+                         "空＝不走代理（默认，与存量渠道一致）")
+    ap.add_argument("--headful", action="store_true",
+                    help="显示浏览器窗口（默认 headless —— 与 identity_service 一致）")
     ap.add_argument("--yes", action="store_true", help="硬门槛：不给只打印计划")
     ap.add_argument("--plan", action="store_true", help="只打印计划（同不给 --yes）")
     ap.add_argument("--tier", default="1K")
@@ -164,11 +179,17 @@ def main(argv=None) -> int:
     if bad:
         print("未知的门：", bad, "（可选：", ", ".join(DOORS), "）")
         return 2
-    jwt = os.environ.get("QWEN_JWT", "").strip()
-    if not jwt:
-        print("拒绝执行：请用环境变量 QWEN_JWT 传 token（不落盘）。")
-        return 2
-    account_id = str(jwt_payload(jwt).get("id") or "")
+
+    guest = args.key_form == "guest"
+    account_id = ""
+    if guest:
+        print("凭据形态：guest —— 稍后现铸设备身份（本地 Chrome），四门共用这一个身份")
+    else:
+        jwt = os.environ.get("QWEN_JWT", "").strip()
+        if not jwt:
+            print("拒绝执行：请用环境变量 QWEN_JWT 传 token（不落盘）。")
+            return 2
+        account_id = str(jwt_payload(jwt).get("id") or "")
 
     image_path = Path(args.input_image) if args.input_image else (
         REPO / "reports" / "2026-09-19_qwen-key-jwt" / "outputs" / "jwt_1k_t2i.png")
@@ -178,7 +199,8 @@ def main(argv=None) -> int:
     report = Path(args.report_dir) if args.report_dir else (
         REPO / "reports" / f"{time.strftime('%Y-%m-%d')}_qwen-frontdoors")
 
-    print(f"计划：{len(doors)} 个门 × 1 发 = **{len(doors)} 发**账号额度；"
+    quota = "访客额度（现铸身份，约 4~5 张/天）" if guest else "账号额度"
+    print(f"计划：{len(doors)} 个门 × 1 发 = **{len(doors)} 发**{quota}；"
           f"档位 {args.tier}；垫图 {image_path.name}（{image_path.stat().st_size}B）")
     for d in doors:
         print(f"   · {d}")
@@ -199,82 +221,128 @@ def main(argv=None) -> int:
         environment="dev", adapter_key_required=False, adapter_key="",
         allow_inline_script=True, upstream_allow_private_network=True,
         redis_url="", storage_backend="minio", minio_endpoint="", fal_key="",
+        # Only meaningful when the run passes `--proxy`, and harmless otherwise:
+        # an allowlist trusting loopback is what lets the header be set at all
+        # (an empty list refuses it outright). The bypass list keeps the OSS
+        # upload off the proxy -- the deployment shape, so `--proxy` exercises
+        # the same paths a real channel would.
+        upstream_proxy_allowlist="127.0.0.1,localhost",
+        upstream_proxy_bypass_hosts="*.aliyuncs.com",
     )
+
+    minter = None
+    if guest:
+        import identity_service as ids
+        minter = ids.BrowserMinter(channel="chrome", headless=not args.headful,
+                                   settle_ms=7000)
+        try:
+            started = time.time()
+            ident = minter.mint()
+            print(f"访客身份就绪 {time.time() - started:.1f}s："
+                  f"cookie={len(ident['cookie'])} bx_ua={len(ident['bx_ua'])} "
+                  f"umid={ident['bx_umidtoken'][:8]}…")
+        except Exception as exc:  # noqa: BLE001
+            minter.close()
+            print(f"❌ 访客身份铸就失败：{exc}")
+            return 1
+        channel_options = {"chat_mode": "guest", "cookie": ident["cookie"],
+                           "bx_ua": ident["bx_ua"], "bx_umidtoken": ident["bx_umidtoken"]}
+        bearer = "Bearer guest"
+    else:
+        channel_options = {}
+        bearer = "Bearer " + jwt
+
     headers = {
         "X-Upstream-Url": "https://chat.qwen.ai/api/v2/chat/completions",
         "X-Script-Ref": "qwen/images@v1",
-        "X-Channel-Options": json.dumps({}),
+        "X-Channel-Options": json.dumps(channel_options),
         "X-Auth-Emit": "none",
-        "Authorization": "Bearer " + jwt,
+        "Authorization": bearer,
     }
+    if args.proxy:
+        headers["X-Upstream-Proxy"] = args.proxy
+        print(f"经代理：{args.proxy}")
     data_uri = _data_uri(image_path)
     ensure_dir(report / "outputs")
     ensure_dir(report / "meta")
 
     summary = []
-    with TestClient(app, raise_server_exceptions=False) as client:
-        for door in doors:
-            path, body, files, form = build(door, model="qwen-image", size=args.tier,
-                                            prompt=args.prompt, image_path=image_path,
-                                            data_uri=data_uri)
-            print(f"[{door}] POST {path}")
-            started = time.time()
-            if files:
-                # 多部件：Content-Type 与 boundary 由客户端自己带（别预先写死）
-                resp = client.post(path, headers=headers, files=files, data=form)
-            else:
-                resp = client.post(path, headers=headers, json=body)
-            elapsed = time.time() - started
-            text = resp.text
-            print(f"   HTTP {resp.status_code}  {elapsed:.1f}s  "
-                  f"X-Request-Id={resp.headers.get('x-request-id')}")
-            url = pick_url(door, text) if resp.status_code == 200 else ""
-            notes = [n for n in tap.notes if n.get("stage") == "request"]
-            trace = notes[-1] if notes else {}
-            print(f"   trace: chat_type={trace.get('chat_type')} "
-                  f"input_images={trace.get('input_images')} size={trace.get('size')}")
-            row = {"door": door, "path": path, "http": resp.status_code,
-                   "elapsed_s": round(elapsed, 1),
-                   "request_id": resp.headers.get("x-request-id"),
-                   "trace": {k: v for k, v in trace.items() if k != "message"},
-                   "response_head": text[:300]}
-            if not url:
-                print("   ❌ 没取到产物 URL：", text[:200])
-                row["error"] = text[:300]
-            else:
-                owner = ""
-                m = re.search(r"[?&]key=([^&]+)", url)
-                if m:
-                    owner = str(jwt_payload(m.group(1)).get("resource_user_id") or "")
-                door_of = "account" if (owner and account_id and owner == account_id) else "unclear"
-                # 下载产物：直连（不走代理），与其它工具同款
-                import httpx
-                with httpx.Client(trust_env=False, timeout=60) as c:
-                    raw = c.get(url).content
-                png = raw.startswith(b"\x89PNG\r\n\x1a\n")
-                try:
-                    import io as _io
-                    from PIL import Image
-                    im = Image.open(_io.BytesIO(raw))
-                    dims = f"{im.width}x{im.height}"
-                except Exception:  # noqa: BLE001
-                    dims = "?"
-                out = report / "outputs" / f"{door}_{args.tier.lower()}.png"
-                out.write_bytes(raw)
-                print(f"   ✅ 产物 {out.name}：{len(raw)}B magic={'PNG' if png else '?'} {dims}"
-                      f" | 门归属={door_of}")
-                row.update({"door_of": door_of, "bytes": len(raw), "dims": dims,
-                            "sha256": hashlib.sha256(raw).hexdigest(),
-                            "file": f"outputs/{out.name}"})
-            summary.append(row)
-            tap.notes.clear()
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            for door in doors:
+                path, body, files, form = build(door, model="qwen-image", size=args.tier,
+                                                prompt=args.prompt, image_path=image_path,
+                                                data_uri=data_uri)
+                print(f"[{door}] POST {path}")
+                started = time.time()
+                if files:
+                    # 多部件：Content-Type 与 boundary 由客户端自己带（别预先写死）
+                    resp = client.post(path, headers=headers, files=files, data=form)
+                else:
+                    resp = client.post(path, headers=headers, json=body)
+                elapsed = time.time() - started
+                text = resp.text
+                print(f"   HTTP {resp.status_code}  {elapsed:.1f}s  "
+                      f"X-Request-Id={resp.headers.get('x-request-id')}")
+                url = pick_url(door, text) if resp.status_code == 200 else ""
+                notes = [n for n in tap.notes if n.get("stage") == "request"]
+                trace = notes[-1] if notes else {}
+                print(f"   trace: chat_type={trace.get('chat_type')} "
+                      f"chat_mode={trace.get('chat_mode')} "
+                      f"input_images={trace.get('input_images')} size={trace.get('size')}")
+                row = {"door": door, "path": path, "http": resp.status_code,
+                       "elapsed_s": round(elapsed, 1),
+                       "request_id": resp.headers.get("x-request-id"),
+                       "trace": {k: v for k, v in trace.items() if k != "message"},
+                       "response_head": text[:300]}
+                if not url:
+                    print("   ❌ 没取到产物 URL：", text[:200])
+                    row["error"] = text[:300]
+                else:
+                    if guest:
+                        # 访客产物属于平台临时账号，无自有 id 可比 ⇒ 以脚本自报 chat_mode 为准
+                        door_of = "guest" if trace.get("chat_mode") == "guest" else "unclear"
+                    else:
+                        owner = ""
+                        m = re.search(r"[?&]key=([^&]+)", url)
+                        if m:
+                            owner = str(jwt_payload(m.group(1)).get("resource_user_id") or "")
+                        door_of = ("account" if (owner and account_id and owner == account_id)
+                                   else "unclear")
+                    # 下载产物：直连（不走代理），与其它工具同款
+                    import httpx
+                    with httpx.Client(trust_env=False, timeout=60) as c:
+                        raw = c.get(url).content
+                    png = raw.startswith(b"\x89PNG\r\n\x1a\n")
+                    try:
+                        import io as _io
+                        from PIL import Image
+                        im = Image.open(_io.BytesIO(raw))
+                        dims = f"{im.width}x{im.height}"
+                    except Exception:  # noqa: BLE001
+                        dims = "?"
+                    out = report / "outputs" / f"{door}_{args.tier.lower()}.png"
+                    out.write_bytes(raw)
+                    print(f"   ✅ 产物 {out.name}：{len(raw)}B magic={'PNG' if png else '?'} {dims}"
+                          f" | 门归属={door_of}")
+                    row.update({"door_of": door_of, "bytes": len(raw), "dims": dims,
+                                "sha256": hashlib.sha256(raw).hexdigest(),
+                                "file": f"outputs/{out.name}"})
+                summary.append(row)
+                tap.notes.clear()
+    finally:
+        if minter is not None:
+            minter.close()
 
     (report / "meta" / "frontdoors_run.json").write_text(
-        json.dumps({"doors": doors, "account_id_prefix": account_id[:8], "runs": summary},
+        json.dumps({"doors": doors, "key_form": args.key_form,
+                    "via_proxy": bool(args.proxy),
+                    "account_id_prefix": account_id[:8], "runs": summary},
                    ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"meta 已落盘 {report}/meta/frontdoors_run.json（不含凭据、不含签名 URL）")
-    ok = sum(1 for r in summary if r.get("http") == 200 and r.get("door_of") == "account")
-    print(f"⇒ {ok}/{len(summary)} 个门满足「200 且走账号门」")
+    expected = "guest" if guest else "account"
+    ok = sum(1 for r in summary if r.get("http") == 200 and r.get("door_of") == expected)
+    print(f"⇒ {ok}/{len(summary)} 个门满足「200 且走{expected}门」")
     return 0 if ok == len(summary) else 1
 
 

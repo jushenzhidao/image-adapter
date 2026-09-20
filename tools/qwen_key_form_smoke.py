@@ -219,6 +219,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="用例：t2i（默认）或 multi（多图生图，需 --input-image）")
     ap.add_argument("--input-image", action="append", default=[],
                     help="垫图本地文件路径（可重复；multi 需要 ≥2 张）→ 转 data URI 进请求体")
+    ap.add_argument("--proxy", default="",
+                    help="让本渠道走出站代理，如 http://127.0.0.1:11080"
+                         "（本地 SOCKS→HTTP 桥见 tools/socks_http_bridge.py）；"
+                         "空＝不走代理（默认，与存量渠道一致）")
     args = ap.parse_args(argv)
 
     resolved = resolve_credential(args.key_form)
@@ -256,6 +260,11 @@ def main(argv: list[str] | None = None) -> int:
         environment="dev", adapter_key_required=False, adapter_key="",
         allow_inline_script=True, upstream_allow_private_network=True,
         redis_url="", storage_backend="minio", minio_endpoint="", fal_key="",
+        # Only meaningful when the run passes `--proxy`, and harmless otherwise:
+        # the proxy host must sit on the allowlist, while the qwen OSS upload
+        # stays off the proxy — the deployment shape, so `--proxy` exercises it.
+        upstream_proxy_allowlist="127.0.0.1,localhost",
+        upstream_proxy_bypass_hosts="*.aliyuncs.com",
     )
     # 凭据放哪里**由形态决定**，这也是这两档唯一的实质差别：
     #   jwt / pair / jar ⇒ 放密钥（引擎会按 X-Auth-Emit 决定发不发 Authorization）
@@ -269,6 +278,10 @@ def main(argv: list[str] | None = None) -> int:
     }
     if bearer:
         headers["Authorization"] = "Bearer " + bearer
+    if args.proxy:
+        # 与 guest 冒烟同款：代理经请求头逐发声明（适配器按白名单放行，见上方 Settings）
+        headers["X-Upstream-Proxy"] = args.proxy
+        print(f"经代理：{args.proxy}")
     body = {"model": "qwen-image", "size": args.tier, "prompt": args.prompt}
     if args.case == "multi":
         if len(args.input_image) < 2:
