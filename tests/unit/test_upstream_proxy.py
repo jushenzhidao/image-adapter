@@ -256,6 +256,58 @@ def test_a_wildcard_bypass_covers_subdomains_but_not_lookalikes() -> None:
     assert "proxy" not in covered
 
 
+@pytest.mark.parametrize(
+    "pattern",
+    ["api.*.com", "a.*.b.com", "**.foo.com", "*.foo.*.com", "*.", "x.*"],
+)
+def test_a_wildcard_anywhere_but_the_front_is_refused(pattern: str) -> None:
+    """`host_matches` reads a pattern it does not recognise as a literal string,
+    so a middle wildcard matches nothing at all.
+
+    That is the worst shape a configuration entry can take: the operator reads it
+    as "these hosts stay direct" while it excludes nothing, and no request ever
+    contradicts them. It used to be *accepted* here -- the comment beside
+    `WILDCARD` claimed the opposite, which is exactly how it survived review.
+    Refusing it while the channel is parsed is the same rule, and the same
+    reason, as a partial glob in `X-Model-Map`.
+    """
+    with pytest.raises(ChannelConfigError) as caught:
+        _channel_with(
+            "http://127.0.0.1:3128",
+            upstream_proxy_allowlist="127.0.0.1",
+            upstream_proxy_bypass_hosts=pattern,
+        )
+    assert caught.value.param == "UPSTREAM_PROXY_BYPASS_HOSTS"
+    assert pattern in caught.value.message
+
+
+@pytest.mark.parametrize(
+    "pattern,probe",
+    [
+        ("*", "https://anything.example.com/x"),
+        ("example.com", "https://example.com/x"),
+        ("*.example.com", "https://a.example.com/x"),
+    ],
+)
+def test_every_accepted_shape_is_one_that_can_match_something(
+    pattern: str, probe: str
+) -> None:
+    """The positive control for the rule above.
+
+    Three spellings are accepted and each has to be actionable: `*` and a bare
+    host match by definition, and `*.suffix` needs a host underneath it. A
+    refusal list is only honest if what it accepts works -- otherwise the check
+    has merely moved the silent no-op to a different spelling.
+    """
+    channel = _channel_with(
+        "http://127.0.0.1:3128",
+        upstream_proxy_allowlist="127.0.0.1",
+        upstream_proxy_bypass_hosts=pattern,
+    )
+    _, _, kwargs = build_request(channel, RequestPlan(), {}, probe)
+    assert "proxy" not in kwargs, f"{pattern!r} was accepted but bypasses nothing"
+
+
 # --------------------------------------------------------- scope: per request
 
 

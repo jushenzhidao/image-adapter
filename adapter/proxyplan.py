@@ -33,10 +33,10 @@ from urllib.parse import urlparse
 
 from adapter.errors import ChannelConfigError
 
-#: The only wildcard, and it is a whole-pattern one: ``*`` means every host,
-#: ``*.example.com`` means that suffix. ``api.*.com`` is refused rather than
-#: accepted and quietly never matched -- the same rule, and the same reason, as
-#: the X-Model-Map catch-all.
+#: The two wildcard shapes, and both are whole-pattern ones: ``*`` means every
+#: host, ``*.example.com`` means that suffix. ``api.*.com`` is refused rather
+#: than accepted and quietly never matched (see ``_is_wildcard_shape``) -- the
+#: same rule, and the same reason, as the X-Model-Map catch-all.
 WILDCARD = "*"
 
 MODE_SHARED = "shared"
@@ -61,8 +61,36 @@ def parse_hosts(raw: str, header: str) -> tuple[str, ...]:
                 f"{header} entries must be bare hosts or *.suffix patterns",
                 header,
             )
+        if WILDCARD in pattern and not _is_wildcard_shape(pattern):
+            # Refused rather than kept. `host_matches` reads a pattern it does
+            # not recognise as a literal string, so `api.*.com` matches no host
+            # at all -- and an entry that matches nothing reads as "this host is
+            # excluded" while excluding nothing. A 400 naming the value is the
+            # only honest answer, exactly as with a partial glob in X-Model-Map.
+            raise ChannelConfigError(
+                f"{header} supports only '*', '*.suffix' or a bare host; "
+                f"{pattern!r} would never match",
+                header,
+            )
         patterns.append(pattern)
     return tuple(dict.fromkeys(patterns))
+
+
+def _is_wildcard_shape(pattern: str) -> bool:
+    """True for the only two shapes ``host_matches`` can act on.
+
+    ``*`` is every host and ``*.suffix`` is one suffix -- that is the whole
+    language. Anything else carrying a ``*`` (``api.*.com``, ``*.foo.*.com``,
+    or a bare ``*.`` with nothing after it) would fall through to the literal
+    comparison in ``host_matches`` and therefore match nothing at all, so
+    ``parse_hosts`` refuses it instead of storing it.
+    """
+    if pattern == WILDCARD:
+        return True
+    if not pattern.startswith(f"{WILDCARD}."):
+        return False
+    suffix = pattern[2:]
+    return bool(suffix) and WILDCARD not in suffix
 
 
 def host_matches(host: str, pattern: str) -> bool:
