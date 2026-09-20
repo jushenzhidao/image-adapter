@@ -1543,3 +1543,56 @@ def test_the_request_bookkeeping_does_not_outlive_the_response():
     ctx = FakeCtx(raw=SSE_OK.encode("utf-8"))
     _drive(ctx)
     assert q._REQUESTS == {}
+
+
+# ---------------------------------------------- 静默丢弃 ⇒ 500（让下游自己重试）
+
+def _no_recovery_http():
+    """兜底取图也拿不到（历史接口非 200）⇒ 逼到"上游确实什么都没给"。"""
+    return _recovery_http(chat_resp=FakeResp(500, "history unavailable"))
+
+
+def test_silent_drop_with_zero_data_lines_is_a_retryable_500():
+    """**静默丢弃**（200 回来、0 条 data 行、会话里也没登记）⇒ **500**，不是 502/4xx。
+
+    为什么是 500：`ctx.fail` 的约定与 `docs/06` 一致 —— **状态码就是给下游的重试信号**。
+    这种形状上游什么都不说就丢了（实测还会伴随 ~0.2s 返回），最正确的处置是**让 new-api 自己重试一次**，
+    而不是报成"不可重试"，也不是让调用方看到假的成功。
+    """
+    ctx = FakeCtx(raw=b'{"success":true}\n', http=_no_recovery_http())
+    with pytest.raises(AssertionError):
+        _drive(ctx)
+    assert ctx.failed[1]["status"] == 500, ctx.failed
+    assert ctx.failed[1]["err_type"] == "server_error"
+    assert ctx.failed[1]["code"] == "upstream_error"
+    assert "静默丢弃" in ctx.failed[0]
+
+
+def test_silent_drop_with_a_truly_empty_body_is_also_500():
+    """另一种到达形态：响应体**完全为空**（`raw_body` 为空 ⇒ 另一条分支）。同一处置。"""
+    ctx = FakeCtx(raw=b"", http=_no_recovery_http())
+    with pytest.raises(AssertionError):
+        _drive(ctx)
+    assert ctx.failed[1]["status"] == 500
+    assert "静默丢弃" in ctx.failed[0]
+
+
+def test_frames_but_no_url_is_still_502_not_500():
+    """守卫：**有 SSE 帧但没图**（生成被中断）不是"静默丢弃" ⇒ 保持 502（不诱导下游重试）。"""
+    ctx = FakeCtx(raw=NO_PICTURE, http=_no_recovery_http())
+    with pytest.raises(AssertionError):
+        _drive(ctx)
+    assert ctx.failed[1]["status"] == 502
+    assert "有 SSE 但无图片 URL" in ctx.failed[0]
+
+
+def test_waf_page_is_still_502_not_500():
+    """守卫：WAF 挑战页重试无用（同凭据同形态必再被拦）⇒ 保持 502。"""
+    ctx = FakeCtx(raw='<!doctype html><meta name="aliyun_waf_aa">'.encode(),
+                  http=_no_recovery_http())
+    with pytest.raises(AssertionError):
+        _drive(ctx)
+    assert ctx.failed[1]["status"] == 502
+    assert "WAF" in ctx.failed[0]
+
+

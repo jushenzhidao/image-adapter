@@ -213,6 +213,23 @@ def build_request(
         url = merge_url(url, RequestPlan(query=query))
 
     kwargs: dict[str, Any] = {"headers": headers}
+    if channel.proxy.covers(url):
+        # aiohttp takes the proxy per request, so one channel can leave from a
+        # different exit while every other channel stays direct -- no process
+        # session change, no second connection pool. The key is set only when
+        # the call is actually in scope: no header, or a host outside the
+        # channel's list, leaves every existing deployment byte-identical.
+        kwargs["proxy"] = channel.proxy.url
+        credentials = channel.proxy.credentials()
+        if credentials is not None:
+            # The request's session id, sent as the proxy login so the bridge
+            # can keep this request's calls on one upstream tunnel even when a
+            # connection is closed and re-established underneath. Written as a
+            # header rather than aiohttp's `proxy_auth`: that parameter is
+            # deprecated, and this is the exact header the bridge reads.
+            kwargs["proxy_headers"] = {
+                "Proxy-Authorization": aiohttp.encode_basic_auth(*credentials)
+            }
     if plan.raw is not None:
         kwargs["data"] = plan.raw
     elif plan.files is not None:

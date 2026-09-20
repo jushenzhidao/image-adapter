@@ -69,13 +69,29 @@ class FakeResp:
 
 
 class _CM:
-    def __init__(self, resp):
+    """Async context manager with optional in-flight hooks.
+
+    The hooks exist so a test can observe *how many* calls overlap, which is
+    the only way to tell a serialised hop from a concurrent one: the call
+    order looks exactly the same either way.
+    """
+
+    def __init__(self, resp, on_enter=None, on_exit=None):
         self.resp = resp
+        self._on_enter = on_enter
+        self._on_exit = on_exit
 
     async def __aenter__(self):
+        if self._on_enter is not None:
+            self._on_enter()
+        # A real yield: without one, `gather`ed tasks never interleave and every
+        # concurrency measurement reads 1.
+        await asyncio.sleep(0)
         return self.resp
 
     async def __aexit__(self, *exc):
+        if self._on_exit is not None:
+            self._on_exit()
         return False
 
 
@@ -90,6 +106,27 @@ class FakeHttp:
         self.posts: list[dict] = []
         self.puts: list[dict] = []
         self.sts_calls = 0
+        # In-flight high-water marks. `sts_max == 1` is the serialisation
+        # contract (a rotating exit must not be used twice at once); `put_max`
+        # is what proves the PUTs did *not* get serialised along with it.
+        self._sts_live = 0
+        self.sts_max = 0
+        self._put_live = 0
+        self.put_max = 0
+
+    def _sts_enter(self):
+        self._sts_live += 1
+        self.sts_max = max(self.sts_max, self._sts_live)
+
+    def _sts_exit(self):
+        self._sts_live -= 1
+
+    def _put_enter(self):
+        self._put_live += 1
+        self.put_max = max(self.put_max, self._put_live)
+
+    def _put_exit(self):
+        self._put_live -= 1
 
     def post(self, url, json=None, headers=None):  # noqa: A002 - aiohttp 形状
         self.posts.append({"url": url, "json": json, "headers": headers})
@@ -103,19 +140,21 @@ class FakeHttp:
             data["file_path"] = "webui/u1/input" + str(self.sts_calls) + ".png"
             data["file_url"] = base + "/input" + str(self.sts_calls) + ".png"
             data["file_id"] = "fid-" + str(self.sts_calls)
-            return _CM(FakeResp(200, json_module.dumps(doc)))
+            return _CM(FakeResp(200, json_module.dumps(doc)),
+                       self._sts_enter, self._sts_exit)
         return _CM(FakeResp(200, json_module.dumps(self.chat)))
 
     def put(self, url, data=None, headers=None):
         self.puts.append({"url": url, "data": data, "headers": headers})
-        return _CM(FakeResp(self.put_status, self.put_text))
+        return _CM(FakeResp(self.put_status, self.put_text),
+                   self._put_enter, self._put_exit)
 
 
 json_module = json  # aliased so FakeHttp.post reads naturally above
 
 
 class FakeCtx(MappingMixin):
-    """ctx 站位。继承真的 MappingMixin（ctx.parse_size 是框架件，桩里不留副本）。"""
+    """ctx 站位。继承真的 MappingMixin（框架件，桩里不留副本）。"""
 
     def __init__(self, options=None, http=None, raw=None, image_bytes=None):
         self.options = options or dict(CREDS)
@@ -214,6 +253,29 @@ def test_two_images_both_upload_in_order():
     assert [f["url"].rsplit("/", 1)[-1] for f in files] == [
         "input1.png", "input2.png"]
     assert [f["id"] for f in files] == ["fid-1", "fid-2"]
+
+
+def test_getsts_token_is_serial_while_the_puts_stay_concurrent():
+    """The one hop that goes through a rotating exit must not overlap itself.
+
+    2026-09-19: the materialisation is three stages, not one fanout, because
+    `getstsToken` is the only call of the three that the channel's proxy
+    carries (the PUTs are on the bypass list). Run two of them at once and a
+    single client request leaves from two addresses, which is exactly what a
+    per-request rotation is supposed to rule out.
+
+    Order alone cannot see this: concurrent and serial calls are recorded in
+    the same sequence. The in-flight high-water mark can.
+    """
+    ctx = FakeCtx()
+    body = _run(ctx, {"prompt": "merge these", "image": [IMG_A, IMG_B, IMG_B]})
+
+    assert len(body["messages"][0]["files"]) == 3
+    assert ctx.http.sts_max == 1, "getstsToken must not overlap itself"
+    assert ctx.http.put_max > 1, "the PUTs are direct and should still fan out"
+    # Serialising the middle stage must not drop or reorder anything.
+    assert [f["id"] for f in body["messages"][0]["files"]] == [
+        "fid-1", "fid-2", "fid-3"]
 
 
 def test_image_mode_first_uploads_only_the_first():

@@ -109,7 +109,7 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
         limit = self.settings.max_asset_bytes
         try:
             async with asyncio.timeout(self.settings.image_download_timeout):
-                async with self.http.get(safe_url) as resp:
+                async with self.download_http.get(safe_url) as resp:
                     if resp.status >= 400:
                         raise UpstreamError(
                             f"Image download failed with status {resp.status}",

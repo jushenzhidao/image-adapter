@@ -70,6 +70,27 @@ class Settings(BaseSettings):
     # Comma-separated hosts; empty means any public host is allowed.
     upstream_host_allowlist: str = ""
 
+    # --- Outbound proxy (X-Upstream-Proxy) ---------------------------------
+    # A proxy terminates the connection, so it sees everything the adapter
+    # sends -- the vendor credential included. The header is caller-supplied,
+    # and it is not an SSRF-only concern: a hostile value exfiltrates upstream
+    # credentials rather than merely scanning the network. Hence the inverted
+    # default -- an empty list does not mean "any host is fine", it means the
+    # header is refused outright. A deployment opts in by naming its proxies.
+    # Comma-separated hosts; "*" is an explicit, deliberate wildcard. Loopback
+    # and private hosts are permitted here (the deployment this exists for is a
+    # local SOCKS-to-HTTP bridge), and SOCKS is refused by scheme -- see
+    # adapter/urlguard.py.
+    upstream_proxy_allowlist: str = ""
+
+    # Host patterns that must stay direct even when a channel has a proxy --
+    # an object-store upload is the case this exists for: it is not the traffic
+    # the exit was bought for, and megabytes through a pool only get slower.
+    # Comma-separated, `*.suffix` allowed. A deployment-level list rather than a
+    # per-channel header, because the answer is the same for every channel and
+    # per-channel copies drift.
+    upstream_proxy_bypass_hosts: str = ""
+
     # --- Timeouts ----------------------------------------------------------
     # Six bounds apply to one request and they are kept separate on purpose:
     # which one fired is what the caller sees, so merging them would make the
@@ -397,6 +418,14 @@ class Settings(BaseSettings):
     def upstream_host_set(self) -> frozenset[str]:
         return frozenset(
             h.strip().lower() for h in self.upstream_host_allowlist.split(",") if h.strip()
+        )
+
+    @property
+    def upstream_proxy_host_set(self) -> frozenset[str]:
+        return frozenset(
+            h.strip().lower()
+            for h in self.upstream_proxy_allowlist.split(",")
+            if h.strip()
         )
 
     @property

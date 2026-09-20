@@ -224,6 +224,13 @@ N=2 → **2.00×**、N=5 → **4.77×**、N=10 → **4.97×**（在 `fanout_conc
 🔴 **且它按账号/身份、不按出口 IP**（三臂同窗口对照：账号在直连与系统代理两个 IP 上**都被拒**，
 而**同机同 IP 的访客身份照旧 OK**；又：全新访客在**两个不同 IP** 上都恰好是 **5**，命中后跨出口仍拒）
 ⇒ **换出口无用，且换 IP 不能重置窗口**，处置是**等窗口或换身份**。
+🔴 **L6 已验（2026-09-19 14:47）**：**12.7 小时前**上传的 `file_id` 被 `completions` **接受且被消费**
+（用历史会话里那条老 `files[]` 原样提交，产物＝参考图主体＋提示词要求的纯红背景）
+⇒ **上传缓存/预生成的前置成立**：缓存键取内容哈希、值取 `files[]`（关键是 `id`），
+复用经 `getfilelink` 重签 url，TTL 先取 6 小时量级（下界已证 12.7h、上界未知）。
+证据：`reports/2026-09-19_qwen-stale-fileid/`。
+⚠️ 手搓探针务必逐项对齐 `_headers` —— 漏 `Connection`/`X-Accel-Buffering` 会得到
+**200 + 空响应体**的静默丢弃，看着像"陈旧被拒"（本轮先踩后修）。
 ✅ **上传跳的限流已按瞬态处理**（2026-09-19，`hop="upload"`）：该步不计费 ⇒ 额度措辞在此不成立，
 不会被判成 429「身份当日耗尽」。证据：`reports/2026-09-19_qwen-multi-concurrency-speed/` §5.3。
 🔴 **冷测预算（静默后逐次计数、命中即停）：账号 20 次 / 访客身份 5 次**；
@@ -379,6 +386,14 @@ AttributeError）。它**只在本来就要失败的路径上**跑：把「已�
 
 ⇒ 本脚本按**文案**判定：只有实测的日额度文案映射 **429 `upstream_quota_exhausted`**（不重试），
 其余走 **502 `upstream_error`**（可重试）并在消息里写明"不是该身份当日额度耗尽"。
+🔴 **2026-09-19 补第二处：静默丢弃 ⇒ 500**。上游有时**200 回来却什么都不说**：0 条 `data` 行
+（或响应体完全为空），且**会话里连消息都没登记**（实测伴随 ~0.2s 返回；见
+`reports/2026-09-19_qwen-stale-fileid/` 的第一发）。这种形状现在给 **500 `server_error`**
+（`code=upstream_error`）而不是 502 —— 依据是 `ctx.fail` 的约定与 `docs/06` 的同一用法：
+**状态码就是给下游的重试信号**（4xx＝别重试、5xx＝可重试）⇒ 让 **new-api 自己重试一次**。
+守卫（都钉了单测）：**有 SSE 帧但无图**（生成被中断）与 **WAF 挑战页**保持 502（重试无用）。
+⇒ 两类并排看：**静默丢弃＝500（可重试）／有帧无图与 WAF 页＝502** ——
+判据始终是同一句话：**状态码就是给下游的重试信号**。
 🔴 **2026-09-19 补上一维：文案判定还要看「哪一跳」**（`_fail_qwen_error(..., hop=)`）。
 **上传跳（`getstsToken`）不计费** ⇒ 它上面出现的任何"额度"措辞都不可能是「生图额度耗尽」，
 一律按瞬态处理（消息写明"上传不计费 ⇒ 与生图额度无关"）。否则一次大 N 多图的**上传频控**
@@ -526,6 +541,8 @@ AttributeError）。它**只在本来就要失败的路径上**跑：把「已�
 | **账号门（pair 形态 `<user>\|<password>`）出图，且走的是账号门** | ✅ **实测**（2026-09-19 01:43；门归属用产物 `resource_user_id` ＝ 账号 JWT `id` 判，不是靠"200"推断；`reports/2026-09-19_qwen-account-pair-auth/`） |
 | **token-only jar 可打生成端点** | **实测**（同上；推翻 §3.0 的普遍化表述，见 §3.0 的更正段） |
 | **2K 档实测**（`3.0-pro` + `auto` ⇒ 1792×2400；`hw` 两例均为 `[高,宽]`） | **实测**（2026-09-19 01:57；`reports/2026-09-19_qwen-key-jwt/` §7） |
+| **四个入口折叠打真上游**（`edits` / `chat` / `responses` 各 200，脚本自报 `chat_type=image_edit`、
+`input_images=1`，产物主体保留＋背景按提示词改变） | ✅ **实测**（2026-09-19 14:07，各 1 发；`reports/2026-09-19_qwen-frontdoors/`） |
 | **四档密钥形态均可作生产配置**（jwt / jar / empty 各 0 次 signin，pair 1 次；四档均账号门） | **实测**（2026-09-19 01:43–02:02；见各 `reports/2026-09-19_qwen-*`） |
 | **会话兜底取图真的救回过一发**（客户端拿不到 URL，只读找回） | ✅ **实测**（同上；生成已计费成功、客户端落盘崩在这一侧） |
 | **瞬时过载与额度耗尽是两支**（前者 502 可重试、后者 429 不可） | **实测**（同上 §7.1：同一账号同日先被"服务访问量较大"拒、隔 30s 再发即成功） |
@@ -581,6 +598,15 @@ AttributeError）。它**只在本来就要失败的路径上**跑：把「已�
 | 2026-09-18 | 首版（t2i + image_edit、两门、四形态密钥、`identity_url`/`token_url`） |
 | 2026-09-18 晚 | **合并反向代理当晚的新实测**：错误两条投递通道（流内 `error` 帧）并入 `_fail_qwen_error` 收口；额度两个 `code` 按**文案**区分日额度/瞬时过载（§6.0）；补 §5.1 分辨率实测；证据等级表按新实测改判；§9 增「并发出图」非目标 |
 | 2026-09-18 深夜 | `-pro` + 显式像素的护栏落地（§5.1）；框架下载判据改为按 magic bytes（`adapter/ctxapi/image_ref.py`，见 §11 ② 的落地说明） |
+| 2026-09-19 15:0x | ✅ **静默丢弃 ⇒ 500（可重试）**：上游 200 但 0 条 `data` 行 / 空响应体且会话未登记时，
+不再报 502，而是 500 `server_error`⇒ 让 new-api 自己重试；有帧无图 / WAF 页仍 502（守卫 2 条）。
+摘要 `1bca6201…`→`26687fc6…` |
+| 2026-09-19 14:47 | ✅ **L6：陈旧 `file_id` 被接受且被消费**（12.7 小时前的上传，原样引用即可出图）
+⇒ 上传缓存可行；新增 `tools/probe_qwen_stale_fileid.py`。⚠️ 第一发因探针漏两个写路径必备头而
+"200+空体静默丢弃"，补 `Connection`/`X-Accel-Buffering` 后一发即过 |
+| 2026-09-19 14:07 | ✅ **四个入口折叠打真上游**：`/v1/images/edits`、`/v1/chat/completions`、`/v1/responses`
+各自 200（16.5–16.9s），trace 都是 `chat_type=image_edit` + `input_images=1`，产物为**同一主体、背景按提示词
+换成沙漠** ⇒ 折叠**同时**带上 prompt 与 image。新增工具 `tools/qwen_frontdoor_smoke.py`（`--plan` 零成本自检） |
 | 2026-09-19 03:0x | ✅ **修上传跳的错误映射**：给 `_fail_qwen_error` 加 `hop` 维度 ——
 上传跳（`getstsToken`，不计费）的 `RateLimited`/额度措辞**一律按瞬态 502**，不再可能被判成
 429「该身份当日额度耗尽」（生成跳的 429 判定不变）。新增 2 条单测 + 变异自证；摘要
@@ -594,6 +620,8 @@ AttributeError）。它**只在本来就要失败的路径上**跑：把「已�
 | 2026-09-19 | **按参考仓逐条对齐**（§11 ⑤–⑨）：写类请求头补 `Accept`/`Connection`/`X-Accel-Buffering`（§4）；`response_format` 支持 `b64_json` 并顺带获得死链判据（§4）；无图 URL 时兜底读 `GET /v2/chats/<id>`（§4）；x5sec 的 `code` 形态并入同一退避窗（§6.1）；t2i 的 `timestamp` 由秒改毫秒（§3） |
 | 2026-09-19 凌晨 | 🔴 **§6.3 更正**：早期"出口被累计惩罚 / 补头无用"是**探针自己缺三个头**造成的假阴性 ⇒ 出口与建会话都通；唯一还挡着的是**生成端点的 x5sec**。同步修 `tools/qwen_egress_check.py`（补头 + 新增"匿名被拒=出口通"判定）与 `tools/qwen_guest_smoke.py`（`import adapter` 的 sys.path） |
 | 2026-09-19 01:11–01:18 | ✅ **访客通路首次真实出图**：三种形态 × 1K，**6/6 全通**（有头 3 + 无头 3），PNG 1024×1024；生成端点的 x5sec **已恢复**（§6.3 追加复核）。`2026-09-18_qwen-guest-blocked` 的「上游已关闭 guest 通路」**作废**。工具再修两处：`qwen_guest_smoke.py` 默认引擎由**有头**改**无头**（与铸造器/参考仓同向）、入图张数打印按形态计数；§8 定「生产无头、有头仅诊断」 |
+| 2026-09-19 16:1x | ✅ **出站代理扩到「每请求轮换」**：新增 `X-Upstream-Proxy-Mode`（`shared` / `per-request`）与 `UPSTREAM_PROXY_BYPASS_HOSTS`（部署级旁路，OSS 直连）；`ctx.http` 改走 `ProxiedHttp` 门面（脚本调用也带代理），素材下载改走 `download_http`（**永不代理**）；pipeline 在 per-request 模式为每个请求建独立 session 并在 `ctx.close()` 关闭；新增本地桥 `tools/socks_http_bridge.py`（SOCKS5→HTTP，纯 stdlib，按 session 记隧道 ＋ bypass ＋ `/health`）。qwen 脚本物化段改**三阶段**（下载并发 / `getstsToken` 串行 / PUT 并发）⇒ 摘要 `1bca6201…`→`b45e148e…`（manifest 已登记；**改 manifest 需重启**）。新增测试：`test_upstream_proxy.py`（24 条）/ `test_socks_http_bridge.py`（10 条）/ `test_proxy_rotation.py`（4 条，真 socket ＋ CONNECT ＋ 测试内自签证书）。🔴 **变异自证抓出两处真问题**：①「白名单默认关闭」的断言只查键名（专用与通用消息同键名）⇒ 改严；② 集成测试用 http 目标时 **proxy headers 根本不发送** ⇒ 那条断言是**假绿**（匿名 session 也复用隧道），改成 https 后又发现「出站连接数」不足以验证 session 传递 ⇒ 新增 `/health` 的 `recent_sessions` 断言才真正抓住变异 |
+| 2026-09-19 15:0x | ✅ **渠道级出站代理落地**（框架通用，不属 qwen 契约；qwen 语境见 §11 ④）：新增独立渠道头 **`X-Upstream-Proxy`** ＋ 设置 `UPSTREAM_PROXY_ALLOWLIST`（**默认空＝拒绝该头**，与 `X-Upstream-Url` 的取向相反）；`build_request` 以 aiohttp **per-request `proxy=`** 注入，只影响该渠道；非法值在任何上游调用之前 400 `channel_config_error`，trace 记**脱敏**后的 `proxy`（`redact_proxy` 去掉 userinfo）。**SOCKS 按名称明确拒绝**（aiohttp 无 SOCKS transport ⇒ 静默直连＝「看着正常的错出口」），须先跑本地 SOCKS→HTTP 桥。新增 `tests/unit/test_upstream_proxy.py`（13 条，含**真 socket** 证明确实经代理）与 `tests/unit/test_channel_headers_contract.py`（把「解析器 `H_*` 常量 / FastAPI 声明 / CORS 允许清单」三份头清单钉在一起；顺带把硬编码的 `authorization` 提成 `H_AUTHORIZATION` 才使三方可比）。**变异自证 4 项全部判红**：去掉注入、去掉白名单默认关闭、去掉 SOCKS 专门分支、CORS 漏登记 —— 其中「白名单默认关闭」**第一次没拦住**（专用消息与通用消息都含同一个键名，断言无法区分）⇒ 断言改严后复验通过。⚠️ 未做：aiohttp 按 proxy 复用连接 ⇒ 池子「每连接换 IP」不自动成立 |
 
 ## 11. 决策与落地（来自反向代理 2026-09-18 晚的证据）
 
@@ -602,11 +630,13 @@ AttributeError）。它**只在本来就要失败的路径上**跑：把「已�
 | ① | **`-pro` 模型 + 显式像素**（会挂满 300s） | ✅ **已落地**：归一到 `auto` + `size_guard` trace 记录（§5.1）。选它而不是 400，是为与脚本既有的「size 从不 400」取向一致；代价是丢弃调用方写的像素（上游本来也不接受） |
 | ② | 框架下载路径按 `Content-Type: image/*` 拒图 | ✅ **已落地**：改按 **magic bytes** 判 —— 头说"不是图"**且**字节也没有图片 magic 才拒；空头与 `image/*` 头行为不变 ⇒ 拒绝面严格小于原判据（真图不再被 `application/octet-stream` 误杀，HTML/文本仍被拒）。`download_image` 的 span 与错误码不变 |
 | ③ | `tools/identity_service.py` 缺**验活/续期**能力（参考仓 `ident_pool.py` 有 `verify`/`refresh`/`stats`） | ⏸ **暂不做**：当前只能靠 `--max-uses 4` 估计退役，看不到真实存活；补齐是新增能力而非修缺陷 |
-| ④ | **"用代理池做出站"在本仓结构上不可用**（2026-09-19 核实） | ⏸ **未做**：①`ctx.http` 是 `aiohttp.ClientSession`，**不支持 SOCKS**（无 `aiohttp_socks`），且当前是 `trust_env` 默认关 ⇒ 它既不读系统代理也不读 `HTTP_PROXY`；②引擎没有"出站代理"选项。⇒ 池子（`pool.livetest.cn:2088`，**只有 SOCKS5**）现在**无法**成为渠道出口。要用它得先加能力：本地 **SOCKS→HTTP 桥**（纯 stdlib 可写）+ 引擎侧一个代理开关（或渠道选项），属新能力，需需求方点头（§3.2 记的"B 方案"走的是**登录工具侧**，不是出站数据面）。⚠️ 池子本身是**可用**的（2026-09-19 00:35 带浏览器 jar 实测 6/6 拿到 chat id，§6.3），所以加完能力就能验证 |
+| ④ | **出站代理**：`X-Upstream-Proxy` ＋ `-Mode: per-request` ＋ 本地桥（2026-09-19 落地） | ✅ **已落地，含每请求轮换**：独立渠道头 `X-Upstream-Proxy`（设 `UPSTREAM_PROXY_ALLOWLIST` 放行，**默认空＝拒绝该头**）＋ `X-Upstream-Proxy-Mode: per-request`；覆盖**该渠道的全部出站**（引擎代发 ＋ 脚本经 `ctx.http`，由 `ProxiedHttp` 门面按 host 注入 `proxy` / `proxy_headers`）。两条**不走**：素材下载（`ctx.download_http` 无代理视图，目标是调用方给的 URL）与 `UPSTREAM_PROXY_BYPASS_HOSTS` 里的 host（对象存储上传）。轮换机制 ＝ **每个客户端请求一个 HTTP session**（`AdapterContext._request_http`，在 `ctx.close()` 关闭）⇒ 下个请求不可能继承上一个的出口。非法值在任何上游调用之前 400 `channel_config_error`；trace 记脱敏 `proxy` ＋ `proxy_session`。⚠️ **SOCKS 仍被明确拒绝**（aiohttp 无 SOCKS transport）⇒ 必须先跑 `tools/socks_http_bridge.py`（纯 stdlib；按 session 记隧道、支持 bypass、`/health` 报计数）。🔴 **两条已实测的边界**：① aiohttp **只对 https（CONNECT）发** `proxy_headers` ⇒ 用 http 目标写的断言会**假绿**（集成测试因此改用 https ＋ 测试内自签证书）；② **连接中途断开后重连＝换 IP**（隧道包着有状态的 TLS 会话，不能跨客户端连接复用）⇒ 「同一请求全程一个 IP」只在连接不断时成立，要真正钉住需池子支持 session-key 粘性。⚠️ 且别指望它解决额度：生成限流**按账号/身份、不按出口 IP**（§4、§6），换出口只对 `signin` 的 IP 墙有意义（已由 `token_service` 覆盖） |
 | ⑤ | **写类请求头与参考仓 `build_headers` 对齐**（`Accept` / `Connection` / `X-Accel-Buffering`） | ✅ **已落地**（2026-09-19，§4）。依据是参考仓 §10.19 的根因更正 + 「写类请求必备头」附录；与抓包头集合的差集**只有这三条**，`Content-Type` 经实测**不是**缺口。行为代价为零。⚠️ 它与本仓生成端点当前的 x5sec（§6.3）**不是**一对因果关系，别互相套用 |
 | ⑥ | **`response_format`（`url` ⇄ `b64_json`）** | ✅ **已落地**（2026-09-19，§4）。`url`（或不说）＝上游原生载体零成本直通；`b64_json` ＝逐张下载并编码。选它而不是"永远直通"，是因为**下载即死链判据**：§3.0 ⑦ 的 404 死链在本仓会变成明确失败，不再被当成功转出。代价＝要 base64 的调用方每张多一次 GET。**默认不变**，所以存量渠道行为无变化 |
 | ⑦ | **无图 URL 时读 `GET /v2/chats/<id>` 兜底** | ✅ **已落地**（2026-09-19，§4）。只读、**零额度**、只在失败路径上跑。刻意**不**依赖参考仓那个**未验证**的「断流后上游续跑」假设 —— 本仓读的是**已读完**的流 |
 | ⑧ | **x5sec 的 `code` 形态**（`FAIL_SYS_USER_VALIDATE` / `RGV587`） | ✅ **已落地**（2026-09-19，§6.1）。此前只有 `{"ret":[…]}` 会记退避窗；`code` 形态落进通用 502 **不记窗** ⇒ 下一发立刻再打上游，而「命中后连发只会加深」正是参考仓的结论 |
+| ⑬ | **静默丢弃的状态码**（200 + 无内容 ⇒ 谁重试） | ✅ **已落地**（2026-09-19）：**500 `server_error`** ⇒ new-api 自己重试；有帧无图 / WAF 仍 502 |
+| ⑫ | **上传缓存/预生成**（重复图不重传 ⇒ 直接省掉频控预算里的一次 mint） | ✅ **前置已验**（2026-09-19，L6）：陈旧 `file_id` 被接受且被消费（≥12.7h）。**待做**：实现（内容哈希 → `files[]`，落 `ctx.cache` 带 TTL，复用重签 url） |
 | ⑪ | **上传跳的 `RateLimited` 误判**（可能被判成 429「身份当日耗尽」） | ✅ **已落地**（2026-09-19）：`
 _fail_qwen_error(..., hop=)`；上传不计费 ⇒ 该跳一律瞬态。**触发条件已实测**：访客 6 张/账号 21 次即撞 |
 | ⑩ | **垫图并发物化**（qwen 此前是四渠道里唯一串行的一档） | ✅ **已落地**（2026-09-19，§4）：`ctx.fanout` ＋保序＋限量＋最早失败原样抛；单张走串行路径故行为不变。⚠️ 随之而来的一条**测试纪律**：「PUT 到达顺序」不再是可观测量，顺序要断在 `files[i]` ↔ 它上传的字节上 |

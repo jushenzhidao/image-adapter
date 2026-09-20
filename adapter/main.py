@@ -13,7 +13,7 @@ Two deliberate choices are worth knowing before editing this file:
   ``response_model`` to a route that returns a ``dict`` would silently start
   trimming unknown fields.
 * **Every channel header is declared optional.** ``channel_contract`` exists so
-  the eleven headers appear in /docs and can be exercised from there, not to
+  the thirteen headers appear in /docs and can be exercised from there, not to
   validate them. Required-header failures stay ``channel_config_error`` (400,
   OpenAI envelope) from ``adapter/channel.py`` instead of a FastAPI 422.
 """
@@ -86,6 +86,21 @@ async def channel_contract(
     x_upstream_method: Annotated[
         str | None, Header(alias="X-Upstream-Method", description="默认 POST")
     ] = None,
+    x_upstream_proxy: Annotated[
+        str | None,
+        Header(
+            alias="X-Upstream-Proxy",
+            description="本渠道单独走出的 HTTP 代理（如 http://127.0.0.1:3128）；"
+            "默认关闭，需 UPSTREAM_PROXY_ALLOWLIST 放行；不支持 SOCKS",
+        ),
+    ] = None,
+    x_upstream_proxy_mode: Annotated[
+        str | None,
+        Header(
+            alias="X-Upstream-Proxy-Mode",
+            description="shared（默认，复用连接）或 per-request（每次客户端请求新连接、新出口）",
+        ),
+    ] = None,
     x_auth_emit: Annotated[
         str | None,
         Header(
@@ -110,7 +125,7 @@ async def channel_contract(
 ) -> None:
     """The channel contract expressed as code rather than prose.
 
-    README documents these eleven headers in a table. Declaring them here means
+    README documents these thirteen headers in a table. Declaring them here means
     the contract cannot drift from the implementation, and /docs doubles as a
     test client for it: fill the fields in and send.
 
