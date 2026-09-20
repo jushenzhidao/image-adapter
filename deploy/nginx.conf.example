@@ -95,9 +95,9 @@ server {
         # gunicorn, so a reaped worker's own error reaches the caller instead of
         # an nginx-generated 504 that hides which layer failed.
         #
-        # Sized for the shipped .env: UPSTREAM_TIMEOUT=300 (a 2K generation
+        # Sized for the shipped .env: UPSTREAM_TIMEOUT=360 (a 2K generation
         # measures 27~82s against Ark, so 60s truncates slow successes) and
-        # GUNICORN_TIMEOUT=600. Raise this whenever those move -- and keep this
+        # GUNICORN_TIMEOUT=900. Raise this whenever those move -- and keep this
         # value strictly ABOVE GUNICORN_TIMEOUT, never equal to it: nginx's
         # default 60s (and an equal value) makes nginx win the race, and then
         # the caller gets an nginx-generated 504 that hides which layer failed.
