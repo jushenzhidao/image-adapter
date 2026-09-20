@@ -1405,6 +1405,26 @@ QUOTA_CODES = ("RateLimited", "quota_limit")
 #: and paid exactly that).
 QUOTA_WORDINGS = ("额度已用完", "额度用完", "额度已耗尽")
 
+#: The **content-moderation** marker, now measured verbatim (2026-09-19):
+#:
+#:     data: {"error": {"code": "data_inspection_failed", "modality": ["text"],
+#:                      "stage": "input",
+#:                      "details": "内容安全警告：输入数据可能包含不适当的内容！"},
+#:            "response_id": "...", "response_index": 0}
+#:
+#: The code sits in `error.code` -- the frontend's `applyGreenNetParentFix` is what turns
+#: it into the UI's `green_error` (reverse-proxy `qwen-image-vision-api.md` §5, from the
+#: bundle; the bundle reading said `error_code`, the frame says `code`, so **both
+#: spellings are checked**). Reading only one lands this in the generic 502 below, which
+#: is exactly backwards for a refusal that can never succeed on a retry.
+#:
+#: `modality` says *what* was flagged (text/image) and `stage` says *where* (input/output)
+#: -- both go into the trace note, because "the prompt was refused" and "the picture was
+#: refused" need different advice.
+CONTENT_CODES = ("data_inspection_failed",)
+#: 自然语言层的拒答词**不再由本脚本持有**：它属于所有渠道，落在
+#: `capabilities/_shared.json`（改数据不发版），由 `ctx.matched_moderation` 统一匹配。
+#: 这里只留**厂商专属**的 code —— 跨厂商共享一张 code 表才是真正的猜。
 
 
 def _fail_qwen_error(ctx, doc, *, hop="generate"):
@@ -1435,6 +1455,11 @@ def _fail_qwen_error(ctx, doc, *, hop="generate"):
         later" (502). `details` decides; only the measured quota wording maps
         to 429, and the transient arm says so in as many words so the next
         reader does not "fix" it back.
+
+    **Content moderation is the deliberate opposite of "treat unknown as transient"**:
+    `data_inspection_failed` means the same prompt will be refused again, so it maps to
+    a 400 rather than a 5xx -- retrying it spends a generation and teaches the caller a
+    false "try again later". See CONTENT_CODES.
 
     The x5sec shape is a bare `{"ret": [...]}` with no `data` at all, which is
     why it needs its own branch instead of falling through to "carried no image
@@ -1486,6 +1511,20 @@ def _fail_qwen_error(ctx, doc, *, hop="generate"):
         shown = (json.dumps(ret, ensure_ascii=False)[:160] if ret
                  else "code=" + code)
         _fail_upstream(ctx, "qwen x5sec 风控/限流: " + shown + hint)
+    if ctx.matched_moderation(doc, codes=CONTENT_CODES):
+        # 🔴 **内容审核未通过 ⇒ 400，不是 5xx**。判定与出口都由框架 helper 收口
+        # （`ctx.matched_moderation` / `ctx.fail_moderation`，见 `adapter/ctxapi/moderation.py`），
+        # 于是三个渠道对客户端的说法天然一致：**状态码就是给下游的重试信号**，
+        # 而这一类和"静默丢弃"正相反 —— 同一个 prompt 重试**必然**再被拒。
+        # note 里带厂商事实：modality 说**被拒的是什么**（text/image）、stage 说拒在**输入还是输出**，
+        # 两者决定给调用方的建议（改提示词 vs 换素材）。
+        ctx.fail_moderation(
+            "qwen 内容审核未通过（" + (code or err_code or "content_filter")
+            + (("：" + details) if details else "") + "）",
+            error_code=(code or err_code),
+            modality=",".join(str(x) for x in (data.get("modality") or []))[:40],
+            refused_at=str(data.get("stage") or "")[:16],
+            details=details[:120])
     if code in QUOTA_CODES or "额度" in details:
         if hop == "generate" and any(w in details for w in QUOTA_WORDINGS):
             # The daily quota, bound to the device identity rather than the IP

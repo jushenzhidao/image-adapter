@@ -118,6 +118,28 @@ def lookup(vendor: str, model: str | None, roots: tuple[Path, ...]) -> dict | No
     return {"model": name, **facts}
 
 
+#: Facts that belong to **every** vendor rather than one of them. Today that is the
+#: natural-language vocabulary of a safety refusal: the phrasing is ordinary Chinese
+#: ("内容安全警告…"), not a vendor's private string, and every channel must recognise
+#: the same one -- a per-vendor copy would drift exactly where uniformity matters.
+SHARED_TABLE = "_shared.json"
+
+
+def shared_facts(roots: tuple[Path, ...]) -> dict:
+    """The cross-vendor table (``capabilities/_shared.json``), or ``{}``.
+
+    Same forgiving contract as ``lookup``: absent or malformed is "no facts", never
+    an error, and the same mtime-validated cache means a hot-fix is picked up without
+    a restart. Roots follow ``capability_roots`` order, so an overlay can override
+    the shipped table.
+    """
+    for root in roots:
+        table = _read(root / SHARED_TABLE)
+        if table is not None:
+            return table
+    return {}
+
+
 def known_models(vendor: str, roots: tuple[Path, ...]) -> tuple[str, ...]:
     """Every model id with facts in this vendor's table (empty when there are none)."""
     for root in roots:

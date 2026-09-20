@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from adapter.ctxapi.mapping import MappingMixin
+from adapter.ctxapi.moderation import ModerationMixin
 from adapter.sandbox import scan_source
 from adapter.utils.fanout import fanout as fanout_all
 
@@ -153,8 +154,14 @@ class FakeHttp:
 json_module = json  # aliased so FakeHttp.post reads naturally above
 
 
-class FakeCtx(MappingMixin):
-    """ctx 站位。继承真的 MappingMixin（框架件，桩里不留副本）。"""
+class _FakeSettings:
+    """`ctx.settings` 站位：只给 `ModerationMixin` 用的 `capability_roots`（空＝无能力表）。"""
+
+    capability_roots: tuple = ()
+
+
+class FakeCtx(MappingMixin, ModerationMixin):
+    """ctx 站位。继承真的 MappingMixin 与 ModerationMixin（都是框架件，桩里不留副本）。"""
 
     def __init__(self, options=None, http=None, raw=None, image_bytes=None):
         self.options = options or dict(CREDS)
@@ -162,6 +169,7 @@ class FakeCtx(MappingMixin):
         self.upstream_raw = raw
         self.upstream_error = None   # 引擎 4xx 重试前写入
         self.upstream_url = "https://chat.qwen.ai/api/v2/chat/completions"
+        self.settings = _FakeSettings()
         self.emitted: list[dict] = []
         self.failed = None
         self.request_id = "req-1"

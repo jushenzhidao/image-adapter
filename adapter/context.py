@@ -30,6 +30,7 @@ from adapter.ctxapi import (
     FaultMixin,
     ImageRefMixin,
     MappingMixin,
+    ModerationMixin,
     PlanMixin,
     RequestPlan,
     StorageMixin,
@@ -332,6 +333,7 @@ class AdapterContext(
     FanoutMixin,
     BudgetMixin,
     PlanMixin,
+    ModerationMixin,
     FaultMixin,
     ContextCore,
 ):

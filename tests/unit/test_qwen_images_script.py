@@ -22,6 +22,7 @@ import pytest
 
 from adapter.ctxapi.codec import CodecMixin
 from adapter.ctxapi.mapping import MappingMixin
+from adapter.ctxapi.moderation import ModerationMixin
 from adapter.errors import UpstreamError
 from adapter.sandbox import scan_source
 from adapter.utils.fanout import fanout as fanout_all
@@ -173,11 +174,23 @@ class FakeLogfire:
         self.notes.append({"message": message, **attrs})
 
 
-class FakeCtx(MappingMixin, CodecMixin):
+class _FakeSettings:
+    """`ctx.settings` 站位：只提供 `ModerationMixin` 要读的 `capability_roots`。
+
+    留空元组＝"没有能力表"，于是共享词表走 mixin 自带的**实测默认**——正是数据文件缺失时
+    生产里的行为，单元测试不该依赖仓库里那份 JSON 的内容。
+    """
+
+    capability_roots: tuple = ()
+
+
+class FakeCtx(MappingMixin, CodecMixin, ModerationMixin):
     """ctx 站位。继承**真的** MappingMixin：`ctx.parse_size` 是框架件，桩里不该有副本，
     否则尺寸方言的回归会在框架与桩各测一遍、而且两边可以漂移。
 
-    `CodecMixin` 同为真件（`encode_b64` / `sniff_mime` 是纯函数）。下载与外呼 fan-out
+    `CodecMixin` 同为真件（`encode_b64` / `sniff_mime` 是纯函数）。
+    `ModerationMixin` 也是真件：审核判定与出口契约**只在框架里有一份**（判定用哪张词表、
+    出口给什么状态码都是契约），桩里再抄一份就等于把契约测成两份、还能各自漂移。下载与外呼 fan-out
     则是**替身**：这里钉的是脚本怎么用它们的返回值，不是框架的判据
     （`download_image` 的 SSRF / 体积 / magic bytes 在 `tests/unit/test_image_ref.py`）；
     并发度不是脚本的语义，故 fan-out 走真原语、限 5。
@@ -193,6 +206,7 @@ class FakeCtx(MappingMixin, CodecMixin):
         self.upstream_raw = raw
         self.upstream_error = None   # 引擎在 4xx 重试前写入；脚本据此作废缓存的 JWT
         self.upstream_url = "https://chat.qwen.ai/api/v2/chat/completions"
+        self.settings = _FakeSettings()
         self.emitted = []
         self.failed = None
         self.request_id = "req-1"
@@ -1596,3 +1610,79 @@ def test_waf_page_is_still_502_not_500():
     assert "WAF" in ctx.failed[0]
 
 
+# ------------------------------------------- 内容审核未通过 ⇒ 400（不可重试）
+
+def test_content_refusal_as_a_stream_error_frame_is_400_not_5xx():
+    """`error.error_code == "data_inspection_failed"` ⇒ **400 `content_filter`**。
+
+    依据与"静默丢弃 ⇒ 500"是同一条 doctrine、但方向相反：**状态码就是给下游的重试信号**。
+    审核拒答**同 prompt 必再被拒** ⇒ 报 5xx 只会让 new-api 白烧一次生成，
+    还让调用方以为"稍后能成"。OpenAI 里这一类就叫 `content_filter`。
+
+    ⚠️ 该标志走的是 `error_code` 字段（**不是** `code`）—— 只读 `code` 会落进通用 502。
+    """
+    frame = (b'data: {"error": {"error_code": "data_inspection_failed", '
+             b'"message": "\\u5185\\u5bb9\\u5ba1\\u6838\\u672a\\u901a\\u8fc7"}}\n')
+    ctx = FakeCtx(raw=frame)
+    with pytest.raises(AssertionError):
+        asyncio.run(q.transform(ctx, None, "response"))
+    assert ctx.failed[1]["status"] == 400, ctx.failed
+    assert ctx.failed[1]["code"] == "content_filter"
+    assert ctx.failed[1]["param"] == "prompt"
+    assert "重试必再被拒" in ctx.failed[0]
+
+
+def test_content_refusal_in_the_json_envelope_is_also_400():
+    """另一种到达形态：JSON 信封（`success:false` + `data.error_code`）⇒ 同样 400。"""
+    payload = {"success": False,
+               "data": {"error_code": "data_inspection_failed", "code": ""}}
+    ctx = FakeCtx()
+    with pytest.raises(AssertionError):
+        asyncio.run(q.transform(ctx, payload, "response"))
+    assert ctx.failed[1]["status"] == 400
+    assert ctx.failed[1]["code"] == "content_filter"
+
+
+def test_unknown_error_code_is_still_transient_502():
+    """守卫：**认不出的** code 仍按瞬时 502（既有 doctrine：认不出的偏差要付一次快失败的代价，
+    而不是把一条好身份停一天）。审核分支**只**认实测标志，不许顺手扩大。"""
+    ctx = FakeCtx()
+    payload = {"success": False, "data": {"code": "SomethingBrandNew", "details": "???"}}
+    with pytest.raises(AssertionError):
+        asyncio.run(q.transform(ctx, payload, "response"))
+    assert ctx.failed[1]["status"] == 502
+    assert ctx.failed[1]["code"] == "upstream_error"
+
+
+# ------------------------- 真实审核拒答帧（2026-09-19 用户提供原文）+ trace note
+
+#: **逐字**来自上游的拒答帧（用户 2026-09-19 提供的原文），不是构造的。
+REAL_CONTENT_REFUSAL = (
+    'data: {"error": {"code": "data_inspection_failed", "modality": ["text"], '
+    '"stage": "input", "details": "内容安全警告：输入数据可能包含不适当的内容！"}, '
+    '"response_id": "a900b4c7-15e6-4812-9c82-02b2542514b9", "response_index": 0}\n'
+).encode("utf-8")
+
+
+def test_real_content_refusal_frame_maps_to_400_and_leaves_a_trace_note():
+    """用**上游原文**钉住两件事：
+
+    1. 标志在 `error.code`（bundle 里读到的 `error_code` 是另一拼法 ⇒ 两种都要认）；
+    2. 400 `content_filter`（不可重试），且消息带上厂商原文（"内容安全警告：…"）；
+    3. **trace note 自证**：`outcome=content_refused` + `modality=text` + `refused_at=input`
+       ⇒ 生产里第一次真实出现时证据自动留档，不必再去构造违规请求。
+    """
+    ctx = FakeCtx(raw=REAL_CONTENT_REFUSAL)
+    with pytest.raises(AssertionError):
+        asyncio.run(q.transform(ctx, None, "response"))
+    assert ctx.failed[1]["status"] == 400, ctx.failed
+    assert ctx.failed[1]["code"] == "content_filter"
+    assert "内容安全警告" in ctx.failed[0]           # 厂商原文透传
+    assert "重试必再被拒" in ctx.failed[0]
+    notes = [n for n in ctx.logfire.notes if n.get("outcome") == "content_refused"]
+    assert len(notes) == 1, ctx.logfire.notes
+    note = notes[0]
+    assert note["error_code"] == "data_inspection_failed"
+    assert note["modality"] == "text"
+    assert note["refused_at"] == "input"
+    assert "内容安全警告" in note["details"]

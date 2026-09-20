@@ -392,7 +392,28 @@ AttributeError）。它**只在本来就要失败的路径上**跑：把「已�
 （`code=upstream_error`）而不是 502 —— 依据是 `ctx.fail` 的约定与 `docs/06` 的同一用法：
 **状态码就是给下游的重试信号**（4xx＝别重试、5xx＝可重试）⇒ 让 **new-api 自己重试一次**。
 守卫（都钉了单测）：**有 SSE 帧但无图**（生成被中断）与 **WAF 挑战页**保持 502（重试无用）。
-⇒ 两类并排看：**静默丢弃＝500（可重试）／有帧无图与 WAF 页＝502** ——
+🔴 **2026-09-19 补第三处：内容审核未通过 ⇒ 400 `content_filter`**（与上面那条**方向相反**）。
+**实测帧（上游原文，2026-09-19）**：
+
+```
+data: {"error": {"code": "data_inspection_failed", "modality": ["text"], "stage": "input",
+                 "details": "内容安全警告：输入数据可能包含不适当的内容！"},
+       "response_id": "a900b4c7-…", "response_index": 0}
+```
+
+⇒ 字段勘误：标志在 **`error.code`**（bundle 里读到的 `error_code` 是另一拼法 ⇒ **两种都认**，
+实测以 `code` 为准）；另带 `modality`（被拒的模态：text/image）与 `stage`（拒在**输入**还是输出）
+—— 这两项决定了给调用方的建议（"改提示词" vs "换素材"），所以进 trace。
+文案兜底**不在本脚本里了**（AC-36）：自然语言词表属**跨渠道共享**，落在
+`script_store/capabilities/_shared.json` 的 `moderation_wordings`（改数据不发版，本渠道只剩**厂商专属 code**
+`CONTENT_CODES`）；判定与出口都由框架件 `ctx.matched_moderation` / `ctx.fail_moderation` 收口，
+所以三个渠道对客户端的说法一致（400 `content_filter` + `param=prompt` + 统一后缀）。
+**trace note 自证**：命中时记 `outcome="content_refused"` + `error_code` + `modality` + `refused_at` + `details(前 120 字)`
+⇒ 生产里**第一次真实出现**就留档，不必再为了拿证据去构造违规请求。
+这一类**同 prompt 重试必再被拒**，
+报 5xx 只会让 new-api 白烧一次生成、还告诉调用方"稍后能成"。故给 **400**
+（`code=content_filter`、`param=prompt`、消息写明"改提示词或换素材"）。
+⇒ 三条并排看：**静默丢弃＝500（可重试）／有帧无图与 WAF 页＝502／审核拒答＝400（别重试）** ——
 判据始终是同一句话：**状态码就是给下游的重试信号**。
 🔴 **2026-09-19 补上一维：文案判定还要看「哪一跳」**（`_fail_qwen_error(..., hop=)`）。
 **上传跳（`getstsToken`）不计费** ⇒ 它上面出现的任何"额度"措辞都不可能是「生图额度耗尽」，
@@ -598,6 +619,16 @@ AttributeError）。它**只在本来就要失败的路径上**跑：把「已�
 | 2026-09-18 | 首版（t2i + image_edit、两门、四形态密钥、`identity_url`/`token_url`） |
 | 2026-09-18 晚 | **合并反向代理当晚的新实测**：错误两条投递通道（流内 `error` 帧）并入 `_fail_qwen_error` 收口；额度两个 `code` 按**文案**区分日额度/瞬时过载（§6.0）；补 §5.1 分辨率实测；证据等级表按新实测改判；§9 增「并发出图」非目标 |
 | 2026-09-18 深夜 | `-pro` + 显式像素的护栏落地（§5.1）；框架下载判据改为按 magic bytes（`adapter/ctxapi/image_ref.py`，见 §11 ② 的落地说明） |
+| 2026-09-19 15:4x | ✅ **审核拒答上移到框架层（AC-36）**：新增 `ModerationMixin`
+（`ctx.matched_moderation` 判定 + `ctx.fail_moderation` 出口契约）与跨渠道共享词表
+`capabilities/_shared.json`；本脚本删掉私有词表、只留厂商 code。触发原因：同类处理在 qwen/google
+各写一份、**ark 一份都没有**。摘要 `9b9dc3e6…`→`e234d749…` |
+| 2026-09-19 15:2x | ✅ **按上游原文校正审核拒答**：标志在 `error.code`（bundle 说 `error_code` ⇒ **两种都认**）；
+新增文案兜底 `CONTENT_WORDINGS` 与 **trace note 自证**（`outcome=content_refused` + `modality` + `refused_at` + `details`）。
+用逐字帧做用例 + 变异自证；摘要 `aa908fdc…`→`9b9dc3e6…` |
+| 2026-09-19 15:1x | ✅ **内容审核未通过 ⇒ 400 `content_filter`**：实测标志 `error.error_code ==
+"data_inspection_failed"`（走 `error_code` 不是 `code`）⇒ 不再落进通用 502；同 prompt 必再被拒，
+故给 400 让下游别重试。新增 3 条单测 + 变异自证；摘要 `26687fc6…`→`aa908fdc…` |
 | 2026-09-19 15:0x | ✅ **静默丢弃 ⇒ 500（可重试）**：上游 200 但 0 条 `data` 行 / 空响应体且会话未登记时，
 不再报 502，而是 500 `server_error`⇒ 让 new-api 自己重试；有帧无图 / WAF 页仍 502（守卫 2 条）。
 摘要 `1bca6201…`→`26687fc6…` |
@@ -635,6 +666,7 @@ AttributeError）。它**只在本来就要失败的路径上**跑：把「已�
 | ⑥ | **`response_format`（`url` ⇄ `b64_json`）** | ✅ **已落地**（2026-09-19，§4）。`url`（或不说）＝上游原生载体零成本直通；`b64_json` ＝逐张下载并编码。选它而不是"永远直通"，是因为**下载即死链判据**：§3.0 ⑦ 的 404 死链在本仓会变成明确失败，不再被当成功转出。代价＝要 base64 的调用方每张多一次 GET。**默认不变**，所以存量渠道行为无变化 |
 | ⑦ | **无图 URL 时读 `GET /v2/chats/<id>` 兜底** | ✅ **已落地**（2026-09-19，§4）。只读、**零额度**、只在失败路径上跑。刻意**不**依赖参考仓那个**未验证**的「断流后上游续跑」假设 —— 本仓读的是**已读完**的流 |
 | ⑧ | **x5sec 的 `code` 形态**（`FAIL_SYS_USER_VALIDATE` / `RGV587`） | ✅ **已落地**（2026-09-19，§6.1）。此前只有 `{"ret":[…]}` 会记退避窗；`code` 形态落进通用 502 **不记窗** ⇒ 下一发立刻再打上游，而「命中后连发只会加深」正是参考仓的结论 |
+| ⑭ | **内容审核拒答的状态码**（该不该重试） | ✅ **已落地**（2026-09-19）：`data_inspection_failed` ⇒ **400 `content_filter`**（不可重试）；认不出的 code 仍按瞬时 502（守卫 1 条） |
 | ⑬ | **静默丢弃的状态码**（200 + 无内容 ⇒ 谁重试） | ✅ **已落地**（2026-09-19）：**500 `server_error`** ⇒ new-api 自己重试；有帧无图 / WAF 仍 502 |
 | ⑫ | **上传缓存/预生成**（重复图不重传 ⇒ 直接省掉频控预算里的一次 mint） | ✅ **前置已验**（2026-09-19，L6）：陈旧 `file_id` 被接受且被消费（≥12.7h）。**待做**：实现（内容哈希 → `files[]`，落 `ctx.cache` 带 TTL，复用重签 url） |
 | ⑪ | **上传跳的 `RateLimited` 误判**（可能被判成 429「身份当日耗尽」） | ✅ **已落地**（2026-09-19）：`

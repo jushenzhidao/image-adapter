@@ -35,6 +35,7 @@ from adapter.ctxapi.fanout import FanoutMixin
 from adapter.ctxapi.fault import FaultMixin
 from adapter.ctxapi.image_ref import ImageRefMixin
 from adapter.ctxapi.mapping import MappingMixin, SizeReading
+from adapter.ctxapi.moderation import ModerationMixin
 from adapter.ctxapi.plan import FilePart, PlanMixin, RequestPlan
 from adapter.ctxapi.storage import StorageMixin
 
@@ -49,6 +50,7 @@ CTX_MIXINS = (
     FanoutMixin,
     BudgetMixin,
     PlanMixin,
+    ModerationMixin,
     FaultMixin,
 )
 
@@ -63,6 +65,7 @@ __all__ = [
     "FilePart",
     "ImageRefMixin",
     "MappingMixin",
+    "ModerationMixin",
     "SizeReading",
     "NeedsCodec",
     "NeedsStorage",

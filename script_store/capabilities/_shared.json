@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "scope": "shared",
+  "verified_at": "2026-09-19",
+  "verified_against": "chat.qwen.ai 拒答帧的 details（qwen/images@v1 实测，见 docs/10 §6）",
+  "moderation_wordings": [
+    "内容安全警告",
+    "不适当的内容"
+  ],
+  "field_notes": {
+    "scope": "本文件是**跨厂商**事实，不是某个渠道的。所有渠道脚本共用同一份（经 ctx.matched_moderation）。",
+    "moderation_wordings": "自然语言层的审核拒答词。放这里＝所有渠道共享；**厂商专属 code 不放这里**（qwen 的 data_inspection_failed、Gemini 的 finishReason 枚举各归各的脚本/表）。只收**实测**串，不要凭猜添加 —— 一个误加的短词会把可重试的上游抖动误判成「别重试」的拒答。",
+    "why_not_env": "这类词是厂商数据（按厂商变化、需要实测出处），而 env 是进程级旋钮：放 env 会同时作用于所有渠道且要重启；本文件按 mtime 缓存，改完下一次请求即生效（改数据不发版）。"
+  }
+}
