@@ -176,3 +176,36 @@ def test_burst_limit_is_the_guest_daily_quota_shape():
     """默认三类用例 = 3 发，正好是单轮允许的上限（再多要 --allow-burst）。"""
     assert smoke.BURST_LIMIT == 3
     assert smoke.plan_budget(smoke.parse_cases(""), ["1K"]) == smoke.BURST_LIMIT
+
+
+def test_no_response_format_means_the_key_is_absent():
+    """默认不带该键 —— 存量行为（产物直通上游链接）必须逐字节不变。"""
+    body = smoke.case_payload("t2i", "1K", "一只猫", [])
+    assert "response_format" not in body
+
+
+def test_b64_json_is_forwarded_so_the_adapter_fetches_the_product():
+    """链式用例取产物**不能靠客户端**去下载 cdn 链接。
+
+    实测 2026-09-20：访客门 + t2i 的产物链接**紧跟生成后立刻** 404（直连与系统代理都是），
+    于是 t2i 成功、i2i 断在没有输入图上 —— 一轮额度只换来半条链。带 `b64_json` ⇒
+    产物由 adapter 自己取回并编码，`asset_from_response` 对两种形态都已支持。
+    """
+    body = smoke.case_payload(
+        "i2i", "1K", "x", ["data:image/png;base64,AAA"], "b64_json"
+    )
+    assert body["response_format"] == "b64_json"
+    assert body["image"] == "data:image/png;base64,AAA"   # 其余字段不受影响
+
+
+def test_the_product_count_does_not_depend_on_having_a_url():
+    """按 URL 计数会漏掉 `b64_json` 形态 ⇒ 把成功读成失败。
+
+    2026-09-20 实跑：`b64_json` 那轮拿到了 1.14MB 的素材，行首却打印"出图 0 张"。
+    """
+    with_url = {"data": [{"url": "https://cdn.example/a.png"}]}
+    with_b64 = {"data": [{"b64_json": "AAAA"}]}
+    assert smoke.product_count(with_url) == 1
+    assert smoke.product_count(with_b64) == 1
+    assert smoke.product_count({}) == 0
+    assert smoke.product_count({"data": []}) == 0

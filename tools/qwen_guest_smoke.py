@@ -158,11 +158,22 @@ def shrink_to_budget(data: bytes, mime: str, budget: int = ASSET_BUDGET):
     return last[0], last[1], note
 
 
-def case_payload(case: str, tier: str, prompt: str, assets: list[str]) -> dict:
-    """按用例构造 canonical 请求体；素材不足时**明确报错**，不发半截请求。"""
+def case_payload(
+    case: str, tier: str, prompt: str, assets: list[str], response_format: str = ""
+) -> dict:
+    """按用例构造 canonical 请求体；素材不足时**明确报错**，不发半截请求。
+
+    `response_format` 留空 ⇒ 不带该键，即 adapter 的默认：产物直通上游原生链接。
+    传 `b64_json` ⇒ 产物由 adapter 自己取回并编码，链式用例就**不再依赖客户端**去下载
+    `cdn.qwenlm.ai` —— 那条路会撞上已知的 404 死链（`docs/10` §4：要 `b64_json` 时
+    死链变成明确失败，要 `url` 时它被当成功转出）。实测 2026-09-20：访客门 + t2i 的
+    产物链接**紧跟生成后立刻** 404，客户端无从下载，链子就此断掉。
+    """
     if case not in CASES:
         raise ValueError("未知用例 " + str(case))
     body: dict = {"model": "qwen-image", "size": tier}
+    if response_format:
+        body["response_format"] = response_format
     if case == "t2i":
         body["prompt"] = prompt
         return body
@@ -213,6 +224,16 @@ def download_asset(url: str, timeout: float = 60.0):
     raise RuntimeError("下载产物失败（" + "; ".join(errors) + "）")
 
 
+def product_count(doc: dict) -> int:
+    """产物条数 ＝ `data[]` 的条目数，**不按 URL 数**。
+
+    两种形态都要算：`url`（有链接）与 `b64_json`（没有链接）。按 URL 数会在
+    `b64_json` 那一轮打印"出图 0 张"，把一次成功的生成读成失败 —— 2026-09-20 实跑
+    撞到：素材明明取到了 1.14MB，行首却写着 0 张。
+    """
+    return len(doc.get("data") or [])
+
+
 def asset_from_response(doc: dict):
     """上游 `data[0]` -> `(bytes, mime, via)`。url 与 b64_json 两种形态都接。"""
     items = doc.get("data") or []
@@ -247,6 +268,11 @@ def main(argv: list[str] | None = None) -> int:
                        help="用例/档位之间的间隔秒数（不连打）")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT,
                        help="文生图的提示词（图生图/多图生图用内置编辑提示词）")
+    parser.add_argument("--response-format", default="",
+                       choices=("", "url", "b64_json"),
+                       help="产物形态：空＝不传（adapter 默认，直通上游链接）；"
+                            "b64_json＝由 adapter 取回并编码 ⇒ 链式用例避开"
+                            "客户端下载 cdn 的 404（docs/10 §4）")
     parser.add_argument("--allow-burst", action="store_true",
                        help=f"允许单轮超过 {BURST_LIMIT} 发（多档会成倍放大，谨慎）")
     parser.add_argument("--headful", action="store_true",
@@ -322,7 +348,8 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"… 停 {args.pace:.0f}s（不连打）")
                         time.sleep(args.pace)
                     try:
-                        body = case_payload(case, tier, args.prompt, assets)
+                        body = case_payload(
+                            case, tier, args.prompt, assets, args.response_format)
                     except ValueError as exc:
                         print(f"[{tier}] {case} 跳过：{exc}")
                         return 1
@@ -344,9 +371,12 @@ def main(argv: list[str] | None = None) -> int:
                     imgs = body.get("image")
                     n_imgs = len(imgs) if isinstance(imgs, list) else (1 if imgs else 0)
                     extra = f"  输入 {n_imgs} 张" if n_imgs else ""
-                    print(f"{label} HTTP 200  {elapsed:.1f}s  出图 {len(urls)} 张{extra}")
+                    print(f"{label} HTTP 200  {elapsed:.1f}s  "
+                          f"出图 {product_count(doc)} 张{extra}")
                     for url in urls:
                         print("   ✅", url)
+                    if doc.get("data") and not urls:
+                        print(f"   └ 产物为 b64_json 形态（{product_count(doc)} 条，无 URL）")
                     if doc.get("usage"):
                         print("   usage:", doc["usage"])
                     if case in ("t2i", "i2i"):
