@@ -323,7 +323,7 @@ async def test_a_refused_request_has_no_result_attributes(vendor, settings, span
 async def _run_mapped(
     settings: Settings, url: str, payload: dict, mapped: str | None
 ) -> str:
-    """One request whose channel carried a `model_map` that (maybe) matched.
+    """One request whose channel carried an `X-Model-Map` that (maybe) matched.
 
     ``mapped`` is what ``adapter.api.pipeline.adapt`` resolved -- None when the
     table did not apply -- so this drives the same two attributes production

@@ -23,6 +23,10 @@ CHANNEL_HEADERS = [
     "X-Adapter-Key",
     "X-Auth-Emit",
     "X-Async",
+    "X-Model-Map",
+    "X-Stages",
+    "X-Stage-Urls",
+    "X-Stage-Timeout",
     "X-Channel-Options",
 ]
 

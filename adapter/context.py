@@ -157,7 +157,7 @@ class ContextCore:
         # script's, but a script may need it for a signature computation.
         self.key = channel.upstream_key
         self.upstream_url = channel.upstream_url
-        # Model mapping (`X-Channel-Options.model_map`), resolved once by the
+        # Model mapping (`X-Model-Map`), resolved once by the
         # pipeline (adapter/modelmap.py). `requested_model` is what the client
         # asked for; `mapped_model` is what the channel's table turned it into,
         # and None means no table applied -- which is how a script tells

@@ -63,10 +63,10 @@ ARK 脚本有 `_ark_size()`，Google 脚本有 `_ratio()/_tier()`，下一个上
 ### 4.1 兜底必须回答"我改了什么"
 
 ```python
-mapped = ctx.map_size("1024x1024", caps)
-mapped.ratio, mapped.tier          # "1:1", "1K"
-mapped.adjusted                    # True
-mapped.notes                       # ["tier 512 -> 1K: below the model's floor"]
+tier, adjusted = ctx.fit_tier(512, caps["tiers"])
+tier, adjusted                     # "1K", True  ← 要 512，模型下限是 1K
+ratio = ctx.format_ratio(ctx.fit_ratio(1024, 1024, caps["ratios"]))
+ratio                              # "1:1"
 ```
 
 **静默兜底 = 静默改需求 + 静默改成本。** 本轮 4K 误判如果发生在生产，表现为"账单变贵、  
@@ -109,7 +109,7 @@ CAPS = {                          # 脚本：厂商数据，实测校准
     "gemini-3.1-flash-image": {"tiers": ("512", "1K", "2K", "4K"), "wide": True},
     "gemini-2.5-flash-image": {"tiers": (), "wide": False},      # 固定分辨率
 }
-mapped = ctx.map_size(size, caps_of(model))     # ctx：算法
+ratio = ctx.fit_ratio(w, h, caps_of(model)["ratios"])   # ctx：算法
 ```
 
 这样 `MODELS` 表的实测校准（本轮做过三轮）与算法解耦：**能力表改一行，所有脚本受益**。
@@ -400,7 +400,8 @@ script_store/
 
 ```python
 caps = ctx.caps("google", model)          # dict（已按别名/后缀归一化后命中）
-mapped = ctx.map_size(size, caps)         # §5 的纯函数
+tier, adjusted = ctx.fit_tier(want, caps["tiers"])   # §5 的纯函数
+ratio = ctx.fit_ratio(w, h, caps["ratios"])
 ```
 
 ### 11.2 加载与覆盖
@@ -422,7 +423,7 @@ mapped = ctx.map_size(size, caps)         # §5 的纯函数
 | 第二个上游复用同一份事实                 | 各脚本各抄一份，各自漂移                               | 一份权威表，多脚本共享                                         |
 | 记录"这行数据是怎么来的"                | 只能写在注释里                                    | `verified_at` / `verified_against` 是结构字段，可被实测脚本自动回填 |
 
-**注意边界**：独立出来的是**数据**，不是逻辑。`map_size`/`fit_tier` 仍然进 ctx（§5），  
+**注意边界**：独立出来的是**数据**，不是逻辑。`fit_tier`/`fit_ratio` 仍然进 ctx（§5），  
 上游的"特有语义"仍然留在脚本里（例如"这个字段名要用 camelCase"这类硬事实）。
 
 ---
@@ -433,14 +434,16 @@ mapped = ctx.map_size(size, caps)         # §5 的纯函数
 ┌─ 控制面（New API / 业务）───── 选模型、要不要增强、合规开关
 │
 ├─ 渠道层（headers）────────── X-Upstream-Url / X-Script-Ref / X-Async / X-Stages
-│                              X-Channel-Options（含 caps 覆盖）
+│                              X-Model-Map（客户端名→上游名）/ X-Channel-Options（含 caps 覆盖）
 │
 ├─ 能力事实（数据文件）──────── capabilities/*.json  ← 独立、可热更新、与代码解耦
 │   ↑ 经 ctx.caps() 注入
 ├─ 脚本层（厂商语义）────────── 字段名/端点/错误映射/权限（沙箱内、可覆盖）
 │   ↑ 用
 ├─ ctx 能力层
-│   ├─ 映射纯函数 ── fit_ratio / fit_tier / map_size / resolve_model
+│   ├─ 映射纯函数 ── tier_value / size_to_px / parse_size / fit_tier /
+│   │                fit_ratio / format_ratio / is_extreme_ratio
+│   │                （`map_size` / `resolve_model` 是早期草案，§5 明确不做）
 │   ├─ 本地图像处理 ─ compress_image（三形态）/ ctx.image.compress（机制）/ image_info（待做）
 │   ├─ IO 三件套 ── image_* / download_image / upload_temp_image
 │   ├─ 出口 ────── emit / fail

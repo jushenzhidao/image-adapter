@@ -15,7 +15,10 @@ declares only how to talk to that endpoint:
   X-Auth-Emit      header:X-API-Key:Bearer
   X-Async          poll=2,timeout=300
   X-Script-Sha256  integrity pin
-  X-Channel-Options  JSON object handed to the script as ctx.options
+  X-Model-Map      gpt-image-2=doubao-x,*=doubao-y   key=model pairs, this
+                   channel; the one directive the adapter itself acts on
+  X-Channel-Options  JSON object handed to the script as ctx.options -- decoded
+                   here, but nothing in it is the adapter's business
   X-Stages         generate,upscale        overrides the script's STAGES
   X-Stage-Urls     generate=https://a/t2i,upscale=https://b/sr
   X-Stage-Timeout  total=300               cascade budget, capped by settings
@@ -29,6 +32,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from adapter.errors import ChannelConfigError
+from adapter.modelmap import LEGACY_KEY as LEGACY_MODEL_MAP_KEY
 from adapter.modelmap import parse as parse_model_map
 from adapter.proxyplan import MODES, MODE_PER_REQUEST, ProxyPlan, parse_hosts
 from adapter.settings import Settings
@@ -45,6 +49,7 @@ H_SCRIPT_REF = "x-script-ref"
 H_SCRIPT_SHA = "x-script-sha256"
 H_AUTH_EMIT = "x-auth-emit"
 H_ASYNC = "x-async"
+H_MODEL_MAP = "x-model-map"
 H_OPTIONS = "x-channel-options"
 H_ADAPTER_KEY = "x-adapter-key"
 #: Not an `X-` header: it carries the *vendor* credential, not a directive.
@@ -317,13 +322,28 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
             )
         options = parsed
 
-    # `model_map` is the one X-Channel-Options key the adapter itself acts on,
-    # so it is validated here instead of being left to a script: a channel
-    # configuration mistake has to fail before the request reaches an upstream,
-    # and every script -- the inline drafts included -- gets the mapping for
-    # free. What a script does with the resolved model is still its own
-    # business; the framework only supplies the answer (adapter/modelmap.py).
-    model_map = parse_model_map(options.get("model_map"))
+    # The mapping has its own header rather than a key inside `options`, because
+    # it is the one part of the channel directive the adapter itself acts on --
+    # and `options` is the script's bag. Declaring it separately keeps that
+    # boundary literal, and it is validated here instead of being left to a
+    # script: a channel configuration mistake has to fail before the request
+    # reaches an upstream, and every script -- the inline drafts included -- gets
+    # the mapping for free. What a script does with the resolved model is still
+    # its own business; the framework only supplies the answer
+    # (adapter/modelmap.py).
+    if LEGACY_MODEL_MAP_KEY in options:
+        # Refused rather than ignored, and refused by name. A channel still
+        # carrying the old key would send a model nobody rewrote, and reaching
+        # the wrong upstream model without a word is the failure this feature
+        # exists to prevent; ignoring it would leave the operator with a table
+        # that reads as declared and does nothing.
+        raise ChannelConfigError(
+            "X-Channel-Options.model_map has moved to its own header: "
+            "X-Model-Map, as key=model pairs, e.g. "
+            "gpt-image-2=doubao-seedream-5-0-260128",
+            "X-Channel-Options",
+        )
+    model_map = parse_model_map(headers.get(H_MODEL_MAP))
 
     authorization = (headers.get(H_AUTHORIZATION) or "").strip()
     upstream_key = authorization

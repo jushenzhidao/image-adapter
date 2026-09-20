@@ -13,7 +13,7 @@ Two deliberate choices are worth knowing before editing this file:
   ``response_model`` to a route that returns a ``dict`` would silently start
   trimming unknown fields.
 * **Every channel header is declared optional.** ``channel_contract`` exists so
-  the thirteen headers appear in /docs and can be exercised from there, not to
+  the seventeen headers appear in /docs and can be exercised from there, not to
   validate them. Required-header failures stay ``channel_config_error`` (400,
   OpenAI envelope) from ``adapter/channel.py`` instead of a FastAPI 422.
 """
@@ -115,17 +115,40 @@ async def channel_contract(
     x_script_sha256: Annotated[
         str | None, Header(alias="X-Script-Sha256", description="脚本完整性锁定")
     ] = None,
+    x_model_map: Annotated[
+        str | None,
+        Header(
+            alias="X-Model-Map",
+            description="本渠道的模型名改写表，key=model 逗号分隔，*= 兜底，"
+            "如 gpt-image-2=doubao-seedream-5-0-260128",
+        ),
+    ] = None,
+    x_stages: Annotated[
+        str | None,
+        Header(alias="X-Stages", description="覆盖脚本的 STAGES，如 generate,upscale"),
+    ] = None,
+    x_stage_urls: Annotated[
+        str | None,
+        Header(
+            alias="X-Stage-Urls",
+            description="逐级上游地址，如 generate=https://a.test/t2i,upscale=https://b.test/sr",
+        ),
+    ] = None,
+    x_stage_timeout: Annotated[
+        str | None,
+        Header(alias="X-Stage-Timeout", description="级联总预算（秒），如 total=300"),
+    ] = None,
     x_channel_options: Annotated[
         str | None,
         Header(
             alias="X-Channel-Options",
-            description="JSON 对象，脚本内经 ctx.options 读取",
+            description="JSON 对象，脚本内经 ctx.options 读取（adapter 只解码，不解读）",
         ),
     ] = None,
 ) -> None:
     """The channel contract expressed as code rather than prose.
 
-    README documents these thirteen headers in a table. Declaring them here means
+    README documents these seventeen headers in a table. Declaring them here means
     the contract cannot drift from the implementation, and /docs doubles as a
     test client for it: fill the fields in and send.
 

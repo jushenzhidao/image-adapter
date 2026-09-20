@@ -4,19 +4,24 @@ The module is small on purpose -- the whole feature is one table lookup -- so
 what is worth pinning is not the happy path but the decisions that are tempting
 to make differently later:
 
-  * an absent table is not an error, and it is not an identity table either;
-  * ``*`` is a catch-all, not a pattern, so ``gemini-*`` is refused rather than
-    accepted and silently never matched;
+  * an absent header is not an error, and it is not an identity table either;
+  * ``*`` is a catch-all, not a pattern, so ``gemini-*=x`` is refused rather
+    than accepted and silently never matched;
   * a request that matches nothing keeps the name it arrived with.
 
 The last one is the zero-regression property the whole design rests on, so it
 is asserted from both sides: an empty table, and a table that simply does not
 list the model.
 
-``parse_channel`` is exercised here too, because the option is validated there
+``parse_channel`` is exercised here too, because the header is validated there
 rather than in a script: a channel-configuration mistake has to be a 400 before
 the request reaches an upstream, and the only place that can happen is the
 header parser.
+
+The last group also pins the *retirement*: the table used to be a key inside
+``X-Channel-Options``, and a channel that still carries it is refused by name
+rather than ignored -- an ignored one would send a model nobody rewrote, which
+is the failure this whole feature exists to prevent.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ import pytest
 
 from adapter.channel import parse_channel
 from adapter.errors import ChannelConfigError
-from adapter.modelmap import WILDCARD, parse, resolve
+from adapter.modelmap import HEADER, LEGACY_KEY, WILDCARD, parse, resolve
 from adapter.settings import Settings
 
 #: A minimal usable channel, lowercase because `parse_channel` reads raw header
@@ -43,72 +48,95 @@ def _settings() -> Settings:
     return Settings(_env_file=None, adapter_key_required=False)
 
 
+def _table(raw: str) -> dict:
+    """One header value through the real channel parser.
+
+    Used instead of ``parse`` where what is being pinned is the *header*, not
+    the string handling: the header name is looked up by the parser, so a typo
+    in it would leave the table empty and every assertion here vacuous.
+    """
+    return parse_channel({**BASE, HEADER.lower(): raw}, _settings()).model_map
+
+
 # --- parse -------------------------------------------------------------------
 
 
-def test_an_absent_table_is_the_empty_table():
-    """Not declaring the option is the default, not a mistake."""
+def test_an_absent_header_is_the_empty_table():
+    """Not declaring the header is the default, not a mistake."""
     assert parse(None) == {}
 
 
-def test_an_empty_table_is_accepted_and_means_no_mapping():
-    assert parse({}) == {}
+@pytest.mark.parametrize("raw", ["", "   ", "\t"], ids=["empty", "spaces", "tab"])
+def test_a_blank_header_is_the_empty_table(raw):
+    """A control plane clearing an option sends an empty value, not no header."""
+    assert parse(raw) == {}
 
 
-def test_strings_are_trimmed():
+def test_pairs_are_trimmed():
     """Both sides are typed by hand into a header, so padding is a typo."""
-    assert parse({" gpt-image-2 ": " doubao-x "}) == {"gpt-image-2": "doubao-x"}
+    assert parse(" gpt-image-2 = doubao-x ") == {"gpt-image-2": "doubao-x"}
 
 
 def test_the_bare_wildcard_is_accepted():
-    assert parse({WILDCARD: "doubao-x"}) == {WILDCARD: "doubao-x"}
+    assert parse(f"{WILDCARD}=doubao-x") == {WILDCARD: "doubao-x"}
+
+
+def test_several_pairs_are_comma_separated():
+    assert parse("gpt-image-1=a,gpt-image-2=b,*=c") == {
+        "gpt-image-1": "a",
+        "gpt-image-2": "b",
+        WILDCARD: "c",
+    }
+
+
+@pytest.mark.parametrize(
+    "raw", ["a=b, c=d", "a=b ,c=d", "a=b,c=d,", "a=b,,c=d"], ids=["space", "lpad", "trailing", "double"]
+)
+def test_list_padding_is_tolerated(raw):
+    """`a=b, c=d` is how a human writes a list; refusing it would teach nothing.
+
+    An empty segment is a separator artefact, so it is skipped -- which is the
+    same reading `X-Stage-Urls` gives the same shape.
+    """
+    assert parse(raw) == {"a": "b", "c": "d"}
+
+
+def test_only_the_first_equals_sign_splits():
+    """A stray `=` belongs to the model name, which is what keeping the rest does.
+
+    Splitting on every `=` would silently truncate the name to `b`, i.e. a
+    mapping the operator did not write -- the defect this file is about.
+    """
+    assert parse("a=b=c") == {"a": "b=c"}
 
 
 @pytest.mark.parametrize(
     "raw",
-    [
-        ["not", "an", "object"],
-        "not-an-object",
-        7,
-        True,
-    ],
-    ids=["list", "string", "number", "boolean"],
+    [["a=b"], 7, True, {"a": "b"}, None],
+    ids=["list", "number", "boolean", "object", "none"],
 )
-def test_a_table_that_is_not_an_object_is_refused(raw):
+def test_a_value_that_is_not_a_header_string_is_refused(raw):
+    """Only a missing header is `{}`; anything that is not text is a fixture bug.
+
+    `None` is called out separately because it is the one falsy input that *is*
+    legitimate -- see `test_an_absent_header_is_the_empty_table`.
+    """
+    if raw is None:
+        assert parse(raw) == {}
+        return
     with pytest.raises(ChannelConfigError) as caught:
         parse(raw)
     assert caught.value.code == "channel_config_error"
-    assert caught.value.param == "X-Channel-Options"
-    assert "must be a JSON object" in caught.value.message
+    assert caught.value.param == HEADER
 
 
 @pytest.mark.parametrize(
     "raw",
-    [
-        {"": "doubao-x"},
-        {"   ": "doubao-x"},
-        {"*": "doubao-x", " * ": "doubao-y"},
-        {"gpt-image-2": "a", " gpt-image-2": "b"},
-        {"gpt-image-2": ""},
-        {"gpt-image-2": "   "},
-        {"gpt-image-2": 7},
-        {"gpt-image-2": None},
-        {"gpt-image-2": ["doubao-x"]},
-    ],
-    ids=[
-        "blank-key",
-        "padding-key",
-        "wildcard-twice-after-trim",
-        "duplicate-after-trim",
-        "blank-value",
-        "padding-value",
-        "numeric-value",
-        "null-value",
-        "list-value",
-    ],
+    ["gpt-image-2", "=doubao-x", "gpt-image-2=", "gpt-image-2=   ", "   =doubao-x"],
+    ids=["no-equals", "blank-key", "blank-model", "padding-model", "padding-key"],
 )
-def test_an_entry_that_cannot_be_matched_is_refused(raw):
-    """A blank key can never match and a non-string value is not a model name.
+def test_a_pair_that_cannot_be_matched_is_refused(raw):
+    """A blank key can never match and a blank model is not a name.
 
     Storing either would produce an entry that is present in the table and
     still never applies -- the silent no-op this module exists to avoid.
@@ -116,6 +144,8 @@ def test_an_entry_that_cannot_be_matched_is_refused(raw):
     with pytest.raises(ChannelConfigError) as caught:
         parse(raw)
     assert caught.value.code == "channel_config_error"
+    assert caught.value.param == HEADER
+    assert "key=model" in caught.value.message
 
 
 @pytest.mark.parametrize("key", ["gemini-*", "gpt-*", "*gemini", "g*p-t"])
@@ -123,56 +153,38 @@ def test_a_partial_glob_is_refused(key):
     """``*`` is a catch-all, not a pattern -- so a pattern must not pass.
 
     This is the one refusal that is about honesty rather than typing: an
-    operator who writes ``{"gemini-*": "x"}`` believes they declared a rule,
-    and a table that accepts it and never matches anything is worse than a 400
-    naming the key.
+    operator who writes ``gemini-*=x`` believes they declared a rule, and a
+    table that accepts it and never matches anything is worse than a 400 naming
+    the key.
     """
     with pytest.raises(ChannelConfigError) as caught:
-        parse({key: "doubao-x"})
+        parse(f"{key}=doubao-x")
     assert key in caught.value.message
     assert WILDCARD in caught.value.message
 
 
-def test_a_repeated_key_after_trimming_is_refused():
-    """`"*"` and `" * "` are one key, so the table would hold two catch-alls.
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "gpt-image-2=a, gpt-image-2=b",
+        "*=a, *=b",
+        f" {WILDCARD}=a,{WILDCARD}=b",
+    ],
+    ids=["exact-twice", "wildcard-twice", "wildcard-twice-after-trim"],
+)
+def test_a_repeated_key_is_refused(raw):
+    """Two entries for one key have no single reading, and the second used to win.
 
-    Trimming is what makes them collide, and the second one silently won before
-    this check existed -- one catch-all is the rule, and "which of the two" is
-    not a question an operator should have to reason about.
+    Trimming is what makes ``*`` and `` * `` collide, so the collision has to be
+    caught after it, not before: one catch-all is the rule, and "which of the
+    two" is not a question an operator should have to reason about. This check
+    falls out of building the dict, which is why the flat form needs no decoder
+    hook -- unlike the JSON bag next door, whose repeats are caught while the
+    header is decoded (``test_a_repeated_json_key_is_still_refused``).
     """
     with pytest.raises(ChannelConfigError) as caught:
-        parse({"*": "doubao-x", " * ": "doubao-y"})
+        parse(raw)
     assert "repeats" in caught.value.message
-
-
-def test_the_wire_is_refused_when_it_repeats_a_key():
-    """A repeated JSON key cannot be seen in a `dict` -- the parser keeps the last.
-
-    So the refusal has to happen while the header is being decoded, which is why
-    `parse_channel` uses the stdlib decoder with a pairs hook rather than the
-    orjson path the request bodies take. `{"*": "a", "*": "b"}` would otherwise
-    arrive here as a perfectly ordinary one-entry table.
-    """
-    for raw in (
-        '{"model_map": {"*": "first", "*": "second"}}',
-        '{"model": "doubao-seedream-5-0-260128", "model": "doubao-seedream-5-0-pro"}',
-    ):
-        with pytest.raises(ChannelConfigError) as caught:
-            parse_channel({**BASE, "x-channel-options": raw}, _settings())
-        assert caught.value.code == "channel_config_error"
-        assert "repeats" in caught.value.message
-
-
-def test_an_exact_entry_beside_the_catch_all_is_still_fine():
-    """The positive control: the rule costs a well-formed table nothing."""
-    spec = parse_channel(
-        {
-            **BASE,
-            "x-channel-options": '{"model_map": {"*": "doubao-x", "gpt-image-2": "doubao-y"}}',
-        },
-        _settings(),
-    )
-    assert spec.model_map == {"*": "doubao-x", "gpt-image-2": "doubao-y"}
 
 
 # --- resolve -----------------------------------------------------------------
@@ -224,17 +236,18 @@ def test_the_table_lands_on_the_channel_spec():
     spec = parse_channel(
         {
             **BASE,
-            "x-channel-options": '{"model_map": {"*": "doubao-x"}, "watermark": false}',
+            HEADER.lower(): f"{WILDCARD}=doubao-x",
+            "x-channel-options": '{"watermark": false}',
         },
         _settings(),
     )
     assert spec.model_map == {WILDCARD: "doubao-x"}
-    # The other options still travel to the script untouched: the mapping is
-    # resolved by the adapter, but the bag itself stays the script's.
+    # The options bag still travels to the script untouched, and is still the
+    # script's alone: the mapping is no longer a key inside it.
     assert spec.options["watermark"] is False
 
 
-def test_a_channel_without_the_option_gets_an_empty_table():
+def test_a_channel_without_the_header_gets_an_empty_table():
     assert parse_channel(BASE, _settings()).model_map == {}
 
 
@@ -242,18 +255,57 @@ def test_an_unusable_table_fails_the_channel_rather_than_the_request():
     """The failure mode this pins: 400 before an upstream call, not a silent
     fallback to an unmapped model."""
     with pytest.raises(ChannelConfigError) as caught:
-        parse_channel(
-            {**BASE, "x-channel-options": '{"model_map": ["not", "a", "table"]}'},
-            _settings(),
-        )
+        parse_channel({**BASE, HEADER.lower(): "not-a-pair"}, _settings())
+    assert caught.value.code == "channel_config_error"
+    assert caught.value.status == 400
+    assert caught.value.param == HEADER
+
+
+def test_the_mapping_is_not_a_key_the_script_can_see():
+    """`ctx.options` must not carry the table, in either direction.
+
+    The boundary is the whole point of giving the mapping its own header: the
+    adapter acts on it, the script is handed the rest unread. A script that
+    found a `model_map` key here would be reading a table the framework never
+    applied.
+    """
+    spec = parse_channel({**BASE, HEADER.lower(): f"{WILDCARD}=doubao-x"}, _settings())
+    assert "model_map" not in spec.options
+
+
+def test_the_old_option_key_is_refused_by_name():
+    """The retirement, and the reason it is a refusal rather than a fallback.
+
+    A channel still carrying the old key would have its table silently ignored
+    and send whatever the caller named -- reaching the wrong upstream model
+    without a word. The message names both headers so the fix is one edit.
+    """
+    raw = '{"model_map": "*=doubao-x", "watermark": false}'
+    with pytest.raises(ChannelConfigError) as caught:
+        parse_channel({**BASE, "x-channel-options": raw}, _settings())
     assert caught.value.code == "channel_config_error"
     assert caught.value.status == 400
     assert caught.value.param == "X-Channel-Options"
+    assert LEGACY_KEY in caught.value.message
+    assert HEADER in caught.value.message
+
+
+def test_a_repeated_json_key_is_still_refused():
+    """`X-Channel-Options` is still hand-written JSON, so its hook stays.
+
+    Unrelated to the mapping -- pinned here because the mapping used to be the
+    only reason anyone looked at this header closely, and the decoder hook must
+    not be retired along with it.
+    """
+    raw = '{"model": "doubao-a", "model": "doubao-b"}'
+    with pytest.raises(ChannelConfigError) as caught:
+        parse_channel({**BASE, "x-channel-options": raw}, _settings())
+    assert "repeats" in caught.value.message
 
 
 def test_an_unrelated_option_is_still_the_scripts_business():
-    """`model_map` is validated because the adapter acts on it. Nothing else is
-    -- and this test is the guard against that boundary creeping."""
+    """Nothing in the bag is validated -- this is the guard against that
+    boundary creeping now that the one exception has moved out."""
     spec = parse_channel(
         {**BASE, "x-channel-options": '{"image_ref_mode": "data_uri"}'}, _settings()
     )

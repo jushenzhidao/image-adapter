@@ -36,7 +36,7 @@ from adapter.errors import ChannelConfigError
 #: The only wildcard, and it is a whole-pattern one: ``*`` means every host,
 #: ``*.example.com`` means that suffix. ``api.*.com`` is refused rather than
 #: accepted and quietly never matched -- the same rule, and the same reason, as
-#: the model_map catch-all.
+#: the X-Model-Map catch-all.
 WILDCARD = "*"
 
 MODE_SHARED = "shared"

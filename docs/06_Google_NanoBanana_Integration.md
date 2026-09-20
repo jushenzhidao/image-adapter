@@ -105,10 +105,13 @@
 
 其它要点：
 
-- 模型名既是 URL 路径段、又要在能力表里查得到，所以渠道可以用 `model_map` 把客户端的
-  OpenAI 风格模型名翻成 Gemini 的 id：`{"*": "gemini-3.1-flash-image"}`。映射**先于**
-  能力表解析，两者叠加——`{"*": "nano-banana-2"}` 也会落到 `gemini-3.1-flash-image`
+- 模型名既是 URL 路径段、又要在能力表里查得到，所以渠道可以用 `X-Model-Map` 把客户端的
+  OpenAI 风格模型名翻成 Gemini 的 id：`X-Model-Map: *=gemini-3.1-flash-image`。映射**先于**
+  能力表解析，两者叠加——`*=nano-banana-2` 也会落到 `gemini-3.1-flash-image`
   （别名在能力表里，见 §5）。表不可用时在发任何上游请求之前报 `channel_config_error`。
+  注意**多数情况不必配它**：能力表已经有 `aliases`，客户端直接发 `nano-banana-2` /
+  `nano-banana-pro` 就能解析（§6.2 的示例就没有 `X-Model-Map`）。只有客户端会发**能力表解不了**
+  的名字（如 `gpt-image-1`，否则脚本 400 `Unknown model for this channel`）时才需要。
 
 - `responseModalities`：纯出图 `["IMAGE"]`；需要图文混排（infographic、故事配图）或开
   `tools:[{"google_search":{}}]` 时必须含 `"TEXT"`，否则 400。
@@ -232,7 +235,7 @@ https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:gener
                                                     ^^^^^^^^^^^^^^^^^^ 客户端选的模型
 ```
 
-脚本必须把生效的模型名（客户端 `model`，被渠道 `model_map` 命中则用它改写后的值，
+脚本必须把生效的模型名（客户端 `model`，被渠道 `X-Model-Map` 命中则用它改写后的值，
 否则回退 `X-Channel-Options.model`）写回路径最后一段：
 
 ```python

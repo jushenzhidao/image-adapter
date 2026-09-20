@@ -1,4 +1,4 @@
-"""``X-Channel-Options.model_map`` end to end.
+"""``X-Model-Map`` end to end.
 
 Two halves, and both are needed, because each one alone leaves a silent failure
 possible:
@@ -137,9 +137,15 @@ def gemini():
     server.server_close()
 
 
-def _options(table: object) -> dict:
-    """The header block every case in this file varies, and nothing else."""
-    return {"X-Channel-Options": json.dumps({"model_map": table})}
+def _options(table: dict[str, str]) -> dict:
+    """The header block every case in this file varies, and nothing else.
+
+    A table is written as a dict here and spelled into the flat wire form by
+    this one place, so each case reads as "which entry wins" rather than as
+    header syntax. The malformed-input cases bypass it and send a raw string:
+    what they are about *is* the spelling, so they should have to write it.
+    """
+    return {"X-Model-Map": ",".join(f"{key}={value}" for key, value in table.items())}
 
 
 def _posted_model() -> object:
@@ -279,57 +285,84 @@ def test_the_wildcard_catches_a_request_that_sent_no_model(
 
 
 @pytest.mark.parametrize(
-    "table",
+    "raw",
     [
-        ["not", "an", "object"],
-        "not-an-object",
-        7,
-        {"*": 7},
-        {"*": "   "},
-        {"": MAPPED},
-        {"gemini-*": MAPPED},
+        "not-a-pair",
+        "*=",
+        f"={MAPPED}",
+        f"gemini-*={MAPPED}",
     ],
     ids=[
-        "list",
-        "string",
-        "number",
-        "non-string-value",
-        "blank-value",
+        "no-equals",
+        "blank-model",
         "blank-key",
         "partial-glob",
     ],
 )
 def test_an_unusable_table_is_refused_before_any_upstream_call(
-    client, channel_headers, vendor, table
+    client, channel_headers, vendor, raw
 ):
     """A declared knob the adapter cannot honour must not look like one it did.
 
-    All seven shapes are the same mistake from the operator's side -- a table
-    they believe is in effect. The last one is the interesting case: a partial
-    glob reads like a pattern and would silently never match, which is worse
-    than refusing it outright.
+    All four shapes are the same mistake from the operator's side -- a table they
+    believe is in effect. The last one is the interesting case: a partial glob
+    reads like a pattern and would silently never match, which is worse than
+    refusing it outright.
+
+    Raw strings rather than `_options`, because here the spelling *is* the case.
+    The flat form cannot express part of what the JSON one could -- a table that
+    is not an object, a model value that is not text -- since a header value is
+    always text and `key=model` has nowhere to put a type. Those refusals live in
+    the unit suite, where `parse` can be handed impossible values directly; what
+    belongs here is only what an operator can actually type.
     """
     resp = client.post(
         "/v1/images/generations",
-        headers=channel_headers(PROBE, vendor, **_options(table)),
+        headers=channel_headers(PROBE, vendor, **{"X-Model-Map": raw}),
         json={"model": CLIENT_MODEL, "prompt": "a fox"},
     )
     assert resp.status_code == 400, resp.text
     error = resp.json()["error"]
     assert error["code"] == "channel_config_error"
-    assert error["param"] == "X-Channel-Options"
-    assert "model_map" in error["message"]
+    assert error["param"] == "X-Model-Map"
+    assert "X-Model-Map" in error["message"]
     assert _Recorder.bodies == [], "the request reached the upstream anyway"
 
 
-def test_a_repeated_key_on_the_wire_is_refused(client, channel_headers, vendor):
-    """`{"*": "a", "*": "b"}` must not read as a one-entry table.
+def test_a_repeated_key_is_refused(client, channel_headers, vendor):
+    """`*=a,*=b` must not read as a one-entry table.
 
-    Every JSON parser keeps the last duplicate and says nothing, so before this
-    refusal the operator's second value won silently -- the same "the table says
-    something else than what I wrote" defect the rest of these cases exist for.
+    Duplicate keys have no single reading, and every container that accepts them
+    keeps the last and says nothing -- so before this refusal the operator's
+    second value won silently, the same "the table says something else than what
+    I wrote" defect the rest of these cases exist for.
     """
-    raw = '{"model_map": {"*": "first-wins", "*": "second-wins"}}'
+    resp = client.post(
+        "/v1/images/generations",
+        headers=channel_headers(
+            PROBE, vendor, **{"X-Model-Map": "*=first-wins,*=second-wins"}
+        ),
+        json={"model": CLIENT_MODEL, "prompt": "a fox"},
+    )
+    assert resp.status_code == 400, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "channel_config_error"
+    assert error["param"] == "X-Model-Map"
+    assert "repeats" in error["message"]
+    assert _Recorder.bodies == [], "the request reached the upstream anyway"
+
+
+def test_the_retired_option_key_is_refused(client, channel_headers, vendor):
+    """A channel still carrying `X-Channel-Options.model_map` gets a 400.
+
+    Not a fallback and not a warning: the table would be ignored, the request
+    would go upstream under whatever name the caller used, and the operator
+    would have no signal that the mapping they declared is not in effect --
+    reaching the wrong upstream model silently, which is the one outcome this
+    whole feature exists to prevent. The message names the header that replaced
+    it, so the fix is one edit in one place.
+    """
+    raw = '{"model_map": "*=doubao-x", "watermark": false}'
     resp = client.post(
         "/v1/images/generations",
         headers=channel_headers(PROBE, vendor, **{"X-Channel-Options": raw}),
@@ -339,7 +372,7 @@ def test_a_repeated_key_on_the_wire_is_refused(client, channel_headers, vendor):
     error = resp.json()["error"]
     assert error["code"] == "channel_config_error"
     assert error["param"] == "X-Channel-Options"
-    assert "repeats" in error["message"]
+    assert "X-Model-Map" in error["message"]
     assert _Recorder.bodies == [], "the request reached the upstream anyway"
 
 
@@ -363,7 +396,7 @@ def test_the_mapping_runs_after_admission(client, channel_headers, vendor):
 # --- the scripts -------------------------------------------------------------
 
 
-def _ref_headers(url: str, ref: str, table: object | None = None) -> dict:
+def _ref_headers(url: str, ref: str, table: dict[str, str] | None = None) -> dict:
     """The channel New API would send for a script that lives in the store.
 
     Spelled out rather than borrowed from the `channel_headers` fixture, which
@@ -472,9 +505,8 @@ def test_ark_keeps_its_channel_model_when_nothing_matches(client, vendor):
     whatever routing label the caller used.
     """
     headers = _ref_headers(vendor, "volcengine_ark/images@v1")
-    headers["X-Channel-Options"] = json.dumps(
-        {"model": ARK_DEFAULT, "model_map": {"some-other-model": MAPPED}}
-    )
+    headers["X-Channel-Options"] = json.dumps({"model": ARK_DEFAULT})
+    headers["X-Model-Map"] = f"some-other-model={MAPPED}"
     resp = client.post(
         "/v1/images/generations",
         headers=headers,

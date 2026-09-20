@@ -139,7 +139,7 @@ async def adapt(
         channel = parse_channel(request.headers, settings)
 
         # Model mapping belongs to the channel, not to the caller: the table
-        # arrives in X-Channel-Options and the canonical body is rewritten
+        # arrives in X-Model-Map and the canonical body is rewritten
         # once, here, so every script sees the upstream name and none of them
         # has to know a table exists. Rewritten before `execute` rather than
         # inside a script for the same reason the front doors fold the body

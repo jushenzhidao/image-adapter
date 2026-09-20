@@ -17,22 +17,37 @@ callers look.
 Adding ``X-Upstream-Proxy`` is what made this worth pinning: it is the first
 header added to this contract in a while, and it needed edits in all three
 files.
+
+``X-Model-Map`` (2026-09-20) added a fourth place worth remembering -- the
+scripts' own docstrings quote the channel setup -- and, more usefully, exposed
+the hole described at ``_PARSER_MODULES``: a header can be read by the request
+path from a module this test never looked at.
 """
 
 from __future__ import annotations
 
 import typing
 
-from adapter import channel
+from adapter import channel, stage_spec
 from adapter.main import channel_contract
 from adapter.middleware.cors import ALWAYS_ALLOWED_HEADERS, CHANNEL_HEADERS
+
+#: Every module whose ``H_*`` constants name a header the request path reads.
+#: The cascade headers live in ``stage_spec`` because the module was split for
+#: size, and this scan only knew about ``channel`` until 2026-09-20 -- so
+#: ``X-Stages`` / ``X-Stage-Urls`` / ``X-Stage-Timeout`` were read by
+#: ``ChannelSpec.parse`` on every layered request while being absent from both
+#: the FastAPI contract and the CORS allow-list: invisible in /docs, refused by
+#: a browser preflight, and this test green throughout.
+_PARSER_MODULES = (channel, stage_spec)
 
 
 def _parser_headers() -> set[str]:
     """Lowercased header names the channel parser actually reads."""
     return {
         value.lower()
-        for name, value in vars(channel).items()
+        for module in _PARSER_MODULES
+        for name, value in vars(module).items()
         if name.startswith("H_") and isinstance(value, str)
     }
 

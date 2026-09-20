@@ -10,17 +10,15 @@ Channel setup (New API side):
   and it is this script's only source for it: the client's `model` is not
   forwarded on its own, because whatever a caller calls this channel
   ("gpt-image-2", say) is a routing label ARK has never heard of. To let
-  callers reach more than one access point, declare a mapping -- the
-  adapter resolves it before this script runs and hands the winner over as
+  callers reach more than one access point, declare the channel's mapping --
+  the adapter resolves it before this script runs and hands the winner over as
   `ctx.mapped_model`:
 
-  X-Channel-Options: {"model_map": {"*": "doubao-seedream-5-0-260128"}}
-  X-Channel-Options: {"model": "doubao-seedream-5-0-260128",
-                      "model_map": {"gpt-image-2": "doubao-seedream-5-0-pro-260628"}}
+  X-Model-Map: gpt-image-2=doubao-seedream-5-0-pro-260628,*=doubao-seedream-5-0-260128
 
-  Precedence is `model_map` match > `model` option > the built-in default.
-  An unmatched request therefore keeps the channel's `model`, so adding a
-  table cannot change what an unlisted request sends.
+  Precedence is an `X-Model-Map` match > the `model` option > the built-in
+  default. An unmatched request therefore keeps the channel's `model`, so adding
+  a table cannot change what an unlisted request sends.
 
   Nothing else is required. A URL reference is forwarded verbatim, so ARK
   fetches it and we download nothing, and when ARK reports it could not, we
@@ -516,7 +514,7 @@ async def _to_ark_ref(ctx, ref):
 async def transform(ctx, payload, phase):
     if phase == "request":
         body = {
-            # `ctx.mapped_model` is the channel's model_map applied to this
+            # `ctx.mapped_model` is the channel's X-Model-Map applied to this
             # request's model, or None when no table matched -- in which case
             # the channel's own option decides, exactly as it did before the
             # mapping existed (adapter/modelmap.py).

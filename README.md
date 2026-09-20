@@ -60,9 +60,13 @@ New API 在渠道配置里声明适配策略，通过头透传：
 | `X-Auth-Emit` | 否 | 凭证位置非标准时，如 `header:X-API-Key:Bearer` |
 | `X-Async` | 否 | 异步 Job 型上游，如 `poll=2,timeout=300` |
 | `X-Script-Sha256` | 否 | 完整性锁定 |
-| `X-Channel-Options` | 否 | JSON 对象，脚本内通过 `ctx.options` 读取；`model_map` 由 adapter 自己解析（见下） |
+| `X-Model-Map` | 否 | 本渠道的模型名改写表：`key=model` 逗号分隔、`*=` 兜底，如 `gpt-image-2=doubao-seedream-5-0-260128`。命中时改写 canonical body 的 `model`（见下） |
+| `X-Channel-Options` | 否 | JSON 对象，脚本内通过 `ctx.options` 读取。adapter 只把它解码成 dict，**不解读其中任何键** |
+| `X-Stages` | 否 | 覆盖脚本的 `STAGES`，如 `generate,upscale` |
+| `X-Stage-Urls` | 否 | 逐级上游地址，如 `generate=https://a.test/t2i,upscale=https://b.test/sr`。键必须是 `X-Stages` 的子集 |
+| `X-Stage-Timeout` | 否 | 级联总预算（秒），如 `total=300` |
 
-这 13 个头在代码里由 `adapter/main.py::channel_contract` 用 `Header()` 声明：因此 `/docs`
+这 17 个头在代码里由 `adapter/main.py::channel_contract` 用 `Header()` 声明：因此 `/docs`
 可以直接填写试调，契约表不会再与实现漂移。全部声明为**可选**是有意为之——缺失的头仍由
 `channel.py` 报 `channel_config_error`（400，OpenAI 错误体），而不是被 FastAPI 拦成 422。
 
@@ -91,41 +95,51 @@ New API 在渠道配置里声明适配策略，通过头透传：
 
 请求链路：取 `X-Upstream-Url` + 脚本 + `Authorization` → `transform(phase='request')` 转请求体 → 带凭证调上游 → `transform(phase='response')` 转响应体 → 返回客户端。
 
-### 模型映射（`X-Channel-Options.model_map`）
+### 模型映射（`X-Model-Map`）
 
-客户端用什么模型名是它的自由，上游认什么是上游的事。`model_map` 把两者对上，**按渠道生效、
+客户端用什么模型名是它的自由，上游认什么是上游的事。`X-Model-Map` 把两者对上，**按渠道生效、
 改数据不发版**：
 
 ```
-X-Channel-Options: {"model_map": {"gpt-image-2": "doubao-seedream-5-0-260128"}}
-X-Channel-Options: {"model_map": {"*": "doubao-seedream-5-0-260128"}}
+X-Model-Map: gpt-image-2=doubao-seedream-5-0-260128
+X-Model-Map: *=doubao-seedream-5-0-260128
+X-Model-Map: gpt-image-1=doubao-a,gpt-image-2=doubao-b,*=doubao-c
 ```
 
 | 规则 | 行为 |
 |---|---|
-| 未声明 `model_map` | **透传**：canonical body 的 `model` 原样发给上游，与不带此功能时逐字节相同 |
+| 未声明该头 | **透传**：canonical body 的 `model` 原样发给上游，与不带此功能时逐字节相同 |
 | 精确命中 | 该键的值成为上游模型名 |
-| `"*"` 兜底（**至多一条**） | 任何未被精确命中的请求都用它，**包括没带 `model` 的请求** |
+| `*` 兜底（**至多一条**） | 任何未被精确命中的请求都用它，**包括没带 `model` 的请求** |
 | 都没命中 | 不改：客户端发什么就是什么（表是翻译，不是白名单） |
 
 命中时 canonical body 的 `model` 被就地改写，脚本拿到的就是上游名——`openai/images@v1`
 （整包转发）与 `google/images@v1`（body 优先）因此**零改动**生效；`volcengine_ark/images@v1`
 的 model 是接入点 ID、不读 body，它读 `ctx.mapped_model`（未命中＝`None`）再回退到自己的
-`model` 选项。优先级：**`model_map` 命中 > 渠道 `model` 选项 > 脚本内置默认**。
+`model` 选项。优先级：**`X-Model-Map` 命中 > 渠道 `model` 选项 > 脚本内置默认**。
+
+**为什么是扁平 `key=model` 而不是 JSON**：HTTP 头值只能是字符串，表怎么都要序列化一次；扁平写法的
+优势在于它嵌进**另一份 JSON**（控制面提交渠道配置的 payload、ConfigMap、IaC 模板）时**不需要转义**，
+且与同族的 `X-Stage-Urls`、`X-Async` 同形。代价是 `,` 与 `=` 不能出现在键或值里——模型 id 是
+`[A-Za-z0-9._-]`，安全；`X-Stage-Urls` 为同样的原因带着同样的限制。
 
 解析规则见 `adapter/modelmap.py`，要点五条：
 
-- 表不可用（非对象，键或值为空/非字符串）→ 400 `channel_config_error`，`param` 指向
-  `X-Channel-Options`，且**在任何上游调用之前**失败。
+- 表不可用（没有 `=`、键或值为空、非裸 `*` 的通配键）→ 400 `channel_config_error`，`param` 指向
+  `X-Model-Map`，且**在任何上游调用之前**失败。
 - **至多一条 `*`**：表永远是「精确条目 + 一条兜底」，不是模式语言。重复的键一律 400，
-  覆盖两种形态：线上写了两次 `"*"`（JSON 解析器默认「后者胜」，会**静默丢掉一个**），
+  覆盖两种形态：线上写了两次 `*`（容器默认「后者胜」，会**静默丢掉一个**），
   以及只差空白的 `" * "` 与 `"*"`（去掉空白后是同一个键）。
-- 只支持裸 `"*"` 作兜底：`"gemini-*"` 这类看着像模式、实际永远匹配不上的键会被**拒绝**，
+- 只支持裸 `*` 作兜底：`gemini-*=x` 这类看着像模式、实际永远匹配不上的键会被**拒绝**，
   而不是静默不生效（配置里最坏的形态是一个「设了等于没设」的开关）。
 - 匹配区分大小写（模型 id 是）。
 - 客户端可见的回显不受影响：chat / responses 用折叠前的原始 body 标注回复，所以**上游模型名
   不会泄回客户端**。观测上 `adapt` span 的 `model` 仍＝客户端请求的模型，命中时**额外**记
   `model_upstream`，一次 trace 即可回答「要的是 X、实际跑的是 Y」。
+
+> ⚠️ **旧写法 `X-Channel-Options.model_map` 已移除，且是显式拒绝而非静默忽略**：渠道若还带着该键，
+> 会在发上游之前报 400 `channel_config_error`（`param` 指向 `X-Channel-Options`）。理由很直接——
+> 静默忽略会拿着一个没人改写过的模型名发给上游，可能路由到错的模型却毫无提示。
 
 > ⚠️ **先看 new-api 那一层再决定要不要用本表**：new-api 的渠道自带模型映射
 > （渠道配置里的 `model_mapping`），而且**覆盖 images 路径**——它会在转发前改写发往本服务的
@@ -165,7 +179,7 @@ async def transform(ctx, payload, phase):
 | 成员 | 说明 |
 |---|---|
 | `ctx.options` | `X-Channel-Options` 解析后的 dict |
-| `ctx.mapped_model` | 本次请求经渠道 `model_map` 解析出的上游模型名；**未命中为 `None`**（持有模型的脚本据此回退到自己的选项，见 `volcengine_ark/images@v1`） |
+| `ctx.mapped_model` | 本次请求经渠道 `X-Model-Map` 解析出的上游模型名；**未命中为 `None`**（持有模型的脚本据此回退到自己的选项，见 `volcengine_ark/images@v1`） |
 | `ctx.upstream_url` | 当前渠道 URL |
 | `ctx.request_id` | 贯穿日志的请求 ID |
 | `await ctx.download_image(url)` | 下载图片，Redis 缓存 |
