@@ -269,8 +269,9 @@ def test_getsts_token_is_serial_while_the_puts_stay_concurrent():
     2026-09-19: the materialisation is three stages, not one fanout, because
     `getstsToken` is the only call of the three that the channel's proxy
     carries (the PUTs are on the bypass list). Run two of them at once and a
-    single client request leaves from two addresses, which is exactly what a
-    per-request rotation is supposed to rule out.
+    single client request leaves from two addresses -- the exit is chosen per
+    *connection*, so overlapping that hop is what splits one request across
+    two of them.
 
     Order alone cannot see this: concurrent and serial calls are recorded in
     the same sequence. The in-flight high-water mark can.

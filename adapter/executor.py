@@ -174,10 +174,6 @@ async def _do_upstream(
     }
     if channel.proxy.enabled:
         span_attrs["proxy"] = redact_proxy(channel.proxy.url)
-        if channel.proxy.per_request and channel.proxy.session_id:
-            # Without this, "why did two identical requests leave from different
-            # addresses" is unanswerable from the trace alone.
-            span_attrs["proxy_session"] = channel.proxy.session_id
     with logfire.span("upstream_call", **span_attrs) as span, span_elapsed_ms(span):
         try:
             async with ctx.http.request(method, url, **kwargs) as resp:

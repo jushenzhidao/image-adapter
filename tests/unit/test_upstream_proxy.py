@@ -2,10 +2,14 @@
 
 Each decision asserted here is tempting to reverse, which is why it is pinned:
 
-  * **off by default.** An unset ``UPSTREAM_PROXY_ALLOWLIST`` refuses the
-    header instead of allowing any host -- the opposite default from
-    ``X-Upstream-Url``. A bad upstream URL sends a request somewhere it should
-    not go; a bad proxy URL hands the vendor credential to a stranger.
+  * **empty means "any host".** ``UPSTREAM_PROXY_ALLOWLIST`` is a
+    *restriction* when it is set and no restriction when it is not -- the same
+    orientation as ``X-Upstream-Url``'s list. It was fail-closed until
+    2026-09-20, so the test below pins which way it goes now: a future reader
+    must not be able to "restore" the old default by accident.
+  * **a named list still bites.** With a value, an off-list host is refused
+    before any upstream call -- a bad proxy URL hands the vendor credential to
+    a stranger, so the check is worth keeping wherever it is affordable.
   * **SOCKS is refused by name.** aiohttp has no SOCKS transport, so accepting
     ``socks5://`` would mean the call quietly goes direct: a wrong-exit bug
     that looks exactly like a healthy channel.
@@ -25,7 +29,6 @@ ignored the value.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 
 import aiohttp
 import pytest
@@ -75,24 +78,21 @@ def test_a_declared_proxy_is_carried_into_the_call() -> None:
     assert kwargs["proxy"] == "http://127.0.0.1:3128"
 
 
-def test_the_header_is_off_until_the_deployment_opts_in() -> None:
-    """Empty allowlist refuses the header -- it does not mean "any host".
+def test_an_empty_allowlist_accepts_any_host() -> None:
+    """Empty is "no restriction", not "refuse the header" (inverted 2026-09-20).
 
-    The two refusals have to stay tellable apart: "this deployment turned the
-    header off" and "that host is not on your list" need different fixes, and
-    an assertion that only looks for the key name passes for either. This test
-    used to do exactly that, and a mutant that deleted the dedicated branch
-    left it green -- the generic host check happens to say the same key name.
+    It was the other way round until then, and back then the two refusals had
+    to stay tellable apart -- "this deployment turned the header off" and
+    "that host is not on your list" need different fixes, while a
+    key-name-only assertion passes for either. Only one refusal is left now,
+    which is exactly why the direction itself is pinned here.
     """
-    with pytest.raises(ChannelConfigError) as excinfo:
-        _channel("http://127.0.0.1:3128")
+    loopback = _channel("http://127.0.0.1:3128")
+    assert loopback.proxy.url == "http://127.0.0.1:3128"
 
-    error = excinfo.value
-    assert error.status == 400
-    assert error.code == "channel_config_error"
-    assert error.param == "X-Upstream-Proxy"
-    assert "is disabled" in error.message
-    assert "not in UPSTREAM_PROXY_ALLOWLIST" not in error.message
+    # Not just loopback: with no list, every host is accepted.
+    elsewhere = _channel("http://proxy.elsewhere.test:3128")
+    assert elsewhere.proxy.url == "http://proxy.elsewhere.test:3128"
 
 
 def test_a_host_outside_the_allowlist_is_refused() -> None:
@@ -202,16 +202,10 @@ async def test_the_outbound_call_really_goes_through_the_proxy() -> None:
 # --------------------------------------------------------------- scope: hosts
 
 
-def _channel_with(
-    proxy: str | None = None,
-    mode: str | None = None,
-    **settings_overrides,
-):
+def _channel_with(proxy: str | None = None, **settings_overrides):
     headers = dict(BASE)
     if proxy is not None:
         headers["x-upstream-proxy"] = proxy
-    if mode is not None:
-        headers["x-upstream-proxy-mode"] = mode
     return parse_channel(headers, _settings(**settings_overrides))
 
 
@@ -308,70 +302,17 @@ def test_every_accepted_shape_is_one_that_can_match_something(
     assert "proxy" not in kwargs, f"{pattern!r} was accepted but bypasses nothing"
 
 
-# --------------------------------------------------------- scope: per request
+def test_an_authenticated_proxy_url_is_used_as_is() -> None:
+    """A proxy that authenticates by URL keeps working: nothing is echoed over it.
 
-
-def test_per_request_marks_the_channel_for_a_fresh_exit() -> None:
-    channel = _channel_with(
-        "http://127.0.0.1:3128",
-        mode="per-request",
-        upstream_proxy_allowlist="127.0.0.1",
-    )
-    assert channel.proxy.per_request is True
-
-    # Without a session id there is nothing to log in with: the pipeline is the
-    # only layer that knows the request boundary, so it attaches one.
-    _, _, kwargs = build_request(channel, RequestPlan(), {}, None)
-    assert kwargs["proxy"] == "http://127.0.0.1:3128"
-    assert "proxy_headers" not in kwargs
-
-
-def test_an_attached_session_travels_as_the_proxy_login() -> None:
-    channel = _channel_with(
-        "http://127.0.0.1:3128",
-        mode="per-request",
-        upstream_proxy_allowlist="127.0.0.1",
-    )
-    channel = replace(channel, proxy=channel.proxy.with_session("deadbeef"))
-
-    _, _, kwargs = build_request(channel, RequestPlan(), {}, None)
-    header = kwargs["proxy_headers"]["Proxy-Authorization"]
-    assert header == aiohttp.encode_basic_auth("deadbeef", "x")
-
-
-def test_shared_mode_leaves_an_authenticated_proxy_url_alone() -> None:
-    """A proxy that authenticates by URL keeps working: nothing is echoed over it."""
+    The adapter adds no proxy credentials of its own -- the URL's own userinfo is
+    all there is, and it is never re-emitted as a header.
+    """
     channel = _channel_with(
         "http://user:pw@127.0.0.1:3128", upstream_proxy_allowlist="127.0.0.1"
     )
     _, _, kwargs = build_request(channel, RequestPlan(), {}, None)
     assert "proxy_headers" not in kwargs
-
-
-def test_per_request_refuses_a_proxy_url_that_carries_credentials() -> None:
-    """The session id *is* the login; a URL with its own would be overridden."""
-    with pytest.raises(ChannelConfigError) as excinfo:
-        _channel_with(
-            "http://user:pw@127.0.0.1:3128",
-            mode="per-request",
-            upstream_proxy_allowlist="127.0.0.1",
-        )
-    assert "without credentials" in excinfo.value.message
-
-
-def test_the_mode_header_needs_the_proxy_header() -> None:
-    """Silently ignoring it would look configured and rotate nothing."""
-    with pytest.raises(ChannelConfigError) as excinfo:
-        _channel_with(mode="per-request", upstream_proxy_allowlist="*")
-    assert "requires" in excinfo.value.message
-
-
-def test_an_unknown_mode_is_refused() -> None:
-    with pytest.raises(ChannelConfigError) as excinfo:
-        _channel_with(
-            "http://127.0.0.1:3128", mode="per-requests", upstream_proxy_allowlist="*"
-        )
-    assert excinfo.value.param == "X-Upstream-Proxy-Mode"
 
 
 # ------------------------------------------------------- the script-side view
@@ -408,16 +349,3 @@ def test_the_script_view_attaches_the_proxy_per_call() -> None:
     assert view.closed is False
 
 
-def test_the_script_view_sends_the_session_id_when_the_channel_rotates() -> None:
-    seen: list[dict] = []
-
-    class FakeSession:
-        def post(self, url: str, **kwargs):
-            seen.append(kwargs)
-            return None
-
-    plan = ProxyPlan(url="http://127.0.0.1:3128", per_request=True, session_id="abc")
-    ProxiedHttp(FakeSession(), plan).post("https://api.vendor.test/x", json={})
-
-    header = seen[0]["proxy_headers"]["Proxy-Authorization"]
-    assert header == aiohttp.encode_basic_auth("abc", "x")

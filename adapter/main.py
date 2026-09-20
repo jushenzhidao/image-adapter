@@ -91,14 +91,8 @@ async def channel_contract(
         Header(
             alias="X-Upstream-Proxy",
             description="本渠道单独走出的 HTTP 代理（如 http://127.0.0.1:3128）；"
-            "默认关闭，需 UPSTREAM_PROXY_ALLOWLIST 放行；不支持 SOCKS",
-        ),
-    ] = None,
-    x_upstream_proxy_mode: Annotated[
-        str | None,
-        Header(
-            alias="X-Upstream-Proxy-Mode",
-            description="shared（默认，复用连接）或 per-request（每次客户端请求新连接、新出口）",
+            "UPSTREAM_PROXY_ALLOWLIST 有值时只放行清单内的 host（否则调上游前 400），"
+            "空值＝任意 host；不支持 SOCKS",
         ),
     ] = None,
     x_auth_emit: Annotated[

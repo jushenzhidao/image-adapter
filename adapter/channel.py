@@ -5,7 +5,6 @@ declares only how to talk to that endpoint:
 
   X-Upstream-Url   https://api.vendor-x.com/v2/text2img   (required)
   X-Upstream-Proxy http://127.0.0.1:3128    outbound proxy, this channel only
-  X-Upstream-Proxy-Mode   shared | per-request    one exit per request
   X-Script         inline source, literal \\n as separator (one of three)
   X-Script-64      base64 of the source                   (one of three)
   X-Script-Ref     vendor_y/mj@v1.3 or https://.../mj.py  (one of three)
@@ -29,12 +28,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
 
 from adapter.errors import ChannelConfigError
 from adapter.modelmap import LEGACY_KEY as LEGACY_MODEL_MAP_KEY
 from adapter.modelmap import parse as parse_model_map
-from adapter.proxyplan import MODES, MODE_PER_REQUEST, ProxyPlan, parse_hosts
+from adapter.proxyplan import ProxyPlan, parse_hosts
 from adapter.settings import Settings
 from adapter.stage_spec import StageSpec
 from adapter.urlguard import check_proxy_url, check_url
@@ -42,7 +40,6 @@ from adapter.urlguard import check_proxy_url, check_url
 H_URL = "x-upstream-url"
 H_METHOD = "x-upstream-method"
 H_PROXY = "x-upstream-proxy"
-H_PROXY_MODE = "x-upstream-proxy-mode"
 H_SCRIPT = "x-script"
 H_SCRIPT_64 = "x-script-64"
 H_SCRIPT_REF = "x-script-ref"
@@ -244,35 +241,10 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
     # before the request goes out, not as an opaque 502 afterwards. Absent
     # header means "no proxy" and costs nothing.
     proxy_raw = (headers.get(H_PROXY) or "").strip()
-    proxy_mode_raw = (headers.get(H_PROXY_MODE) or "").strip().lower()
     if not proxy_raw:
-        # The mode is useless without the address, and a channel that sets it is
-        # a mistake that would otherwise look like it worked: nothing would
-        # rotate, and nothing would say so.
-        if proxy_mode_raw:
-            raise ChannelConfigError(
-                "X-Upstream-Proxy-Mode requires X-Upstream-Proxy to be set as well",
-                "X-Upstream-Proxy",
-            )
         proxy = ProxyPlan()
     else:
         url = check_proxy_url(proxy_raw, settings, "X-Upstream-Proxy")
-        if proxy_mode_raw and proxy_mode_raw not in MODES:
-            raise ChannelConfigError(
-                f"X-Upstream-Proxy-Mode must be one of {sorted(MODES)}",
-                "X-Upstream-Proxy-Mode",
-            )
-        per_request = proxy_mode_raw == MODE_PER_REQUEST
-        if per_request and urlparse(url).username:
-            # The session id travels as the proxy credential, so a URL carrying
-            # its own would either be overridden or start being rejected by the
-            # bridge. Fail here, where the fix is obvious.
-            raise ChannelConfigError(
-                "X-Upstream-Proxy-Mode=per-request needs a proxy URL without "
-                "credentials: the session id is sent as the proxy login, so the "
-                "upstream password belongs on the bridge itself",
-                "X-Upstream-Proxy",
-            )
         # The bypass list is the deployment's, not this channel's: what has to
         # stay direct (an object store upload) is the same answer for every
         # channel, and repeating it on each one is how the copies drift apart.
@@ -281,7 +253,6 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
             bypass=parse_hosts(
                 settings.upstream_proxy_bypass_hosts, "UPSTREAM_PROXY_BYPASS_HOSTS"
             ),
-            per_request=per_request,
         )
 
     source_name, _ = _first_present(headers, H_SCRIPT, H_SCRIPT_64, H_SCRIPT_REF)

@@ -11,9 +11,7 @@ import hmac
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from dataclasses import replace
 from typing import Any
-from uuid import uuid4
 
 import aiohttp
 from starlette.requests import Request
@@ -176,38 +174,12 @@ async def adapt(
         record_ingress_failure(endpoint, stage, payload, exc)
         raise
 
-    # A rotating proxy hands out a new address per connection, so "a new exit
-    # per client request" is really "this request must not reuse the previous
-    # request's socket". That is expressed by giving the request its own
-    # session: its pool is discarded in `ctx.close()`, and nothing can be
-    # inherited. The session id rides along as the proxy login so the bridge
-    # pins this request's calls to one upstream tunnel even if one connection
-    # is dropped and re-established mid-request (an SSE generation is long
-    # enough for that to happen).
-    #
-    # Costs, stated plainly: a session per request means a fresh TCP+TLS
-    # handshake per request -- which is exactly what buying a new exit costs,
-    # and why this is opt-in per channel rather than the default.
-    request_http: aiohttp.ClientSession | None = None
-    if channel.proxy.per_request:
-        channel = replace(
-            channel, proxy=channel.proxy.with_session(uuid4().hex[:16])
-        )
-        request_http = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=settings.upstream_timeout),
-            connector=aiohttp.TCPConnector(
-                limit=settings.http_pool_limit,
-                limit_per_host=settings.http_pool_limit_per_host,
-            ),
-        )
-
     ctx = AdapterContext(
         request_id=request_id,
         channel=channel,
         settings=settings,
         endpoint=endpoint,
         http=getattr(request.app.state, "http", None),
-        request_http=request_http,
         cache=getattr(request.app.state, "asset_cache", None),
         storage=getattr(request.app.state, "storage", None),
         requested_model=requested_model,

@@ -284,10 +284,6 @@ def main(argv: list[str] | None = None) -> int:
                        help="让本渠道走出站代理，如 http://127.0.0.1:11080"
                             "（本地 SOCKS→HTTP 桥见 tools/socks_http_bridge.py）；"
                             "空＝不走代理（默认，与存量渠道一致）")
-    parser.add_argument("--proxy-mode", default="per-request",
-                       choices=("shared", "per-request"),
-                       help="per-request（默认）＝每个客户端请求一条新连接 ⇒ 换出口；"
-                            "shared＝连接复用、出口稳定")
     args = parser.parse_args(argv)
 
     try:
@@ -360,8 +356,7 @@ def main(argv: list[str] | None = None) -> int:
             # call and everything the script does through ctx.http leave through
             # the proxy, while the OSS upload stays direct (bypass list above).
             headers["X-Upstream-Proxy"] = args.proxy
-            headers["X-Upstream-Proxy-Mode"] = args.proxy_mode
-            print(f"经代理：{args.proxy}（模式 {args.proxy_mode}）")
+            print(f"经代理：{args.proxy}")
         with TestClient(app, raise_server_exceptions=False) as client:
             for tier in tiers:
                 assets: list[str] = []       # 本档内累积：i2i 用 assets[0]，multi 用前两张

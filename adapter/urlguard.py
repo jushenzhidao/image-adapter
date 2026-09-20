@@ -123,15 +123,13 @@ def check_proxy_url(
     if not host:
         raise ChannelConfigError(f"{header} is missing a hostname", header)
 
+    # 🔴 An empty list means "any host": a deployment that has not named its
+    # proxies is not refused the header. That **inverts** the original
+    # fail-closed default on purpose (2026-09-20, deployment owner's call);
+    # adapter/settings.py carries the trade-off beside the field. With a value
+    # here, an off-list host is still refused before any upstream call.
     allowed = settings.upstream_proxy_host_set
-    if not allowed:
-        raise ChannelConfigError(
-            f"{header} is disabled on this deployment: set "
-            "UPSTREAM_PROXY_ALLOWLIST to the proxy hosts it trusts "
-            "(comma-separated, or * to allow any host)",
-            header,
-        )
-    if "*" not in allowed and host not in allowed:
+    if allowed and "*" not in allowed and host not in allowed:
         raise ChannelConfigError(
             f"{header} host is not in UPSTREAM_PROXY_ALLOWLIST", header
         )

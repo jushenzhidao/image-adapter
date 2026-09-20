@@ -140,7 +140,6 @@ class ContextCore:
         settings: Settings,
         endpoint: str = "",
         http: aiohttp.ClientSession | None = None,
-        request_http: aiohttp.ClientSession | None = None,
         cache: Any = None,
         storage: Any = None,
         requested_model: str | None = None,
@@ -206,12 +205,6 @@ class ContextCore:
         # throw away keep-alive, so these are injected rather than created.
         self._http = http
         self._owns_http = http is None
-        # A session that belongs to *this request*, present only when the
-        # channel rotates its exit per request. It exists so that no socket can
-        # be reused from the previous request -- which is the entire mechanism
-        # behind "a new address per client request" (adapter/proxyplan.py), and
-        # the reason `close()` below has to shut it down.
-        self._request_http = request_http
         self._cache = cache
         self._owns_cache = cache is None
         self._storage = storage
@@ -233,7 +226,7 @@ class ContextCore:
 
     @property
     def http(self) -> aiohttp.ClientSession | ProxiedHttp:
-        """The session scripts and the engine share for this request.
+        """The session scripts and the engine share.
 
         A proxy view when the channel declared one: aiohttp attaches a proxy
         per *request*, so a channel-level proxy has to be applied at the call
@@ -258,14 +251,7 @@ class ContextCore:
         return self._script_session()
 
     def _script_session(self) -> aiohttp.ClientSession:
-        """The one pool this request's outbound calls share.
-
-        The request-scoped session wins while it is alive: for a rotating
-        channel it is the pool whose sockets get discarded when the request
-        ends, which is what makes the next request leave from somewhere else.
-        """
-        if self._request_http is not None and not self._request_http.closed:
-            return self._request_http
+        """The one pool this process's outbound calls share."""
         if self._http is None or self._http.closed:
             timeout = aiohttp.ClientTimeout(total=self.settings.upstream_timeout)
             connector = aiohttp.TCPConnector(limit=self.settings.http_pool_limit)
@@ -309,11 +295,6 @@ class ContextCore:
     async def close(self) -> None:
         # Shared resources belong to the application lifespan: a request only
         # closes what it created itself.
-        if self._request_http is not None:
-            # Always ours, never shared: closing it is what guarantees the next
-            # request cannot inherit this one's exit.
-            await self._request_http.close()
-            self._request_http = None
         if self._http is not None and self._owns_http:
             await self._http.close()
         self._http = None

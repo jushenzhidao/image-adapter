@@ -3,32 +3,26 @@
 Two decisions live here rather than at the transport call site, because both
 are about *scope* and both are easy to get subtly wrong:
 
-* ``bypass`` -- a proxy is not a blanket "send everything through it". An upload
-  to the vendor's object store is the case this exists for: it is not the
-  traffic the exit was bought for, and pushing megabytes through a pool only
-  makes it slower. It is a **deployment-level** list rather than a per-channel
-  header, because "what must stay direct" is a property of the estate, not of
-  one channel -- and a per-channel list would have to be repeated on every
-  channel that has the same answer. Reference images are excluded harder still,
-  in code rather than by a list: their target is chosen by the caller, so the
-  download path carries no proxy view at all (``AdapterContext.download_http``).
+* ``bypass`` -- a proxy is not a blanket "send everything through it". The case
+  it exists for is a host the channel must reach **and the exit cannot**: an
+  internal service (qwen's ``token_url`` is configured as a loopback address)
+  is unreachable from a remote pool, which would dial *its own* 127.0.0.1 --
+  so that call has to leave directly. It is a **deployment-level** list rather
+  than a per-channel header, because "what must stay direct" is a property of
+  the estate, not of one channel, and a per-channel list would have to be
+  repeated on every channel holding the same answer. Two kinds of traffic never
+  consult this list, because the channel does not choose their target: material
+  downloads (the caller's URL -- ``AdapterContext.download_http``) and
+  object-store uploads (the storage client carries no proxy view at all). Both
+  go direct **by construction**, not because they are named here.
 
-* ``per_request`` -- a rotating pool hands out a new address per TCP
-  connection, so "one address per client request" is a statement about
-  *connections*: the request must not reuse one opened for the previous
-  request. ``session_id`` is what keeps a single request's calls together when
-  a connection does have to be re-established -- it travels as the proxy
-  credential, and the bridge on the other end pins it to one upstream tunnel.
-
-Keeping both in a frozen value object also means the request-scoped session id
-can be attached with ``dataclasses.replace`` at the one place that knows the
-request boundary (the pipeline), instead of being threaded through the engine
-as a separate parameter beside the channel.
+The plan is a frozen value object, so a channel can carry one without the
+engine having to know how it was decided.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from adapter.errors import ChannelConfigError
@@ -38,10 +32,6 @@ from adapter.errors import ChannelConfigError
 #: than accepted and quietly never matched (see ``_is_wildcard_shape``) -- the
 #: same rule, and the same reason, as the X-Model-Map catch-all.
 WILDCARD = "*"
-
-MODE_SHARED = "shared"
-MODE_PER_REQUEST = "per-request"
-MODES = frozenset({MODE_SHARED, MODE_PER_REQUEST})
 
 #: Characters that cannot appear in a bare host pattern. A pattern carrying a
 #: scheme, a port or a credential is a URL pasted into the wrong header, and it
@@ -106,14 +96,12 @@ def host_matches(host: str, pattern: str) -> bool:
 
 @dataclass(frozen=True)
 class ProxyPlan:
-    """Where a channel's outbound calls go, and whether they may reuse a socket."""
+    """Where a channel's outbound calls go."""
 
     url: str = ""
     #: Host patterns that stay direct (UPSTREAM_PROXY_BYPASS_HOSTS). Matched on
     #: the target's hostname only, so a pattern never depends on path or port.
     bypass: tuple[str, ...] = ()
-    per_request: bool = False
-    session_id: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -137,16 +125,3 @@ class ProxyPlan:
             return False
         return not any(host_matches(host, pattern) for pattern in self.bypass)
 
-    def credentials(self) -> tuple[str, str] | None:
-        """Proxy credentials to send, or None to use the URL's own.
-
-        Only per-request plans carry them: the session id is the whole point,
-        and it has to reach the bridge on every call. A shared plan sends
-        nothing extra, so a proxy that authenticates by URL keeps working.
-        """
-        if self.per_request and self.session_id:
-            return (self.session_id, "x")
-        return None
-
-    def with_session(self, session_id: str) -> ProxyPlan:
-        return replace(self, session_id=session_id)

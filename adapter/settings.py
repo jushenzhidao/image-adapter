@@ -72,11 +72,18 @@ class Settings(BaseSettings):
 
     # --- Outbound proxy (X-Upstream-Proxy) ---------------------------------
     # A proxy terminates the connection, so it sees everything the adapter
-    # sends -- the vendor credential included. The header is caller-supplied,
-    # and it is not an SSRF-only concern: a hostile value exfiltrates upstream
-    # credentials rather than merely scanning the network. Hence the inverted
-    # default -- an empty list does not mean "any host is fine", it means the
-    # header is refused outright. A deployment opts in by naming its proxies.
+    # sends -- the vendor credential included, and the header is supplied by
+    # the caller. A hostile value therefore hands the vendor key to a stranger,
+    # which is not an SSRF-only concern; naming hosts here is what prevents it.
+    #
+    # 🔴 The empty default is **fail-open**: an unnamed list means "any host".
+    # It was fail-closed until 2026-09-20 (empty = refuse the header outright,
+    # the opposite of X-Upstream-Url's list) and was inverted at the deployment
+    # owner's call, so a channel carrying a legitimate proxy value is never
+    # refused over a list nobody remembered to fill in. The cost is real and
+    # accepted: with an empty list, whoever can set channel headers can route
+    # this channel's egress through a third party. Set a value to get the check
+    # back -- a named list still refuses an off-list host before any call.
     # Comma-separated hosts; "*" is an explicit, deliberate wildcard. Loopback
     # and private hosts are permitted here (the deployment this exists for is a
     # local SOCKS-to-HTTP bridge), and SOCKS is refused by scheme -- see

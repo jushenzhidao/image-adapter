@@ -55,8 +55,7 @@ New API 在渠道配置里声明适配策略，通过头透传：
 | `Authorization` | 否 | **上游厂商**凭证，原样透传，不用于本服务鉴权 |
 | `X-Adapter-Key` | 是 | 本服务准入密钥 |
 | `X-Upstream-Method` | 否 | 默认 `POST` |
-| `X-Upstream-Proxy` | 否 | 本渠道单独走出的 HTTP 代理，如 `http://127.0.0.1:3128`。覆盖**除素材下载外**的所有出站（引擎代发 + 脚本经 `ctx.http` 的调用）；`UPSTREAM_PROXY_BYPASS_HOSTS` 里的 host 除外（对象存储上传走这条）。**默认关闭**：`UPSTREAM_PROXY_ALLOWLIST` 为空时该头一律 400。**不支持 SOCKS**（`socks5://` 被明确拒绝），需在适配器旁跑一个 SOCKS→HTTP 桥 |
-| `X-Upstream-Proxy-Mode` | 否 | `shared`（默认，连接复用、出口稳定）或 `per-request`（**每次客户端请求**新建连接 ⇒ 换一个出口；session id 作为代理登录名下发，让同一次请求落在同一条上游隧道） |
+| `X-Upstream-Proxy` | 否 | 本渠道单独走出的 HTTP 代理，如 `http://127.0.0.1:3128`。覆盖**除素材下载外**的所有出站（引擎代发 + 脚本经 `ctx.http` 的调用）；`UPSTREAM_PROXY_BYPASS_HOSTS` 里的 host 除外（把它当"出口够不着"的名单：内网/回环服务、或任何不该走付费出口的目标）。**空＝任意 host**（`UPSTREAM_PROXY_ALLOWLIST` 是**限制**不是开关：设了值则只放行清单内的 host，off-list 仍在调上游之前 400）。**不支持 SOCKS**（`socks5://` 被明确拒绝），需在适配器旁跑一个 SOCKS→HTTP 桥 |
 | `X-Auth-Emit` | 否 | 凭证位置非标准时，如 `header:X-API-Key:Bearer` |
 | `X-Async` | 否 | 异步 Job 型上游，如 `poll=2,timeout=300` |
 | `X-Script-Sha256` | 否 | 完整性锁定 |
@@ -74,16 +73,19 @@ New API 在渠道配置里声明适配策略，通过头透传：
 漏了 CORS 的那一份不会报错，只会被浏览器预检拦在发出之前，呈现为「这个头没用」。
 `tests/unit/test_channel_headers_contract.py` 把三份钉在一起，新增头时它会红。
 
-`X-Upstream-Proxy` 是唯一**默认关闭**的头：代理会经手发往厂商的凭证，坏值不是扫描内网而是
-把密钥交给第三方，所以空白的 `UPSTREAM_PROXY_ALLOWLIST` 表示「拒绝该头」而不是「任意 host 都行」
-（与 `X-Upstream-Url` 的取向相反）。回环/私网地址在这里是**允许**的——本地桥正是它的用法。
+`X-Upstream-Proxy` 是唯一需要**部署侧放行**的头：代理会经手发往厂商的凭证，坏值不是扫描内网而是
+把密钥交给第三方，所以 `UPSTREAM_PROXY_ALLOWLIST` 里的 host 之外一律**在调上游之前** 400。
+🔴 但**空值＝任意 host**（2026-09-20 反转，此前是「空＝拒绝该头」，与 `X-Upstream-Url` 相反的取向
+已放弃）——它是**限制**、不是开关；要让检查生效，就必须在部署里写清代理 host。
+回环/私网地址在这里是**允许**的——本地桥正是它的用法。
 
-范围由**部署级**清单决定，渠道头不重复声明：`UPSTREAM_PROXY_BYPASS_HOSTS` 里的 host 直连
-（对象存储上传就是这条）。它**只认三种写法**：裸 host、`*`（所有 host）、`*.suffix`（某后缀）；
-`api.*.com` 这类中间通配会在**渠道解析期就被拒绝**（它会匹配不到任何 host——写成"排除"
-却什么都没排除）；**空清单＝一个都不豁免**，该渠道的所有出站都走代理。**素材下载**
-（`ctx.download_image` / `image_bytes`）不进代理，且不是靠清单——它的目标是调用方或上游给的
-URL，代码里就不带代理视图（`ctx.download_http`）。
+范围由**部署级**清单决定，渠道头不重复声明：`UPSTREAM_PROXY_BYPASS_HOSTS` 里的 host 直连。
+它解决的**不是**省流量，而是**通不通**——出口够不着那些 host（qwen 的 `token_url` 指向回环，
+远端池只会去连它自己的 `127.0.0.1`）。它**只认三种写法**：裸 host、`*`（所有 host）、
+`*.suffix`（某后缀）；`api.*.com` 这类中间通配会在**渠道解析期就被拒绝**（它会匹配不到任何
+host——写成"排除"却什么都没排除）；**空清单＝一个都不豁免**，该渠道的所有出站都走代理。
+⚠️ **它不负责上传**：对象存储上传与**素材下载**（`ctx.download_image` / `image_bytes`）都由
+**构造**决定直连——存储客户端与 `ctx.download_http` 都不带代理视图，不读这份清单。
 
 最小形态示例：
 

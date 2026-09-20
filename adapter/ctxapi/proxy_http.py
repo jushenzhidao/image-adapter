@@ -88,12 +88,4 @@ class ProxiedHttp:
         if not self._plan.covers(url):
             return kwargs
         kwargs.setdefault("proxy", self._plan.url)
-        credentials = self._plan.credentials()
-        if credentials is not None:
-            # The same header the engine sends, so both land on one tunnel. A
-            # header rather than `proxy_auth`, which aiohttp has deprecated.
-            kwargs.setdefault(
-                "proxy_headers",
-                {"Proxy-Authorization": aiohttp.encode_basic_auth(*credentials)},
-            )
         return kwargs

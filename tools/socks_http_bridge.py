@@ -4,11 +4,14 @@ Why this exists (`adapter/proxyplan.py` is the other half):
 
 * aiohttp speaks HTTP proxies, not SOCKS, and the pool is SOCKS5-only;
 * the pool hands out a **new address per connection**, so "one address per
-  client request" really means "do not reuse the previous request's socket".
-  The adapter gets that by giving every request its own session;
-* the adapter tags its calls with the request's session id (sent as the proxy
-  login) so a call can be attributed to the request that made it. Today the id
-  is **recorded and reported, not used for routing**, and that is a deliberate
+  call" really means "do not reuse the previous call's socket". The adapter no
+  longer arranges that per client request -- it keeps one shared session, and
+  the `X-Upstream-Proxy-Mode` header that bought the per-request session was
+  removed on 2026-09-20 -- so the exit is as stable as the pooled connections
+  are;
+* a caller *may* tag its calls with a session id (sent as the proxy login) so a
+  call can be attributed to whoever made it; the adapter no longer sends one.
+  Today the id is **recorded and reported, not used for routing**, and that is a deliberate
   limitation rather than an unfinished one: for an https target the tunnel is a
   byte pipe around a *stateful* TLS session, so a tunnel cannot be handed to a
   different client connection without breaking the handshake already inside it.
@@ -32,8 +35,11 @@ What it deliberately does not do:
         --upstream 'socks5h://user:pass@pool.example:2088' \\
         --bypass '*.aliyuncs.com'
 
-`--bypass` hosts are dialled directly, without the pool: an object-store upload
-is the case it exists for. `/health` reports tunnel counts and the last errors.
+`--bypass` hosts are dialled directly, without the pool. What it is for is
+reachability: a host the caller must reach but the pool cannot -- an internal
+service, loopback -- would otherwise be dialled from the pool's own network.
+(It is not about the object-store upload: that traffic never reaches this
+bridge.) `/health` reports tunnel counts and the last errors.
 """
 
 from __future__ import annotations
