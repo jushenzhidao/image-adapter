@@ -35,7 +35,8 @@ Channel setup (New API side):
                       "inline_total_max_bytes": 6291456,   per request
                       "default_mime_type": "image/png",
                       "client_url_passthrough": true,
-                      "image_config_style": "auto",        imageConfig|responseFormat
+                      "image_config_style": "auto",        auto(=imageConfig)|
+                                                           responseFormat
                       "max_input_images": 10,
                       "image_text_order": "text_first"}    text_first|text_last
 
@@ -78,9 +79,12 @@ published docs:
     "contents[0].parts[1].data: required oneof field 'data' must have one
     initialized field". inline_data is more forgiving, but everything outbound is
     camelCase for consistency; the reply side still reads both.
-  * `imageConfig` and `responseFormat.image` are BOTH accepted there, and 1K / 2K
-    / 4K all work (a 4K reply measured 10.7MB of base64). image_config_style still
-    matters for gateways that ship only one generation of the field.
+  * `imageConfig` and `responseFormat.image` are both ACCEPTED there, and 1K / 2K
+    / 4K all work (a 4K reply measured 10.7MB of base64) -- but accepted is not
+    honoured. Re-measured 2026-09-20: one 1024x1024 request answered 1024x1024
+    with `imageConfig` and 1408x768 with `responseFormat.image`, which the
+    upstream took and dropped without a word. Hence `auto` no longer picks by
+    generation.
   * replies came back as image/jpeg, and an 8.27MB inline_data was accepted -- so
     "7MB per image" is a floor for that gateway, not the ceiling. The default
     inline_max_bytes stays conservative because the weakest upstream sets the bar.
@@ -318,9 +322,17 @@ def _refs_of(payload, ctx):
         return []
     refs = image if isinstance(image, list) else [image]
     for ref in refs:
+        # Defensive: every door runs `validate_images_body` before this script
+        # (adapter/api/images.py), and that already refuses a non-string or
+        # blank ref -- with its own message and code. So nothing reaches this
+        # branch today. It is kept because the guarantee lives in another
+        # layer, and a script that assumed it would be the one that breaks
+        # silently the day that layer changes.
         if not isinstance(ref, str) or not ref.strip():
             ctx.fail(
-                "'image' must be a URL, a data URI or a base64 string", param="image"
+                "'image' must be a URL, a data URI or a base64 string",
+                param="image",
+                code="unsupported_parameter",
             )
     return refs
 
@@ -470,7 +482,11 @@ async def transform(ctx, payload, phase):
         # a real model id; an id we cannot recognise is refused instead of forwarded.
         fallback = (requested or "").strip()
         if not fallback.startswith("gemini-"):
-            ctx.fail(f"Unknown model for this channel: {fallback!r}", param="model")
+            ctx.fail(
+                f"Unknown model for this channel: {fallback!r}",
+                param="model",
+                code="unknown_model",
+            )
         caps = {"model": fallback, "tiers": [], "wide": True}
         sized = False
     else:
@@ -511,11 +527,23 @@ async def transform(ctx, payload, phase):
     refs = _refs_of(payload, ctx)
     limit = int(ctx.options.get("max_input_images", 10))
     if len(refs) > limit:
-        ctx.fail(f"At most {limit} input images are supported here", param="image")
+        ctx.fail(
+            f"At most {limit} input images are supported here",
+            param="image",
+            code="too_many_images",
+        )
 
     style = ctx.options.get("image_config_style", "auto")
     if style == "auto":
-        style = "responseFormat" if model.startswith("gemini-3.1") else "imageConfig"
+        # `imageConfig` for every generation, not by gate of introduction.
+        # Measured 2026-09-20 on api.chatfire.cn: identical 1024x1024 requests
+        # answered 1024x1024 with this block and 1408x768 with
+        # `responseFormat.image` -- the newer spelling is accepted, never
+        # refused, and ignored. An ignored field renders as success, so picking
+        # by generation (3.1 -> the new form) guessed in exactly the wrong
+        # direction. The option survives as a per-channel knob for a layer that
+        # really does want the new spelling: image_config_style=responseFormat.
+        style = "imageConfig"
 
     allowance = [int(ctx.options.get("inline_total_max_bytes", 6 * 1024 * 1024))]
     mode = ctx.options.get("image_ref_mode", "auto")

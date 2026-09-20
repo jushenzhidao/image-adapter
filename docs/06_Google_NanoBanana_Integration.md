@@ -91,17 +91,20 @@
   "generationConfig": {
     "responseModalities": ["TEXT", "IMAGE"],
 
-    // 形态 A（2.5 / 3.0 时期，现有大量三方网关仍用这个）
+    // 形态 A —— **生效的那个**，chatfire 与 Google 一致都认它
     "imageConfig": { "aspectRatio": "16:9", "imageSize": "2K" }
 
-    // 形态 B（新版，官方把 imageConfig 标记为 legacy）
+    // 形态 B —— 会被**接受但不生效**（见本节末复测），不要用
     // "responseFormat": { "image": { "aspectRatio": "16:9", "imageSize": "2K" } }
   }
 }
 ```
 
-⚠️ **A/B 两形态必须实测确认哪个被当前模型接受**。设计上由渠道选项兜住：
-`X-Channel-Options.image_config_style = "imageConfig" | "responseFormat" | "auto"`（默认 `auto` 按模型代际选，未知模型用 `imageConfig`）。
+⚠️ **两形态不是「旧 vs 新」的选择题，而是「生效 vs 不生效」**。2026-09-20 在 api.chatfire.cn 复测
+（**该网关与 Google 行为一致**）：同一个 `1024x1024` 请求，**形态 A 回 1024x1024、形态 B 回 1408x768**
+——形态 B 被上游**接受却丢弃**，既不报错也不生效。⇒ **不要按模型代际挑形态，一律形态 A**。
+渠道选项 `X-Channel-Options.image_config_style = "imageConfig" | "responseFormat" | "auto"`（默认 `auto`）
+中 **`auto` 恒取 `imageConfig`**；`responseFormat` 仅作**逐渠道旋钮**保留（某层真只认新拼法时才用）。
 
 其它要点：
 
@@ -292,7 +295,7 @@ body = {
 OpenAI 的 `size` 是**目标像素**，Gemini 是**比例 + 档位**，两者不等价，映射必然是降级：
 
 ```
-1024x1024 → 1:1  + 1K  → 1024x1024        （精确）
+1024x1024 → 1:1  + 1K  → 1024x1024        （精确；**前提是形态 A** —— 形态 B 下上游忽略比例）
 1024x1792 → 9:16 + 1K  → 768x1376         （比例对，像素不精确）
 1536x1024 → 3:2  + 2K  → 2528x1696        （升档）
 ```
@@ -1197,7 +1200,7 @@ asyncio.run(draft.transform(FakeCtx(), payload, "request"))
 | 项 | 实测结果 |
 |---|---|
 | `generationConfig.imageConfig`（形态 A） | **200** —— 1K / 2K / 4K 三档全部可用（4K 出图 b64 10.7 MB） |
-| `generationConfig.responseFormat.image`（形态 B） | **200** —— **两代形态都被接受**，`image_config_style` 的两难在本网关不存在 |
+| `generationConfig.responseFormat.image`（形态 B） | **200 但被忽略** —— 2026-09-20 复测：同一 `1024x1024` 请求，形态 A 回 **1024x1024**、形态 B 回 **1408x768**（比例 1.833）。上游（chatfire 与 Google 一致）**接受却丢弃**此字段 ⇒ 「两代形态都被接受」是**错的结论**（当时只验了 200，没验字段是否被采纳），脚本默认因此改为形态 A |
 | `responseModalities: ["IMAGE"]` / `["TEXT","IMAGE"]` | 均 **200** |
 | 纯文本 ping `["TEXT"]` | 200，回 "pong"（模型可用性探针） |
 | **`file_data`（snake_case）** | **失败**：`contents[0].parts[1].data: required oneof field 'data' must have one initialized field`（该键被当未知字段丢弃 → part 的 data oneof 为空） |

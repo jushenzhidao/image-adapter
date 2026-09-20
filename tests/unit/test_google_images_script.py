@@ -123,7 +123,7 @@ def test_the_wire_carries_the_mapped_shape(
     caps = {"model": "gemini-3.1-flash-image", "tiers": FLASH["tiers"],
             "wide": wide, "ratios": ratios}
     _, body = asyncio.run(_request_phase(caps, size=size))
-    inner = body["generationConfig"]["responseFormat"]["image"]
+    inner = body["generationConfig"]["imageConfig"]
     assert inner["aspectRatio"] == expected_aspect
     assert inner["imageSize"] == expected_tier
 
@@ -142,7 +142,7 @@ def test_a_model_without_tiers_gets_a_ratio_but_no_image_size():
 def test_an_unparsable_size_falls_back_to_square_1k():
     _, body = asyncio.run(_request_phase({"model": "gemini-3.1-flash-image", **FLASH},
                                          size="not-a-size"))
-    inner = body["generationConfig"]["responseFormat"]["image"]
+    inner = body["generationConfig"]["imageConfig"]
     assert inner == {"aspectRatio": "1:1", "imageSize": "1K"}
 
 
@@ -156,20 +156,47 @@ async def _request_phase(caps, model="nano-banana-pro", size="1024x1024", **opti
 def test_the_request_phase_uses_the_resolved_model_and_its_tiers():
     ctx, body = asyncio.run(_request_phase({"model": "gemini-3.1-flash-image", **FLASH}))
     assert ctx.emitted_url.endswith("/models/gemini-3.1-flash-image:generateContent")
-    # 3.1-generation ids take the newer field shape; 1024x1024 maps to 1:1 + 1K.
-    assert body["generationConfig"]["responseFormat"]["image"] == {
-        "aspectRatio": "1:1",
-        "imageSize": "1K",
-    }
-
-
-def test_an_older_generation_gets_the_legacy_field_shape():
-    ctx, body = asyncio.run(_request_phase({"model": "gemini-3-pro-image", **PRO}))
-    assert ctx.emitted_url.endswith("/models/gemini-3-pro-image:generateContent")
+    # `auto` resolves to the legacy field shape for every generation, so this is
+    # the same assertion `test_the_default_style_is_the_one_measured_to_be_honoured`
+    # makes about the id that used to take the newer one. 1024x1024 -> 1:1 + 1K.
     assert body["generationConfig"]["imageConfig"] == {
         "aspectRatio": "1:1",
         "imageSize": "1K",
     }
+
+
+def test_the_default_style_is_the_one_measured_to_be_honoured():
+    """`auto` follows the evidence, not the introduction date.
+
+    Measured 2026-09-20 against api.chatfire.cn: a 1024x1024 request answered
+    1024x1024 with `imageConfig` and 1408x768 with `responseFormat.image` -- the
+    newer spelling was accepted, never refused, and dropped. An ignored field is
+    indistinguishable from a working one at the HTTP layer, which is why the
+    default must be the form the vendor is known to act on. A 3.1 id is the case
+    that used to take the newer spelling, so it is the one asserted here.
+    """
+    ctx, body = asyncio.run(_request_phase({"model": "gemini-3.1-flash-image", **FLASH}))
+    assert ctx.emitted_url.endswith("/models/gemini-3.1-flash-image:generateContent")
+    assert body["generationConfig"]["imageConfig"] == {
+        "aspectRatio": "1:1",
+        "imageSize": "1K",
+    }
+    assert "responseFormat" not in body["generationConfig"]
+
+
+def test_the_style_option_still_reaches_the_newer_field_shape():
+    """The per-channel knob: naming the newer spelling still switches the block."""
+    _, body = asyncio.run(
+        _request_phase(
+            {"model": "gemini-3.1-flash-image", **FLASH},
+            image_config_style="responseFormat",
+        )
+    )
+    assert body["generationConfig"]["responseFormat"]["image"] == {
+        "aspectRatio": "1:1",
+        "imageSize": "1K",
+    }
+    assert "imageConfig" not in body["generationConfig"]
 
 
 def test_without_facts_the_script_sends_no_image_config():

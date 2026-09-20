@@ -18,6 +18,7 @@ import base64
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -160,6 +161,32 @@ def test_the_body_is_gemini_shaped_and_carries_no_openai_fields(client, vendor):
     }
     for absent in ("n", "size", "response_format", "model"):
         assert absent not in body, f"{absent} has no place in a generateContent body"
+
+
+def test_the_default_body_uses_the_field_shape_measured_to_work(client, vendor):
+    """`auto` sends `imageConfig`, and that is a measurement rather than a taste.
+
+    2026-09-20, api.chatfire.cn (which mirrors Google's own surface), model
+    `gemini-3.1-flash-image-preview`: one 1024x1024 request answered 1024x1024
+    with `imageConfig` and 1408x768 with `responseFormat.image` -- accepted, no
+    400, ignored. An ignored field is
+    indistinguishable from a working one at the HTTP layer, so the default has to
+    be the form the vendor is known to act on. A 3.1 id is the case that used to
+    take the newer spelling, which is why it is the id under test.
+    """
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={
+            "model": "gemini-3.1-flash-image-preview",
+            "prompt": "a fox",
+            "size": "1024x1024",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    config = _call()["body"]["generationConfig"]
+    assert config["imageConfig"] == {"aspectRatio": "1:1", "imageSize": "1K"}
+    assert "responseFormat" not in config
 
 
 def test_a_client_url_is_forwarded_and_never_fetched(client, vendor):
@@ -361,7 +388,12 @@ def test_an_unknown_model_is_refused(client, vendor):
         json={"model": "gpt-image-1", "prompt": "x"},
     )
     assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["param"] == "model"
+    error = resp.json()["error"]
+    assert error["param"] == "model"
+    # Not just a 400: a routing layer has to be able to tell "this channel does
+    # not serve that model" from every other refusal, without parsing prose.
+    assert error["code"] == "unknown_model"
+    assert not _Vendor.calls, "a refusal must happen before the vendor is called"
 
 
 def test_url_response_format_without_storage_falls_back_to_base64(client, vendor):
@@ -423,3 +455,156 @@ def test_channel_options_can_pin_the_config_style_and_ratio(client, vendor):
         "aspectRatio": "16:9",
         "imageSize": "2K",
     }
+
+
+# --- the shipped capability table -------------------------------------------
+#
+# Parametrised from `script_store/capabilities/google.json` rather than from a
+# hand-kept list, so an entry added there is exercised the moment it lands --
+# including one that is simply wrong, which is the case no hand-written list ever
+# catches. The file is read directly and not through
+# `settings.capability_roots`: what is under test is the table shipped with the
+# image, and going through settings would let an overlay a developer happens to
+# have mounted change the answer.
+
+_TABLE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "script_store"
+    / "capabilities"
+    / "google.json"
+)
+_TABLE = json.loads(_TABLE_PATH.read_text(encoding="utf-8"))
+_TABLE_MODELS = sorted(_TABLE["models"])
+_TABLE_ALIASES = sorted(_TABLE["aliases"].items())
+
+
+def _size_block(call: dict) -> dict:
+    """The aspect/size block, in whichever spelling of the field it arrived.
+
+    Shape-agnostic on purpose: one test pins the default spelling
+    (`test_the_default_body_uses_the_field_shape_measured_to_work`), which leaves
+    the rest of this file free to assert the content, which is what they are about.
+    """
+    config = call["body"]["generationConfig"]
+    return (
+        config.get("imageConfig")
+        or (config.get("responseFormat") or {}).get("image")
+        or {}
+    )
+
+
+def _ask(client, vendor, **body):
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox", **body},
+    )
+    assert resp.status_code == 200, resp.text
+    return _call()
+
+
+@pytest.mark.parametrize("model", _TABLE_MODELS)
+def test_every_table_entry_reaches_the_vendor_under_its_own_id(client, vendor, model):
+    """Nothing in the table may be unreachable."""
+    call = _ask(client, vendor, model=model, size="1024x1024")
+    assert call["path"] == f"/v1beta/models/{model}:generateContent"
+
+
+@pytest.mark.parametrize("model", _TABLE_MODELS)
+def test_a_resolution_tier_is_sent_exactly_when_the_table_has_one(
+    client, vendor, model
+):
+    """An empty `tiers` list means the model fixes its own resolution.
+
+    Sending `imageSize` there would be a claim we cannot back, so the key has to
+    be absent rather than empty. At 1024x1024 every non-empty list clamps to
+    "1K", which is also the floor of the 3.x entries -- so one request pins both
+    halves of the rule.
+    """
+    tiers = _TABLE["models"][model]["tiers"]
+    block = _size_block(_ask(client, vendor, model=model, size="1024x1024"))
+    assert ("imageSize" in block) is bool(tiers), (model, tiers, block)
+    if tiers:
+        assert block["imageSize"] == "1K"
+
+
+@pytest.mark.parametrize(
+    "alias,target", _TABLE_ALIASES, ids=[alias for alias, _ in _TABLE_ALIASES]
+)
+def test_an_alias_resolves_to_the_id_the_table_names(client, vendor, alias, target):
+    """The alias table is what lets a caller write `nano-banana-pro` at all."""
+    call = _ask(client, vendor, model=alias, size="1024x1024")
+    assert call["path"] == f"/v1beta/models/{target}:generateContent"
+
+
+LITE = "gemini-3.1-flash-lite-image"
+
+
+@pytest.mark.parametrize(
+    "size,expected",
+    [("512x512", "512"), ("1024x1024", "1K"), ("4096x4096", "1K")],
+    ids=["its-floor", "its-ceiling", "above-its-ceiling-clamps"],
+)
+def test_the_lite_model_stops_at_its_own_ceiling(client, vendor, size, expected):
+    """The one entry whose tier list differs from its siblings'.
+
+    The rest of the 3.x family goes to 4K; this one stops at 1K. A row copied
+    from a sibling would satisfy every other test in this file and show up only
+    as a 4K request that a gateway refuses -- which is why the newest entry is
+    worth its own case. 4096 is the clamp: crossing the top of the list must not
+    silently upgrade.
+    """
+    block = _size_block(_ask(client, vendor, model=LITE, size=size))
+    assert block["imageSize"] == expected
+
+
+@pytest.mark.parametrize(
+    "model,size,expected",
+    [
+        ("gemini-2.5-flash-image", "4096x512", "21:9"),
+        ("gemini-3-pro-image", "4096x512", "8:1"),
+    ],
+    ids=["wide-false-folds", "wide-true-keeps"],
+)
+def test_an_extreme_ratio_survives_only_where_the_table_allows_it(
+    client, vendor, model, size, expected
+):
+    """`wide` decides whether the four folded shapes may be sent at all.
+
+    The expectation is the *nearest* shape the table leaves in play, not a second
+    hand-kept list: the fold is arithmetic (`ctx.is_extreme_ratio`), and copying
+    the ratio list into an assertion is the drift the flag exists to prevent.
+    """
+    block = _size_block(_ask(client, vendor, model=model, size=size))
+    assert block["aspectRatio"] == expected
+
+
+@pytest.mark.parametrize(
+    "body,param,code",
+    [
+        ({"model": "gpt-image-1"}, "model", "unknown_model"),
+        ({"image": [PNG_DATA_URI] * 11}, "image", "too_many_images"),
+        ({"n": 3}, "n", "unsupported_parameter"),
+        ({"image": PNG_DATA_URI, "mask": PNG_DATA_URI}, "mask", "unsupported_parameter"),
+    ],
+    ids=["unknown-model", "too-many-images", "n-greater-than-one", "mask"],
+)
+def test_every_refusal_names_a_machine_readable_code(client, vendor, body, param, code):
+    """`code: null` is an answer a caller cannot act on.
+
+    Two of this script's refusals used to arrive with the `code` key present and
+    null while the rest named a reason, so a downstream that classifies by `code`
+    (routing, billing, alerting) could not tell them from a generic 400. The
+    envelope permits a null; a service that knows *why* it refused has no excuse
+    for one.
+    """
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(vendor),
+        json={"prompt": "a fox", **body},
+    )
+    assert resp.status_code == 400, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == code
+    assert error["param"] == param
+    assert not _Vendor.calls, "a refusal must happen before the vendor is called"
