@@ -73,6 +73,10 @@ class FakePool:
         self.connections: list[socket.socket] = []
         self.requests: list[str] = []  # request lines, in arrival order
         self.headers: list[dict[str, str]] = []
+        #: Answer the greeting with 0xff ("no acceptable methods") instead of
+        #: accepting. The bridge offers only user/password when its URL carries
+        #: credentials, so this is the shape of a pool that refuses it.
+        self.reject_methods = False
         self.targets: list[str] = []
         self.authorized: list[str] = []
         self._stop = False
@@ -105,6 +109,9 @@ class FakePool:
     def _handshake(self, conn: socket.socket) -> None:
         greeting = conn.recv(2)
         conn.recv(greeting[1])  # the offered methods
+        if self.reject_methods:
+            conn.sendall(b"\x05\xff")  # nothing here is acceptable
+            raise ValueError("refused the offered methods")
         conn.sendall(b"\x05\x02")  # this pool always asks for user/password
         conn.recv(1)
         user_len = conn.recv(1)[0]
@@ -256,6 +263,27 @@ def raw_request(port: int, request: bytes) -> tuple[int, bytes]:
             if name.strip().lower() == "content-length":
                 length = int(value.strip())
         return status, rfile.read(length) if length else b""
+    finally:
+        sock.close()
+
+
+def raw_connect(port: int, host: str, *, session: str = "") -> str:
+    """CONNECT and return the status line **without** asserting it.
+
+    `connect_tunnel` asserts 200; this one exists for the failure path, where
+    the only thing that matters is whether a status line arrived at all -- an
+    empty string means the connection was dropped.
+    """
+    sock = socket.create_connection(("127.0.0.1", port), 10.0)
+    sock.settimeout(10.0)
+    try:
+        head = [f"CONNECT {host}:443 HTTP/1.1", f"Host: {host}:443"]
+        if session:
+            token = base64.b64encode(f"{session}:x".encode()).decode()
+            head.append(f"Proxy-Authorization: Basic {token}")
+        sock.sendall(("\r\n".join(head) + "\r\n\r\n").encode())
+        rfile = sock.makefile("rb")
+        return rfile.readline().decode("latin-1")
     finally:
         sock.close()
 
@@ -418,3 +446,22 @@ def test_the_session_header_survives_an_unparseable_credential(pool) -> None:
         )
         == "sess"
     )
+
+
+def test_a_pool_that_refuses_the_auth_method_still_answers_502(
+    bridge_server, pool
+) -> None:
+    """A dial that fails at the SOCKS greeting must still produce a status line.
+
+    2026-09-20: the greeting can be answered with `0xff` (nothing acceptable),
+    which raises `MintError` -- **not** an `OSError`. It escaped the handler, so
+    the client saw a dropped connection (`Proxy CONNECT aborted` in curl)
+    instead of a 502, and `/health` stayed silent about why. Found by pointing
+    the bridge at a stub pool that declined the offered auth methods.
+    """
+    pool.reject_methods = True
+
+    line = raw_connect(bridge_server.port, "vendor.test", session="req-1")
+
+    assert "502" in line, f"expected a status line, got {line!r}"
+    assert pool.requests == [], "nothing should have reached the target"

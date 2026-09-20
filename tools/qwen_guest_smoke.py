@@ -280,6 +280,14 @@ def main(argv: list[str] | None = None) -> int:
                             "和参考仓 make_identities 一致；调试才加这个）")
     parser.add_argument("--skip-egress-check", action="store_true",
                        help="跳过出口门禁（不建议；用来区分'出口挡'与'访客门挡'）")
+    parser.add_argument("--proxy", default="",
+                       help="让本渠道走出站代理，如 http://127.0.0.1:11080"
+                            "（本地 SOCKS→HTTP 桥见 tools/socks_http_bridge.py）；"
+                            "空＝不走代理（默认，与存量渠道一致）")
+    parser.add_argument("--proxy-mode", default="per-request",
+                       choices=("shared", "per-request"),
+                       help="per-request（默认）＝每个客户端请求一条新连接 ⇒ 换出口；"
+                            "shared＝连接复用、出口稳定")
     args = parser.parse_args(argv)
 
     try:
@@ -322,6 +330,13 @@ def main(argv: list[str] | None = None) -> int:
         environment="dev", adapter_key_required=False, adapter_key="",
         allow_inline_script=True, upstream_allow_private_network=True,
         redis_url="", storage_backend="minio", minio_endpoint="", fal_key="",
+        # Only meaningful when the run passes `--proxy`, and harmless otherwise:
+        # an allowlist trusting loopback is what lets the header be set at all
+        # (an empty list refuses it outright). The bypass list keeps the OSS
+        # upload off the proxy -- the deployment shape, so `--proxy` exercises
+        # the same paths a real channel would.
+        upstream_proxy_allowlist="127.0.0.1,localhost",
+        upstream_proxy_bypass_hosts="*.aliyuncs.com",
     )
     minter = ids.BrowserMinter(channel="chrome", headless=not args.headful,
                               settle_ms=7000)
@@ -340,6 +355,13 @@ def main(argv: list[str] | None = None) -> int:
             "X-Auth-Emit": "none",
             "Authorization": "Bearer guest",
         }
+        if args.proxy:
+            # Exactly what a deployment sets on the channel: the engine's own
+            # call and everything the script does through ctx.http leave through
+            # the proxy, while the OSS upload stays direct (bypass list above).
+            headers["X-Upstream-Proxy"] = args.proxy
+            headers["X-Upstream-Proxy-Mode"] = args.proxy_mode
+            print(f"经代理：{args.proxy}（模式 {args.proxy_mode}）")
         with TestClient(app, raise_server_exceptions=False) as client:
             for tier in tiers:
                 assets: list[str] = []       # 本档内累积：i2i 用 assets[0]，multi 用前两张

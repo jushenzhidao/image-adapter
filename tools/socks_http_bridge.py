@@ -434,8 +434,15 @@ class BridgeHandler(socketserver.BaseRequestHandler):
         key = TunnelKey(session, host, port)
         try:
             tunnel, reused = self._open(key, headers)
-        except OSError as exc:
-            self._note(f"CONNECT {key} failed: {exc}")
+        except Exception as exc:  # noqa: BLE001 - any dial failure owes a status line
+            # `Exception`, not `OSError`. A SOCKS greeting answered with `0xff`
+            # raises `MintError`, and letting that escape closes the client
+            # connection *without a status line*: measured 2026-09-20 with a
+            # stub pool that declined the offered auth methods, where curl said
+            # `Proxy CONNECT aborted` instead of a 502. A proxy that cannot
+            # reach its upstream owes the client a status; the reason belongs in
+            # the log and `/health`, not in a truncated connection.
+            self._note(f"CONNECT {key} failed: {type(exc).__name__}: {exc}")
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             return
         if not reused:
@@ -477,8 +484,8 @@ class BridgeHandler(socketserver.BaseRequestHandler):
             attempt += 1
             try:
                 tunnel, reused = self._open(key, headers)
-            except OSError as exc:
-                self._note(f"{key} dial failed: {exc}")
+            except Exception as exc:  # noqa: BLE001 - same rule as the CONNECT path
+                self._note(f"{key} dial failed: {type(exc).__name__}: {exc}")
                 self._fail(wfile, 502, f"cannot reach {host}:{port}")
                 return False
             try:
