@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from adapter.errors import ChannelConfigError
 from adapter.modelmap import LEGACY_KEY as LEGACY_MODEL_MAP_KEY
@@ -222,6 +223,36 @@ def _first_present(headers, *names: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+@lru_cache(maxsize=8)
+def parse_default_options(raw: str) -> dict:
+    """Deployment-wide options merged *under* every channel's own.
+
+    The value is process-fixed, so the cache holds one entry in practice; it
+    exists so the per-request path never re-parses a string that cannot change.
+    Refuses anything but a JSON object, by name: this is configuration, and the
+    operator gets told which knob is wrong. `main.py` calls it once at startup,
+    which turns a malformed value into a boot failure instead of a 400 the
+    first request has to discover.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw, object_pairs_hook=_object_without_repeats)
+    except ValueError:
+        # json.JSONDecodeError and orjson.JSONDecodeError both subclass it.
+        raise ChannelConfigError(
+            "DEFAULT_CHANNEL_OPTIONS must be a JSON object",
+            "DEFAULT_CHANNEL_OPTIONS",
+        ) from None
+    if not isinstance(parsed, dict):
+        raise ChannelConfigError(
+            "DEFAULT_CHANNEL_OPTIONS must be a JSON object",
+            "DEFAULT_CHANNEL_OPTIONS",
+        )
+    return parsed
+
+
 def parse_channel(headers, settings: Settings) -> ChannelSpec:
     """Builds a ChannelSpec from request headers. Raises ChannelConfigError."""
     raw_url = headers.get(H_URL, "")
@@ -292,6 +323,14 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
                 "X-Channel-Options must be a JSON object", "X-Channel-Options"
             )
         options = parsed
+
+    # Deployment-wide defaults sit *under* the channel's own options -- see
+    # `default_channel_options` in settings.py. The header wins on any shared
+    # key, so a channel can always override one value; with the knob empty this
+    # is a no-op and `options` keeps the exact dict today's code produced.
+    defaults = parse_default_options(settings.default_channel_options)
+    if defaults:
+        options = {**defaults, **options}
 
     # The mapping has its own header rather than a key inside `options`, because
     # it is the one part of the channel directive the adapter itself acts on --

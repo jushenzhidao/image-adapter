@@ -60,10 +60,17 @@ New API 在渠道配置里声明适配策略，通过头透传：
 | `X-Async` | 否 | 异步 Job 型上游，如 `poll=2,timeout=300` |
 | `X-Script-Sha256` | 否 | 完整性锁定 |
 | `X-Model-Map` | 否 | 本渠道的模型名改写表：`key=model` 逗号分隔、`*=` 兜底，如 `gpt-image-2=doubao-seedream-5-0-260128`。命中时改写 canonical body 的 `model`（见下） |
-| `X-Channel-Options` | 否 | JSON 对象，脚本内通过 `ctx.options` 读取。adapter 只把它解码成 dict，**不解读其中任何键** |
+| `X-Channel-Options` | 否 | JSON 对象，脚本内通过 `ctx.options` 读取。adapter 只把它解码成 dict，**不解读其中任何键**。部署级默认值见下方 `DEFAULT_CHANNEL_OPTIONS` |
 | `X-Stages` | 否 | 覆盖脚本的 `STAGES`，如 `generate,upscale` |
 | `X-Stage-Urls` | 否 | 逐级上游地址，如 `generate=https://a.test/t2i,upscale=https://b.test/sr`。键必须是 `X-Stages` 的子集 |
 | `X-Stage-Timeout` | 否 | 级联总预算（秒），如 `total=300` |
+
+> **`DEFAULT_CHANNEL_OPTIONS`（env）＝ 部署级默认渠道选项**：JSON 对象，**垫在**每个渠道的
+> `X-Channel-Options` 下面——同名键以**渠道头为准**（浅合并、可逐渠道覆盖），空值**零影响**
+> （不设这个旋钮时行为与从前逐字节一致）。把「属于本部署的事实」配在这里（典型：guest 身份
+> 服务的 `identity_url`，含凭据），控制面上就不用每个渠道抄一份、换 token 也只改一处。
+> adapter **不解读内容**（原样交给脚本的 `ctx.options`）；值在**启动时校验**，格式不合法则
+> 拒绝启动而非每个请求 400。
 
 这 17 个头在代码里由 `adapter/main.py::channel_contract` 用 `Header()` 声明：因此 `/docs`
 可以直接填写试调，契约表不会再与实现漂移。全部声明为**可选**是有意为之——缺失的头仍由

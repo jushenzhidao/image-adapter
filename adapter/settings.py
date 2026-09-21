@@ -98,6 +98,19 @@ class Settings(BaseSettings):
     # per-channel copies drift.
     upstream_proxy_bypass_hosts: str = ""
 
+    # --- Channel assembly defaults -----------------------------------------
+    # A JSON object merged *under* every channel's X-Channel-Options: one place
+    # for values that are facts about this deployment rather than about a
+    # channel -- the guest identity service's URL, credentials included -- so
+    # they stop being copied verbatim into every channel on the control plane.
+    # The channel header wins on any shared key; the merge is shallow; an empty
+    # value (the default) leaves channel parsing byte-identical to not having
+    # this feature at all. The framework never reads the contents: it is the
+    # script's bag, and `identity_url` is not a word the adapter knows.
+    # Validated once at startup (main.py) -- a malformed value refuses to boot
+    # instead of failing every request with a 400.
+    default_channel_options: str = ""
+
     # --- Timeouts ----------------------------------------------------------
     # Six bounds apply to one request and they are kept separate on purpose:
     # which one fired is what the caller sees, so merging them would make the
