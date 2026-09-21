@@ -23,7 +23,7 @@ class CapsMixin(CtxMixin):
     """Read-only view of a vendor's capability facts."""
 
     def caps(self, vendor: str, model: str | None = None) -> dict[str, Any] | None:
-        """Facts for one model, alias- and suffix-resolved, or None if unknown.
+        """Facts for one model, alias-resolved, or None if unknown.
 
         The returned dict carries the resolved ``model`` id alongside the facts, so
         a caller that must write the model into a URL gets the normalised name

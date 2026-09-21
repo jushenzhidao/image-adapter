@@ -59,16 +59,16 @@ def test_aliases_resolve_to_the_base_model():
     assert caps["model"] == "gemini-3-pro-image"
 
 
-def test_a_gateway_suffix_still_finds_the_base_model():
-    """The regression that motivated the table: '-preview' used to miss entirely
-    and silently fall back to another model's capabilities.
+def test_an_unlisted_suffixed_spelling_is_not_folded_onto_a_base_model():
+    """The table rewrites nothing but `aliases`: a suffixed spelling with no
+    entry of its own is an unknown model, never a silent rewrite to a near id.
 
-    Uses a spelling that is NOT listed. Once an id has an entry of its own it is
-    matched first and forwarded verbatim -- see the next test for why one is.
+    No facts is the safe answer -- the script sends less rather than guessing --
+    and the honest one whenever a gateway's channels may be keyed on the suffixed
+    spelling itself. To reach a vendor under a spelling the table does not have,
+    declare it here or in the channel's `X-Model-Map`.
     """
-    caps = lookup("google", "gemini-3.1-flash-lite-image-preview", REPO_ROOTS)
-    assert caps is not None
-    assert caps["model"] == "gemini-3.1-flash-lite-image"
+    assert lookup("google", "gemini-3.1-flash-lite-image-preview", REPO_ROOTS) is None
 
 
 def test_a_listed_suffixed_id_is_forwarded_verbatim():
@@ -77,10 +77,9 @@ def test_a_listed_suffixed_id_is_forwarded_verbatim():
     gemini-3-pro-image" (the message names a post-mapping model, so it reads
     like a bug on our side) while the `-preview` spelling returns an image.
 
-    So the suffix must not be stripped for a name the gateway's channels are
-    actually keyed on. Listing the id is what makes the loader match it before
-    the suffix loop, and that is the only difference between this test and the
-    one above.
+    So a spelling the gateway's channels are keyed on has to travel as-is, and
+    listing it under `models` is what does that -- matching is literal, and the
+    table rewrites nothing but `aliases`.
     """
     caps = lookup("google", "gemini-3.1-flash-image-preview", REPO_ROOTS)
     assert caps is not None

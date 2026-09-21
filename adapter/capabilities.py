@@ -65,19 +65,18 @@ def _read(path: Path) -> dict | None:
 
 
 def _resolve(table: dict, model: str) -> str:
-    """Applies aliases, then strips a server-side suffix, to find the base id."""
+    """Applies aliases, and nothing else.
+
+    The table rewrites a name only where it says so: an entry under ``aliases``.
+    Everything else is the control plane's own vocabulary. A spelling the table
+    does not have is an unknown model rather than a "near" id to be guessed at,
+    and reaching a vendor under a different spelling is the channel's own call
+    (``X-Model-Map``), not the loader's.
+    """
     name = model.strip()
     aliases = table.get("aliases")
     if isinstance(aliases, dict):
         name = str(aliases.get(name, name))
-    models = table.get("models")
-    if not isinstance(models, dict) or name in models:
-        return name
-    suffixes = table.get("suffixes")
-    for suffix in suffixes if isinstance(suffixes, list) else ():
-        stripped = name.removesuffix(str(suffix))
-        if stripped != name and stripped in models:
-            return stripped
     return name
 
 

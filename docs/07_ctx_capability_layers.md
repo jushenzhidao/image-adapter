@@ -18,7 +18,7 @@ return max(allowed or list(caps["sizes"]), key=order.get)   # 兜底取了"最�
 tokens 从 1120 翻到 2000。**它不报错，只是悄悄变贵、变样。**
 
 这类逻辑（把"客户端要的"映射成"厂商支持的"）**每个图片上游脚本都要写一遍**，而每一遍都会遇到  
-同样的边界：低于最低档、高于最高档、比例不在列表、模型带 `-preview` 后缀、某些模型固定分辨率。  
+同样的边界：低于最低档、高于最高档、比例不在列表、模型名有别名、某些模型固定分辨率。  
 ARK 脚本有 `_ark_size()`，Google 脚本有 `_ratio()/_tier()`，下一个上游还会有第三份。
 
 所以问题不是"缺一个函数"，而是：**同一种映射逻辑被反复重写，而它的失败方式是静默的**。
@@ -173,7 +173,7 @@ r.notes   # ("2688*1536 is the vendor's 16:9",)
 - `ctx.map_size(size, caps)`（把比例 + 档位 + 说明打包返回）：两个真实用例的**输出形态不同** —— 
   Google 要 `ratio + tier` 两块，ARK 直接要一个预设字符串。硬塞进一个返回值，参数会爆炸，两边都不好用。
   **给两个零件让它们各自组合**更清楚。
-- `ctx.resolve_model(name, aliases)`：职责被 `ctx.caps()` 吸收了 —— 解析别名/后缀本来就是为了查表，
+- `ctx.resolve_model(name, aliases)`：职责被 `ctx.caps()` 吸收了 —— 解析别名本来就是为了查表，
   查完再回来自己解析一遍没有意义；`caps()` 直接返回 `{"model": 规范名, ...}`。
 
 `ctx.note(text)` 已废弃 —— 名字太泛（像日志），更糟的是它把**自由文本**写进响应头（客户端无法解析）。
@@ -389,7 +389,6 @@ script_store/
       "tiers": ["512", "1K", "2K", "4K"],
       "ratios": ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"],
       "modality": {"file_data": true, "inline_data": true, "inlines_max": null},
-      "suffixes": ["-preview", "-exp"],
       "aliases": {"nano-banana-2": "gemini-3.1-flash-image"}
     }
   }
@@ -399,7 +398,7 @@ script_store/
 脚本侧只剩一行：
 
 ```python
-caps = ctx.caps("google", model)          # dict（已按别名/后缀归一化后命中）
+caps = ctx.caps("google", model)          # dict（已按别名解析后命中）
 tier, adjusted = ctx.fit_tier(want, caps["tiers"])   # §5 的纯函数
 ratio = ctx.fit_ratio(w, h, caps["ratios"])
 ```

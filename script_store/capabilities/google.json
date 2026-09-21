@@ -3,7 +3,6 @@
   "vendor": "google",
   "verified_at": "2026-09-11",
   "verified_against": "api.chatfire.cn (gemini-3.1-flash-image-preview)",
-  "suffixes": ["-preview", "-exp", "-latest"],
   "default_model": "gemini-3-pro-image",
   "aliases": {
     "nano-banana": "gemini-2.5-flash-image",
@@ -83,7 +82,7 @@
     "wide": "accepts the extreme ratios (1:4, 4:1, 1:8, 8:1); false means they must fall back to a nearer ratio.",
     "shared": "vendor-wide facts merged into every model entry by the loader, so a list shared by the whole family is written once.",
     "ratios": "every ratio the family documents, as vendor-spelled strings (\"16:9\").",
-    "suffixes": "server-side suffixes a gateway may append to a stable id; the loader strips one to find the base entry. A spelling listed under `models` is matched BEFORE stripping and is therefore forwarded VERBATIM -- which is how a gateway whose channels are keyed on the suffixed name gets served. Measured 2026-09-11 against api.chatfire.cn: the bare `gemini-3.1-flash-image` is answered 503 \"no available channel for gemini-3-pro-image\" (the message names a post-mapping model, so it looks like a bug on our side), while `gemini-3.1-flash-image-preview` returns an image. Hence the preview id has its own entry.",
+    "models": "the ids this table has measured facts for. A name that matches an entry here travels to the vendor VERBATIM -- the loader rewrites nothing but `aliases`, so no spelling is ever folded onto a near id, and a suffixed spelling with no entry of its own is an unknown model (sent with less, never guessed at). A spelling a gateway's channels are keyed on therefore belongs in `models`; a name only the control plane knows belongs in the channel's `X-Model-Map`. Measured 2026-09-11 against api.chatfire.cn: the bare `gemini-3.1-flash-image` is answered 503 \"no available channel for gemini-3-pro-image\" (the message names a post-mapping model, so it looks like a bug on our side), while `gemini-3.1-flash-image-preview` returns an image. Hence the preview id has its own entry.",
   "kind": "generate | format | enhance | erase | watermark | beauty. Lets a script pick defaults and lets an orchestrator reason about a chain.",
     "outputs": "what one call produces (image | mask | text). An orchestrator uses it to check a chain is satisfiable - no consumer yet.",
     "async": "the upstream answers with a task id instead of a result (needs X-Async polling).",

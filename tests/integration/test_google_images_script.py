@@ -421,8 +421,9 @@ def test_a_listed_suffixed_id_reaches_the_upstream_verbatim(client, vendor):
     api.chatfire.cn answers the bare `gemini-3.1-flash-image` with 503 "no
     available channel for gemini-3-pro-image" -- the message names a
     post-mapping model, so the failure looks like ours -- while
-    `gemini-3.1-flash-image-preview` returns an image. Suffix-stripping would
-    turn the spelling the channels are keyed on into one they do not serve.
+    `gemini-3.1-flash-image-preview` returns an image. The table rewrites nothing
+    beyond aliases, so the spelling the channels are keyed on is the one that
+    reaches them.
     """
     resp = client.post(
         "/v1/images/generations",
