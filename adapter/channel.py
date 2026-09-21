@@ -58,6 +58,13 @@ H_ADAPTER_KEY = "x-adapter-key"
 #: tests/unit/test_channel_headers_contract.py.
 H_AUTHORIZATION = "authorization"
 
+#: The literal that opts a channel out of `UPSTREAM_PROXY_DEFAULT` (settings).
+#: Deliberately a bare word rather than an empty header: an empty
+#: `X-Upstream-Proxy` reads as "not declared" and keeps meaning the deployment
+#: default applies, while `none` is a statement -- reach this upstream
+#: directly. Same vocabulary as `X-Auth-Emit: none`.
+NO_PROXY_VALUE = "none"
+
 VALID_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 AUTH_TARGETS = frozenset({"header", "query", "body", "none"})
 
@@ -253,6 +260,25 @@ def parse_default_options(raw: str) -> dict:
     return parsed
 
 
+def _plan_for_proxy(raw: str, settings: Settings, header: str) -> ProxyPlan:
+    """One proxy value -> a validated ProxyPlan (header and default alike).
+
+    Both entry points run the *same* check on purpose: the default is operator
+    configuration, but "who may point this channel's egress at a third party"
+    is one question, and answering it differently for two spellings of the same
+    value is how a check quietly stops covering half its inputs.
+    """
+    return ProxyPlan(
+        url=check_proxy_url(raw, settings, header),
+        # The bypass list is the deployment's, not this channel's: what has to
+        # stay direct (an object store upload) is the same answer for every
+        # channel, and repeating it on each one is how the copies drift apart.
+        bypass=parse_hosts(
+            settings.upstream_proxy_bypass_hosts, "UPSTREAM_PROXY_BYPASS_HOSTS"
+        ),
+    )
+
+
 def parse_channel(headers, settings: Settings) -> ChannelSpec:
     """Builds a ChannelSpec from request headers. Raises ChannelConfigError."""
     raw_url = headers.get(H_URL, "")
@@ -269,21 +295,24 @@ def parse_channel(headers, settings: Settings) -> ChannelSpec:
 
     # Validated on the same rule as the upstream URL, and for a stronger
     # reason: a proxy that is unreachable, misspelled or unlisted has to fail
-    # before the request goes out, not as an opaque 502 afterwards. Absent
-    # header means "no proxy" and costs nothing.
+    # before the request goes out, not as an opaque 502 afterwards.
+    #
+    # Three sources, in precedence order: the channel header wins; a channel
+    # that says nothing inherits the deployment-wide default
+    # (UPSTREAM_PROXY_DEFAULT); and the bare word `none` opts out of the
+    # default explicitly -- without it a deployment-wide exit would be
+    # un-refusable on the one channel it was never meant for.
     proxy_raw = (headers.get(H_PROXY) or "").strip()
-    if not proxy_raw:
+    if proxy_raw.lower() == NO_PROXY_VALUE:
         proxy = ProxyPlan()
+    elif proxy_raw:
+        proxy = _plan_for_proxy(proxy_raw, settings, "X-Upstream-Proxy")
     else:
-        url = check_proxy_url(proxy_raw, settings, "X-Upstream-Proxy")
-        # The bypass list is the deployment's, not this channel's: what has to
-        # stay direct (an object store upload) is the same answer for every
-        # channel, and repeating it on each one is how the copies drift apart.
-        proxy = ProxyPlan(
-            url=url,
-            bypass=parse_hosts(
-                settings.upstream_proxy_bypass_hosts, "UPSTREAM_PROXY_BYPASS_HOSTS"
-            ),
+        default_raw = (settings.upstream_proxy_default or "").strip()
+        proxy = (
+            _plan_for_proxy(default_raw, settings, "UPSTREAM_PROXY_DEFAULT")
+            if default_raw
+            else ProxyPlan()
         )
 
     source_name, _ = _first_present(headers, H_SCRIPT, H_SCRIPT_64, H_SCRIPT_REF)

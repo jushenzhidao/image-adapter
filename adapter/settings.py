@@ -98,6 +98,16 @@ class Settings(BaseSettings):
     # per-channel copies drift.
     upstream_proxy_bypass_hosts: str = ""
 
+    # The deployment-wide default exit, used when a channel sends no
+    # X-Upstream-Proxy header (or sends it empty). The header wins whenever it
+    # carries a value; the bare word `none` opts a channel *out* of the default
+    # -- an upstream that must be reached directly has to be able to say so on
+    # its own channel, without the deployment unsetting the knob for everyone.
+    # Checked exactly like the header (scheme and allowlist included) and once
+    # more at startup (main.py); the empty default leaves channel parsing
+    # byte-identical to a deployment that never sets it.
+    upstream_proxy_default: str = ""
+
     # --- Channel assembly defaults -----------------------------------------
     # A JSON object merged *under* every channel's X-Channel-Options: one place
     # for values that are facts about this deployment rather than about a

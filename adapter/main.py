@@ -48,6 +48,7 @@ from adapter.scriptstore import build_store
 from adapter.settings import get_settings
 from adapter.storage import build_storage, missing_storage_config
 from adapter.state_store import StateStore
+from adapter.urlguard import check_proxy_url
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -223,6 +224,17 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(
             f"refusing to start: DEFAULT_CHANNEL_OPTIONS is invalid ({exc})"
         ) from None
+
+    # Same reasoning one knob over: a bad default proxy would 400 -- or worse,
+    # misroute -- every channel that relies on it. Empty stays free.
+    proxy_default = (cfg.upstream_proxy_default or "").strip()
+    if proxy_default:
+        try:
+            check_proxy_url(proxy_default, cfg, "UPSTREAM_PROXY_DEFAULT")
+        except ChannelConfigError as exc:
+            raise RuntimeError(
+                f"refusing to start: UPSTREAM_PROXY_DEFAULT is invalid ({exc})"
+            ) from None
 
     logger.info("adapter_startup json_parser=%s", JSON_PARSER)
     yield

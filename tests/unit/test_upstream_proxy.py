@@ -349,3 +349,57 @@ def test_the_script_view_attaches_the_proxy_per_call() -> None:
     assert view.closed is False
 
 
+# --------------------------------------------------- UPSTREAM_PROXY_DEFAULT
+#
+# The deployment-wide default exit (settings.py) sits between the two extremes
+# this file already pins: it must not fire when the header says something, and
+# a channel that needs no proxy must be able to refuse it. `none` is that
+# refusal; an empty header is *not* -- it keeps meaning "not declared".
+
+
+def test_default_applies_when_the_header_is_absent() -> None:
+    channel = _channel(None, upstream_proxy_default="http://pool.test:2086")
+    assert channel.proxy.enabled is True
+    assert channel.proxy.url == "http://pool.test:2086"
+
+
+def test_header_wins_over_the_default() -> None:
+    channel = _channel(
+        "http://own.test:3128", upstream_proxy_default="http://pool.test:2086"
+    )
+    assert channel.proxy.url == "http://own.test:3128"
+
+
+def test_none_opts_out_of_the_default() -> None:
+    channel = _channel("none", upstream_proxy_default="http://pool.test:2086")
+    assert channel.proxy.enabled is False
+    _, _, kwargs = build_request(channel, RequestPlan(), {"prompt": "a cat"}, None)
+    assert "proxy" not in kwargs
+
+
+def test_none_is_a_reserved_word_not_a_host() -> None:
+    """裸值 ``none`` 是声明而不是 URL：allowlist 只放行别的 host 也必须过。"""
+    channel = _channel(
+        "none",
+        upstream_proxy_allowlist="pool.test",
+        upstream_proxy_default="http://pool.test:2086",
+    )
+    assert channel.proxy.enabled is False
+
+
+def test_empty_header_still_means_not_declared() -> None:
+    """空头 ≠ 关闭：含义仍是「未声明」⇒ 默认生效（关闭请用 ``none``）。"""
+    channel = _channel("", upstream_proxy_default="http://pool.test:2086")
+    assert channel.proxy.url == "http://pool.test:2086"
+
+
+def test_default_is_checked_like_the_header() -> None:
+    """默认值走同一套校验：off-list 同样在发上游之前拒。"""
+    with pytest.raises(ChannelConfigError):
+        _channel(
+            None,
+            upstream_proxy_default="http://evil.test:3128",
+            upstream_proxy_allowlist="pool.test",
+        )
+
+
