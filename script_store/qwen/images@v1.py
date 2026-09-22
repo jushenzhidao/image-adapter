@@ -56,7 +56,7 @@ Two front doors, one script -- logged-in and guest:
   | `""` (empty)         | from jar  | the jar's own `token=` decides; without one, guest    |
   | `guest`              | guest     | the jar goes out with any `token=` **removed**        |
   | a whole cookie str.  | logged-in | the string *is* the jar, verbatim; token read from it |
-  | `<user>|<password>`  | logged-in | `POST /v1/auths/signin` for a JWT, cached -- below    |
+  | `<user>|<password>`  | logged-in | `POST /v2/auths/signin` for a JWT **and its session jar** -- below |
 
   **The `<user>|<password>` form signs in.** `POST /v2/auths/signin` (v2 -- only
   the read-only account record lives on v1) takes `sha256(password)` and answers
@@ -72,6 +72,18 @@ Two front doors, one script -- logged-in and guest:
   fallback an operator asked for, rather than a guaranteed 401), and a 401 on the
   generation call earns exactly one forced re-sign-in through the engine's single
   retry (`ctx.upstream_error`), so a rotated password heals without a redeploy.
+
+  **The pair form also captures the jar that signed in.** The warm-up and the
+  signin responses mint a set of cookies (the WAF's `acw_tc` / `x-ap` and the
+  account's session entries, `token=` among them) that belong to the very
+  session that produced the JWT; both are captured with it and cached as one
+  entry. Writes then carry *that* jar, so token and jar share an origin -- a
+  token paired with someone else's browser jar is an identity mismatch, and
+  measured 2026-09-22 the vendor refuses exactly that mix with x5sec while the
+  account itself signs in fine. This is also why a pair channel does **not**
+  need the `cookie` option: assembled by hand it is precisely the mismatch.
+  Entries cached before the capture existed (no jar) fall back to the old
+  assembly, so nothing that used to work stops working.
 
   Two cache layers keep that cheap: the module-level dict answers the hot path
   with **no I/O at all**, and `ctx.cache` (Redis when `redis_url` is set) is read
@@ -478,7 +490,26 @@ def _signin_cache_key(key):
 def _signin_entry(key):
     """L1 里这个账号的那一条（两个账号永远不共用一格）。"""
     return _SIGNIN_STATE.setdefault(
-        _signin_cache_key(key), {"jwt": "", "ts": 0.0, "inflight": False})
+        _signin_cache_key(key),
+        {"jwt": "", "ts": 0.0, "inflight": False, "jar": ""})
+
+
+def _cookie_header(set_cookies):
+    """`Set-Cookie` 值列表 -> 一条 Cookie 头（只有 name=value，丢掉属性）。
+
+    属性（`Path` / `HttpOnly` / `SameSite`…）是浏览器 jar 的事，不属于 Cookie
+    头；每条的**第一段**就是那一对。同名以**后出现者为准**（浏览器语义：后一条
+    Set-Cookie 替换前一条），所以先收进 dict 再拼。没有 `=` 的段直接跳过。
+    """
+    pairs = {}
+    for raw in set_cookies:
+        pair = str(raw).split(";", 1)[0].strip()
+        if "=" not in pair:
+            continue
+        name = pair.split("=", 1)[0].strip()
+        if name:
+            pairs[name] = pair
+    return "; ".join(pairs.values())
 
 
 async def _signin_cache_get(ctx, cache_key):
@@ -587,7 +618,8 @@ async def _ensure_signin(ctx, key, force=False):
         doc = await _signin_cache_get(ctx, cache_key)
         if doc:
             entry.update(jwt=str(doc.get("jwt") or ""),
-                         ts=float(doc.get("ts") or 0.0))
+                         ts=float(doc.get("ts") or 0.0),
+                         jar=str(doc.get("jar") or ""))
             if entry["jwt"] and time.time() - entry["ts"] < _SIGNIN_TTL:
                 _note(ctx, stage="auth", signin="from_cache")
                 return
@@ -620,11 +652,13 @@ async def _ensure_signin(ctx, key, force=False):
     # WAF's cold-start cookies never actually arrived.
     parts = urllib.parse.urlsplit(base)
     warm_url = parts.scheme + "://" + parts.netloc + SIGNIN_WARM_PATH
-    token, reason = "", ""
+    token, reason, jar = "", "", ""
     try:
         if service:
             # token 服务模式：登录发生在服务那侧（它走代理池，每条连接换出口），
             # 适配器这一侧完全不出现在 signin 的流量里 ⇒ 墙与我们无关。
+            # ⚠️ 服务只给 token，给不出**那次登录的会话 jar**：走 token_url 的
+            # 渠道拿不到自洽 jar，`cookie` 选项仍是它的身份来源（文档已写明）。
             url = service + ("&" if "?" in service else "?") \
                 + "account=" + urllib.parse.quote(user)
             async with ctx.http.get(
@@ -641,10 +675,13 @@ async def _ensure_signin(ctx, key, force=False):
                           + _diagnose(text) + ")")
         else:
             # 预热 best-effort：它只决定 WAF 冷启动 cookie 的有无，失败不该终止登录。
+            # 但拿到的那几条（acw_tc / x-ap——WAF 的冷启动章）要**留下来**：它们
+            # 和 signin 的 Set-Cookie 一起构成这次登录的会话 jar（见 jar 捕获）。
+            warm_cookies = []
             try:
                 async with ctx.http.get(warm_url,
-                                        headers=_warm_headers(ctx.options)):
-                    pass
+                                        headers=_warm_headers(ctx.options)) as resp:
+                    warm_cookies = _response_set_cookies(resp)
             except Exception:  # noqa: BLE001
                 pass
             async with ctx.http.post(
@@ -654,28 +691,38 @@ async def _ensure_signin(ctx, key, force=False):
                     headers=_signin_headers(ctx.options)) as resp:
                 status = resp.status
                 text = await resp.text()
-                token = _set_cookie_token(_response_set_cookies(resp))
+                signed = _response_set_cookies(resp)
+                token = _set_cookie_token(signed)
             if status != 200:
                 reason = "HTTP " + str(status)
             elif not token:
                 reason = "no token in Set-Cookie (" + _diagnose(text) + ")"
+            else:
+                # 会话 jar：这次登录**自己**种下的 cookie 的全集（WAF 冷启动章 +
+                # Set-Cookie 全集，token 在内）。与 token 同源，写请求带它 = 身份
+                # 自洽；过去把 token 拼进 `cookie` 选项（运营者的 jar）是**身份
+                # 移植**——实测 2026-09-22 正是那种混搭被 x5sec 拒。
+                jar = _cookie_header(warm_cookies + signed)
     except Exception as exc:  # noqa: BLE001 - ctx.fail raises its own shape
         reason = "unreachable: " + str(exc)[:140]
     finally:
         entry["inflight"] = False
-    entry.update(jwt=token, ts=time.time())
+    entry.update(jwt=token, ts=time.time(), jar=jar)
     # 429/挑战页要与"口令不对"区分退避：后者 5 分钟足够，前者实测 >5 分钟仍在墙上。
     backoff = (_SIGNIN_TTL if token
                else _SIGNIN_WALL_COOLDOWN if "WAF" in reason
                else _SIGNIN_RETRY_COOLDOWN)
     # 穿透写回：成功了别人拿去直接用；失败了别人也一起被冷却窗闸住。
+    # jar 与 token 是**一套**，所以同一条文档里写回；失败时写空 jar，
+    # 顺带把 L2 里可能残留的旧 jar 清掉（token 已失效，旧的不能再用）。
     await _signin_cache_put(ctx, cache_key,
-                            {"jwt": token, "ts": entry["ts"]}, backoff)
+                            {"jwt": token, "ts": entry["ts"], "jar": jar}, backoff)
     # 记下这次尝试的时刻，供跨账号节流用（写的是**尝试**时刻，不是成功时刻）。
     await _signin_cache_put(ctx, _SIGNIN_PACE_KEY, {"ts": entry["ts"]},
                             max(int(_SIGNIN_MIN_INTERVAL) * 2, int(backoff)))
     # 成功也记：运营方最需要知道的一句话就是"这次到底登进去了没有"。
-    _note(ctx, stage="auth", signin="ok" if token else "failed", reason=reason[:160])
+    _note(ctx, stage="auth", signin="ok" if token else "failed",
+          reason=reason[:160], jar=bool(jar))
 
 
 def _key_is_pair(key):
@@ -758,7 +805,20 @@ def _jar_for(ctx, cookie):
     there would authenticate as an account while every field we set says
     otherwise; and an empty key leaves the operator's jar verbatim, which is the
     case that must stay byte-identical for anyone comparing against a capture.
+
+    The pair form is its own case now: it prefers the **jar captured at
+    signin** -- the cookies that session minted together with the token -- so
+    the identity on the wire is self-consistent. A hand-assembled jar (the
+    `cookie` option) plus this account's token is a token with someone else's
+    session, which is the mix measured to draw x5sec (2026-09-22). Entries
+    cached before the capture existed (no jar) fall back to the old assembly,
+    so nothing that used to work stops working.
     """
+    declared = _declared_key(ctx)
+    if _key_is_pair(declared):
+        captured = _signin_entry(declared)
+        if captured.get("jwt") and captured.get("jar"):
+            return captured["jar"]
     key = _effective_key(ctx)
     if _key_is_jar(key):
         # Third Bearer form: the pasted string IS the jar -- verbatim on the

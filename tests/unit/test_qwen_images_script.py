@@ -814,6 +814,85 @@ def test_signin_warmup_gets_the_waf_cold_start_cookies_first():
     assert urls[1] == "https://chat.qwen.ai/api/v2/auths/signin"
 
 
+# --- 会话 jar 捕获（pair 形态的身份自洽，2026-09-22） -----------------------
+
+
+def test_cookie_header_takes_pairs_not_attributes_and_last_wins():
+    """Set-Cookie → Cookie 头：只取第一段，属性丢掉；同名后出现者为准。"""
+    out = q._cookie_header(["acw_tc=1; Path=/; HttpOnly",
+                            "x-ap=2; Path=/",
+                            "acw_tc=9; Domain=.qwen.ai",
+                            "junk"])
+    assert out == "acw_tc=9; x-ap=2"
+
+
+def test_pair_form_captures_the_signin_session_jar():
+    """pair 形态把「预热 + 登录」自己种下的 cookie 收成 jar，与 token 同源。
+
+    写请求带的是这份**自洽身份**，而不是把 token 拼进配置的 `cookie` 选项
+    （运营者的 jar）——实测 2026-09-22 正是那种混搭被 x5sec 拒。
+    """
+    warm = FakeResp(200, "<html>ok</html>",
+                    headers={"Set-Cookie": ["acw_tc=x1; Path=/; HttpOnly",
+                                            "x-ap=54; Path=/"]})
+    http = FakeHttp(_signin_ok("jwt-new"),
+                    routes={"chat.qwen.ai/auth": warm})
+    ctx = FakeCtx(options={"cookie": "someone-else=jar; token=oldjwt"},
+                  http=http, key="user@mail.test|passw0rd")
+    h = asyncio.run(q.transform(ctx, {}, "auth"))
+
+    for part in ("acw_tc=x1", "x-ap=54", "token=jwt-new"):
+        assert part in h["Cookie"], h["Cookie"]
+    assert "someone-else=jar" not in h["Cookie"], "不许混入别人的会话"
+    assert "oldjwt" not in h["Cookie"]
+    # 同一份 jar 也要上到 request 相位的写请求上
+    asyncio.run(q.transform(ctx, {"prompt": "x"}, "request"))
+    sent = [c for c in http.calls if c.get("json")][-1]["headers"]
+    assert sent["Cookie"] == h["Cookie"]
+
+
+def test_the_captured_jar_is_cached_beside_the_token():
+    """jar 与 token 是**一套**：L1 与 L2 都一起写，跨 worker/重启同样自洽。"""
+    warm = FakeResp(200, "ok", headers={"Set-Cookie": "acw_tc=x1; Path=/"})
+    http = FakeHttp(_signin_ok("jwt-new"),
+                    routes={"chat.qwen.ai/auth": warm})
+    ctx = FakeCtx(options={}, http=http, key="user@mail.test|passw0rd")
+    asyncio.run(q.transform(ctx, {}, "auth"))
+
+    doc = json.loads(ctx.cache.store[q._signin_cache_key("user@mail.test|passw0rd")])
+    assert doc["jar"] == "acw_tc=x1; token=jwt-new"
+    assert q._signin_entry("user@mail.test|passw0rd")["jar"] == doc["jar"]
+
+
+def test_an_old_cache_entry_without_a_jar_falls_back_to_the_old_assembly():
+    """捕获特性之前写进 L2 的条目没有 jar：退回旧拼装，行为不回归。"""
+    http = FakeHttp(FakeResp(200, json.dumps(CHAT_OK)))
+    ctx = FakeCtx(options={"cookie": "fp=1"}, http=http,
+                  key="user@mail.test|passw0rd")
+    _seed_l2(ctx, "user@mail.test|passw0rd", "jwt-cached", q.time.time())
+    h = asyncio.run(q.transform(ctx, {}, "auth"))
+    assert h["Cookie"] == "fp=1; token=jwt-cached"
+    signins = [c for c in http.calls if c["url"].endswith("/v2/auths/signin")]
+    assert signins == [], "L2 命中不该再登"
+
+
+def test_a_refused_signin_clears_a_stale_captured_jar():
+    """重登被拒 ⇒ 空 jar 写回 L2：旧 jar 随失效 token 一起作废，不许复活。"""
+    refused = FakeResp(200, json.dumps({"detail": "nope"}))
+    http = FakeHttp(FakeResp(200, json.dumps(CHAT_OK)),
+                    routes={"auths/signin": refused})
+    ctx = FakeCtx(options={"cookie": "fp=1", "bx_ua": "ua-g",
+                           "bx_umidtoken": "um-g"},
+                  http=http, key="user@mail.test|wrong")
+    _seed_l2(ctx, "user@mail.test|wrong", "stale-jwt",
+             q.time.time() - q._SIGNIN_TTL - 1,
+             jar="acw_tc=s; token=stale-jwt")
+    asyncio.run(q.transform(ctx, {}, "auth"))
+
+    doc = json.loads(ctx.cache.store[q._signin_cache_key("user@mail.test|wrong")])
+    assert doc["jwt"] == "" and doc["jar"] == ""
+
+
 def test_pair_form_signin_failure_falls_back_to_guest():
     """signin 被拒 → 回落 guest 门：旧 token 清掉、按 guest 凭据校验。
 
@@ -1085,9 +1164,16 @@ def test_signin_rate_limit_floor_is_documented_by_the_constant():
 PAIR_KEY = "user@mail.test|passw0rd"
 
 
-def _seed_l2(ctx, key, jwt, ts):
-    """按 L2 的真实形状预置一份（字节值 + JSON doc）。"""
-    payload = json.dumps({"jwt": jwt, "ts": ts}).encode("utf-8")
+def _seed_l2(ctx, key, jwt, ts, jar=None):
+    """按 L2 的真实形状预置一份（字节值 + JSON doc）。
+
+    `jar=None` 时**省略该键** —— 那是捕获特性之前写进 L2 的**旧形状**，
+    专门用来钉兼容路径（旧条目必须退回旧拼装，不许静默失效）。
+    """
+    doc = {"jwt": jwt, "ts": ts}
+    if jar is not None:
+        doc["jar"] = jar
+    payload = json.dumps(doc).encode("utf-8")
     ctx.cache.store[q._signin_cache_key(key)] = payload
 
 
