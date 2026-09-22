@@ -96,6 +96,9 @@ def settings() -> Settings:
         minio_endpoint="",
         fal_key="",
         script_timeout=PHASE_TIMEOUT,
+        # A local .env must not inject a proxy or a real Logfire token here.
+        upstream_proxy_default="",
+        logfire_token="",
     )
 
 

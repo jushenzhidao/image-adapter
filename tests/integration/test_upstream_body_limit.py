@@ -50,6 +50,9 @@ def settings() -> Settings:
         redis_url="",
         minio_endpoint="",
         max_upstream_bytes=BODY_LIMIT,
+        # A local .env must not inject a proxy or a real Logfire token here.
+        upstream_proxy_default="",
+        logfire_token="",
     )
 
 

@@ -183,6 +183,9 @@ def test_overlay_ref_wins_over_image_store(tmp_path, monkeypatch):
         redis_url="",
         minio_endpoint="",
         script_overlay_dirs=str(tmp_path / "overlay"),
+        # A local .env must not inject a proxy or a real Logfire token here.
+        upstream_proxy_default="",
+        logfire_token="",
     )
     try:
         with TestClient(app, raise_server_exceptions=False) as overlay_client:

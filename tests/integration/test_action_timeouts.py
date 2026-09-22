@@ -147,6 +147,9 @@ def settings() -> Settings:
         script_timeout=PHASE_CAP,
         image_download_timeout=DOWNLOAD_BOUND,
         storage_upload_timeout=UPLOAD_BOUND,
+        # A local .env must not inject a proxy or a real Logfire token here.
+        upstream_proxy_default="",
+        logfire_token="",
     )
 
 

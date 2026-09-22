@@ -72,6 +72,9 @@ _DEFAULTS = dict(
     storage_backend="minio",
     minio_endpoint="",
     fal_key="",
+    # A local .env must not inject a proxy or a real Logfire token here.
+    upstream_proxy_default="",
+    logfire_token="",
 )
 
 
