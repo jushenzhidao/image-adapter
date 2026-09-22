@@ -644,3 +644,56 @@ def test_every_version_is_within_the_script_sandbox(filename):
         (ROOT / filename).read_text(encoding="utf-8"),
         filename=f"volcengine_ark/{filename}",
     )
+
+
+class TestRehostUrl:
+    """The reply-side opt-in: same pass-through shape, our link under `url`.
+
+    ark honours both `response_format` values, so its `url` carrier is a
+    verbatim pass-through of ark's own CDN link -- valid for 24h and then
+    gone. The option swaps that for a link of ours through the generic
+    mechanism, and the assertions here are the same three the openai suite
+    pins: on -> ours, off -> untouched, a hand-written value -> still off.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reply_links_are_swapped_for_ours_when_the_option_is_on(
+        self, monkeypatch
+    ):
+        ctx, spy = _ctx(monkeypatch, rehost_url=True)
+        out = await ark.transform(
+            ctx,
+            {"created": 1, "data": [{"url": URL, "size": "1024x1024"}]},
+            "response",
+        )
+        assert out["data"] == [{"url": REHOSTED, "size": "1024x1024"}]
+        assert spy.downloads == [URL]
+        assert spy.uploads == [PNG], "the extension follows the sniffed type"
+
+    @pytest.mark.asyncio
+    async def test_reply_links_pass_through_without_the_option(self, monkeypatch):
+        """Off by default: honouring ark's own link costs nothing."""
+        ctx, spy = _ctx(monkeypatch)
+        out = await ark.transform(ctx, {"created": 1, "data": [{"url": URL}]},
+                                  "response")
+        assert out["data"] == [{"url": URL}]
+        assert spy.downloads == [] and spy.uploads == []
+
+    @pytest.mark.asyncio
+    async def test_b64_items_are_untouched_even_with_the_option(self, monkeypatch):
+        """`b64_json` items have no link to swap, and `usage` -- the billing
+        surface -- rides through whatever the option did to `data`."""
+        ctx, spy = _ctx(monkeypatch, rehost_url=True)
+        reply = {"created": 1, "data": [{"b64_json": BARE}], "usage": {"x": 1}}
+        out = await ark.transform(ctx, reply, "response")
+        assert out["data"] == [{"b64_json": BARE}]
+        assert out["usage"] == {"x": 1}
+        assert spy.downloads == [] and spy.uploads == []
+
+    @pytest.mark.asyncio
+    async def test_a_hand_written_value_stays_off(self, monkeypatch):
+        """Only the JSON boolean counts -- "true" in quotes stays off."""
+        ctx, spy = _ctx(monkeypatch, rehost_url="true")
+        out = await ark.transform(ctx, {"data": [{"url": URL}]}, "response")
+        assert out["data"] == [{"url": URL}]
+        assert spy.downloads == [] and spy.uploads == []

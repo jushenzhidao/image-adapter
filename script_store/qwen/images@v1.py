@@ -162,7 +162,14 @@ Why this script needs three phases (the only one in the store that does):
      This phase also decides the reply's *shape*. A caller that asks for
      `b64_json` gets base64 -- one checked download per image, via
      `ctx.download_image` -- and a caller that asks for `url` (or says nothing,
-     which is not a request for base64) gets the vendor's own link untouched.
+     which is not a request for base64) gets the vendor's own link untouched --
+     unless the channel opted into `rehost_url: true` in `X-Channel-Options`
+     (a cross-channel convention; the openai and ark scripts read the same
+     key), in which case every vendor link is fetched and re-stored as ours
+     via `ctx.rehost_image`: the vendor's CDN link is outside our retention
+     control, so a caller that needs the picture later holds a link of ours.
+     Without the option nothing is downloaded for a `url` reply -- that fetch
+     is the caller's to opt into.
      The download is what makes a **dead link** detectable: measured upstream
      behaviour is that `qwen-image-3.0-pro` can publish a CDN URL that fetches a
      404 / 226-byte HTML page, and a client handed that as a success has no
@@ -1312,26 +1319,44 @@ async def _carry(ctx, urls, want):
     """The reply in the carrier `want` names; None = the vendor's own shape.
 
     `url` -- and saying nothing -- is the pass-through: the vendor published a
-    link and re-hosting it would only add a copy. `b64_json` costs one download
-    per image, and that download is also the only place a **dead link** can be
-    caught. Measured upstream behaviour (`qwen-chat-api.md` §3.0 (7)):
-    `qwen-image-3.0-pro` can hand back a CDN URL that fetches a **404 / 226-byte
-    HTML page**, so a caller given that URL as a success has no picture at all.
-    `ctx.download_image` refuses a body that is not an image -- by magic bytes,
-    not by Content-Type, because in the same batch a genuine PNG came back as
-    `application/octet-stream` -- which turns that silent failure into a loud
-    one exactly when the caller is about to receive the bytes anyway. A caller
-    that asked for a URL pays nothing extra: that fetch is its own to opt into,
-    and not fetching is what this channel did before.
+    link and re-hosting it would only add a copy. With `rehost_url: true`,
+    though, each link is fetched and re-stored via the generic mechanism
+    (`ctx.rehost_image`), so the caller holds *our* link rather than the
+    vendor's -- and that fetch doubles as the dead-link verdict below.
+    `b64_json` costs one download per image, and that download is also the
+    only place a **dead link** can be caught. Measured upstream behaviour
+    (`qwen-chat-api.md` §3.0 (7)): `qwen-image-3.0-pro` can hand back a CDN
+    URL that fetches a **404 / 226-byte HTML page**, so a caller given that
+    URL as a success has no picture at all. `ctx.download_image` refuses a
+    body that is not an image -- by magic bytes, not by Content-Type, because
+    in the same batch a genuine PNG came back as `application/octet-stream`
+    -- which turns that silent failure into a loud one exactly when the
+    caller is about to receive the bytes anyway. A caller that asked for a
+    URL pays nothing extra by default: that fetch is its own to opt into.
     """
-    if want != "b64_json":
+    if want == "b64_json":
+        # Concurrently: these are waits rather than work, and `ctx.fanout`
+        # bounds the degree (`fanout_concurrency`) while re-raising the
+        # earliest failing item's own exception -- so a dead link keeps its
+        # own error rather than being flattened into a generic one.
+        blobs = await ctx.fanout(urls, partial(_b64_of, ctx))
+        return {"created": 0, "data": [{"b64_json": b} for b in blobs]}
+    if ctx.options.get("rehost_url") is not True:
         return {"created": 0, "data": [{"url": u} for u in urls]}
-    # Concurrently: these are waits rather than work, and `ctx.fanout` bounds
-    # the degree (`fanout_concurrency`) while re-raising the earliest failing
-    # item's own exception -- so a dead link keeps its own error rather than
-    # being flattened into a generic one.
-    blobs = await ctx.fanout(urls, partial(_b64_of, ctx))
-    return {"created": 0, "data": [{"b64_json": b} for b in blobs]}
+    links = await ctx.fanout(urls, partial(_rehost_of, ctx))
+    return {"created": 0, "data": [{"url": u} for u in links]}
+
+
+async def _rehost_of(ctx, url):
+    """One vendor link -> our own link, or the vendor's link back.
+
+    `None` from the mechanism means no object storage to produce a link with,
+    and a data URI must never be dressed up as a `url` -- so the vendor's own
+    link rides through instead, and our missing storage does not fail a
+    request that used to work.
+    """
+    stored = await ctx.rehost_image(url)
+    return url if stored is None else stored
 
 
 async def _item_b64_of(ctx, item):
@@ -1349,20 +1374,44 @@ async def _item_b64_of(ctx, item):
     return fresh
 
 
+async def _item_rehost_of(ctx, item):
+    """`_item_b64_of`'s rehost twin: one shaped item, its link swapped for ours.
+
+    An item with no http link is handed back untouched rather than dressed up
+    as a picture, and so is an item the mechanism could not re-host (no
+    object storage). Extras (`revised_prompt`, `width`, …) ride along either
+    way: the body on the way in is a superset, and the way back has no reason
+    to be narrower.
+    """
+    url = item.get("url") if isinstance(item, dict) else None
+    if not isinstance(url, str) or not url.startswith("http"):
+        return item
+    stored = await ctx.rehost_image(url)
+    if stored is None:
+        return item
+    return {**item, "url": stored}
+
+
 async def _carry_items(ctx, items, want):
     """`_carry`'s counterpart for a reply that already carries `data[]` items.
 
     The SSE path composes its items here; a non-SSE reply arrives with them
     already made, and the caller's carrier still decides what the links become
     -- being asked for base64 and quietly receiving URLs is exactly the kind of
-    gap this store keeps closing. Order is preserved and extras survive, both by
-    `ctx.fanout`'s contract rather than by convention.
+    gap this store keeps closing. With `rehost_url: true` the same fan-out
+    swaps every vendor link for one of ours (`ctx.rehost_image`). Order is
+    preserved and extras survive, both by `ctx.fanout`'s contract rather than
+    by convention.
     """
     # A non-list `data` is passed through untouched: iterating it would produce
     # keys, and a reply this script does not understand is not one to reshape.
-    if want != "b64_json" or not isinstance(items, list):
+    if not isinstance(items, list):
         return items
-    return await ctx.fanout(items, partial(_item_b64_of, ctx))
+    if want == "b64_json":
+        return await ctx.fanout(items, partial(_item_b64_of, ctx))
+    if ctx.options.get("rehost_url") is not True:
+        return items
+    return await ctx.fanout(items, partial(_item_rehost_of, ctx))
 
 
 # ------------------------------------------------------------------ response

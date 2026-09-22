@@ -58,7 +58,11 @@ too. It is a channel-level decision rather than a per-request one -- the
 same channel either promises our links or does not -- which is what a caller
 needs when the vendor's own link is temporary (OpenAI's url is). Off by
 default: honouring an upstream link costs nothing, and re-hosting every one
-of them adds a download plus an upload to every reply.
+of them adds a download plus an upload to every reply. The option is a
+cross-channel convention now, not this script's private knob: the qwen and
+ark scripts honour the same key through the same mechanism
+(`ctx.rehost_image`), and google needs no such switch because its `url`
+carrier is always a link of ours to begin with.
 
 When the caller says nothing the response rides through untouched. The front
 door's `response_format` default decides only whether a value is legal; reading
@@ -179,9 +183,12 @@ async def _as_url(ctx, item):
     it converted anything. What is never done is putting a data URI under
     `url`; if the upstream did that, that is its answer, not one we invented.
 
-    With `rehost_url: true`, a plain upstream link is fetched and re-stored
-    like any other carrier, so the caller holds our link rather than the
-    vendor's.
+    With `rehost_url: true`, a plain upstream link goes through the generic
+    mechanism (`ctx.rehost_image`): the vendor's link is fetched with the
+    checked downloader -- so a dead vendor link fails loudly, not as a
+    picture-less success -- and re-stored as ours. `None` from the mechanism
+    (no object storage to produce a link with) passes the vendor's own link
+    through.
     """
     url = item.get("url")
     if (
@@ -190,6 +197,14 @@ async def _as_url(ctx, item):
         and ctx.options.get("rehost_url") is not True
     ):
         return item
+
+    if isinstance(url, str) and ctx.is_url(url):
+        stored = await ctx.rehost_image(url)
+        if stored is None:
+            # No object storage: there is no link of ours to hand back, so
+            # the vendor's own link rides through rather than fail.
+            return item
+        return _with_carrier(item, "url", stored)
 
     raw = await _payload_bytes(ctx, item)
     if raw is None:

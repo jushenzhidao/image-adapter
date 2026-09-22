@@ -258,6 +258,38 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
             ext = mime.split("/", 1)[1]
         return await self.upload_temp_image(data, ext=ext)
 
+    async def rehost_image(self, ref: str) -> str | None:
+        """Any of the three shapes -> *our* link, or None when there is none.
+
+        ``image_url``'s strict twin, for the reply side. Where ``image_url``
+        passes a URL through unchanged -- "a link is a link", which is right
+        for a *reference we are about to hand upstream* -- ``rehost_image``
+        fetches the link and re-stores the bytes, so the caller holds a link
+        of ours rather than the vendor's. The fetch is the checked
+        ``download_image`` (SSRF guard, byte cap, magic-bytes verdict), which
+        is what turns a **dead vendor link** into a loud failure here:
+        measured qwen behaviour is a CDN URL whose body is a 404 HTML page,
+        and a caller handed that as a success has no picture.
+
+        ``None`` -- never a data URI dressed up as a link -- when no link can
+        be produced, which today means object storage is absent or the store
+        degraded: ``upload_temp_image``'s fallback is a data URI, and the
+        ``url`` carrier must not carry one. The openai and google scripts
+        made that rule before this method existed; it is the same rule. A
+        script that receives None passes the vendor's own shape through, and
+        a download failure propagates: both decisions stay in the script,
+        exactly as with compression -- the mechanism is here, the policy is
+        not (docs/07 §2). ``rehost_url`` in ``X-Channel-Options`` is the
+        convention the image scripts read to opt a channel in.
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            return None
+        data = await self.image_bytes(ref.strip())
+        mime = self.sniff_mime(data)
+        ext = mime.split("/", 1)[1] if mime.startswith("image/") else "png"
+        stored = await self.upload_temp_image(data, ext=ext)
+        return stored if self.is_url(stored) else None
+
     async def compress_image(
         self,
         ref: str,

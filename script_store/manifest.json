@@ -6,7 +6,7 @@
         "stable": "v1"
       },
       "digests": {
-        "v1": "8839afffb5c3899e040ce8b145f837b0d5ae01c6f02be0027ce85cc2ed788d62"
+        "v1": "ea5b4daccd79ccf5daac31b968636f63869f2d7f5de79a8028f880bb065a6456"
       }
     },
     "volcengine_ark/images": {
@@ -15,7 +15,7 @@
         "stable": "v1"
       },
       "digests": {
-        "v1": "05aade1ea3c3ddf203c90694d46519b86dc11e8b6e6efcd9657eeb9718db27b0"
+        "v1": "9045b479f2902d3172edba1dd607f9a6f96b284e4645f69b821a208547b3e4a0"
       }
     },
     "google/images": {
@@ -33,7 +33,7 @@
         "stable": "v1"
       },
       "digests": {
-        "v1": "b45e148e6ae45c909720e083e18585792da1e7c79a712fc6ced761104391f084"
+        "v1": "2161df3fecea7ae03e0f2fa482e36efe1ee152ca82c42cb26bb0b87141984d7b"
       }
     }
   }

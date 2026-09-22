@@ -197,7 +197,7 @@ class FakeCtx(MappingMixin, CodecMixin, ModerationMixin):
     """
 
     def __init__(self, options=None, http=None, raw=None, logfire=True, key="",
-                 cache=None, blobs=None):
+                 cache=None, blobs=None, stored_link=None, rehost_error=None):
         # `is not None` 而不是 `or`：空 dict 是"没有配置"这个合法取值，
         # 用 or 会让它悄悄退回 CREDS（"凭据缺失"那条用例就再也测不到）。
         self.options = dict(CREDS) if options is None else options
@@ -221,6 +221,12 @@ class FakeCtx(MappingMixin, CodecMixin, ModerationMixin):
         # （404 的 226 字节 HTML 页），不是随便挑的失败。
         self.blobs = dict(blobs or {})
         self.downloads = []
+        # `ctx.rehost_image` 站位（机制判据在 test_image_ref.py 用真件测）：
+        # `stored_link` 是转存产物；None = 无存储 ⇒ 机制按契约回 None，
+        # 脚本应透传上游链接；`rehost_error` 模拟死链的响亮失败。
+        self.stored_link = stored_link
+        self.rehost_error = rehost_error
+        self.rehosts = []
 
     def emit(self, **kw):
         self.emitted.append(kw)
@@ -243,6 +249,13 @@ class FakeCtx(MappingMixin, CodecMixin, ModerationMixin):
                 code="image_content_type", status=400,
             )
         return raw
+
+    async def rehost_image(self, url):
+        """`ctx.rehost_image` 站位：登记调用、按配置回转存产物或失败。"""
+        self.rehosts.append(url)
+        if self.rehost_error is not None:
+            raise self.rehost_error
+        return self.stored_link
 
     async def fanout(self, items, work):
         """`ctx.fanout` 的一元门面：真原语，限 5（并发度不是这个脚本的语义）。"""
@@ -1686,3 +1699,78 @@ def test_real_content_refusal_frame_maps_to_400_and_leaves_a_trace_note():
     assert note["modality"] == "text"
     assert note["refused_at"] == "input"
     assert "内容安全警告" in note["details"]
+
+
+# ------------------------- rehost_url：跨渠道约定（openai/ark 同键），2026-09-22
+
+OURS = "https://ours.example/20260922/a.png"
+
+
+def test_rehost_url_swaps_the_vendors_link_for_ours():
+    """开关只对 url 载体生效：上游链接经机制取回、验图、转存成我们的。"""
+    ctx = FakeCtx(raw=SSE_OK.encode("utf-8"),
+                  options={**CREDS, "rehost_url": True}, stored_link=OURS)
+    out = _drive(ctx)
+    assert out["data"] == [{"url": OURS}]
+    assert ctx.rehosts == [URL1]
+    assert ctx.downloads == [], "url 载体的下载发生在机制里，脚本不再各付一次"
+
+
+def test_rehost_url_defaults_off_and_the_vendors_link_rides_through():
+    """默认关：原样转出、零下载 —— 这个渠道曾经的全部行为，一字不变。"""
+    ctx = FakeCtx(raw=SSE_OK.encode("utf-8"), stored_link=OURS)
+    out = _drive(ctx)
+    assert out["data"] == [{"url": URL1}]
+    assert ctx.rehosts == []
+
+
+def test_a_hand_written_rehost_value_stays_off():
+    """与 openai 渠道同一纪律：只有 JSON 布尔 true 算开，字符串 "true" 不算。"""
+    ctx = FakeCtx(raw=SSE_OK.encode("utf-8"), blobs={URL1: PNG},
+                  options={**CREDS, "rehost_url": "true"}, stored_link=OURS)
+    out = _drive(ctx)
+    assert out["data"] == [{"url": URL1}]
+    assert ctx.rehosts == []
+
+
+def test_rehost_without_storage_passes_the_vendors_link_through():
+    """无存储（机制回 None）⇒ 上游链接原样透传。
+
+    两件事都不做：不拿 data URI 冒充 url（那是红线），也不因为**我们的**
+    存储缺失去 fail 一个本来能成的请求。
+    """
+    ctx = FakeCtx(raw=SSE_OK.encode("utf-8"),
+                  options={**CREDS, "rehost_url": True}, stored_link=None)
+    out = _drive(ctx)
+    assert out["data"] == [{"url": URL1}]
+    assert ctx.rehosts == [URL1]
+
+
+def test_a_dead_link_fails_loudly_under_rehost():
+    """死链在 rehost 下必须响亮失败（机制里验图），而不是把 404 HTML 页当成功交出去。"""
+    dead = UpstreamError("Expected an image, got Content-Type 'text/html'",
+                         code="image_content_type", status=400)
+    ctx = FakeCtx(raw=SSE_OK.encode("utf-8"),
+                  options={**CREDS, "rehost_url": True},
+                  stored_link=OURS, rehost_error=dead)
+    with pytest.raises(UpstreamError):
+        _drive(ctx)
+    assert ctx.rehosts == [URL1]
+
+
+def test_rehost_keeps_extras_on_json_items():
+    """非 SSE 的 data[] 回复同样换链接（`_carry_items` 出口），extras 原样保留。"""
+    ctx = FakeCtx(options={**CREDS, "rehost_url": True}, stored_link=OURS)
+    reply = {"created": 7, "data": [{"url": URL1, "revised_prompt": "p"}]}
+    out = _drive(ctx, payload=reply)
+    assert out["created"] == 7
+    assert out["data"] == [{"revised_prompt": "p", "url": OURS}]
+
+
+def test_b64_json_ignores_rehost():
+    """rehost 是 url 载体的开关：要 base64 的路径不受它影响，也绝不双重下载。"""
+    ctx = FakeCtx(raw=SSE_OK.encode("utf-8"), blobs={URL1: PNG},
+                  options={**CREDS, "rehost_url": True}, stored_link=OURS)
+    out = _drive(ctx, response_format="b64_json")
+    assert out["data"] == [{"b64_json": ctx.encode_b64(PNG)}]
+    assert ctx.rehosts == [] and ctx.downloads == [URL1]

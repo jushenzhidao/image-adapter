@@ -445,12 +445,36 @@ ratio = ctx.fit_ratio(w, h, caps["ratios"])
 │   │                （`map_size` / `resolve_model` 是早期草案，§5 明确不做）
 │   ├─ 本地图像处理 ─ compress_image（三形态）/ ctx.image.compress（机制）/ image_info（待做）
 │   ├─ IO 三件套 ── image_* / download_image / upload_temp_image
+│   │                rehost_image（三形态 → **我们的**链接；None＝无存储，绝不拿
+│   │                data URI 冒充 url；死链经 checked download 响亮失败）
 │   ├─ 出口 ────── emit / fail
 │   └─ 缓存与预算 ── image / sleep / remaining / deadline
 │
 └─ 基础设施 ────────────────── aiohttp 连接池 / Redis / 对象存储端口 / 线程池
                                 （远端图像能力走"上游调用"，不是 ctx：见 §10）
 ```
+
+### 12.1 `ctx.rehost_image` 与 `rehost_url` 渠道选项（✅ 已实施 2026-09-22）
+
+**机制在 ctx、策略在脚本**的又一个实例，与 `compress_image` 同构。`rehost_image(ref)`
+是 `image_url` 的"严格孪生"：`image_url` 对链接**直通**（正确，因为那是发给上游的
+引用），`rehost_image` 对链接**取回转存**（正确，因为那是交给调用方的产物）——
+返回我们的链接；存储缺失/降级时返回 **`None`**（绝不把 data URI 冒充 `url`），
+取回不是图（死链）则让 checked download 自己的异常传播。
+
+脚本侧的策略开关是渠道选项 **`rehost_url: true`**（`X-Channel-Options`），这是
+**跨渠道约定键**，不是一个脚本的私有旋钮：
+
+| 渠道脚本 | `url` 载体默认是什么 | `rehost_url: true` 的效果 |
+| --- | --- | --- |
+| `openai/images@v1` | 上游真链接 / data URI（网关不一而足） | 真链接经机制转存为我们的（原有行为改走机制） |
+| `qwen/images@v1` | 上游 CDN 直通（实测有 404 HTML 死链前科） | 同上；下载顺带就是死链判据 |
+| `volcengine_ark/images@v1` | 方舟 CDN 直通（24h 有效期） | 同上 |
+| `google/images@v1` | **本来就是我们的链接**（`upload_temp_image` 产出） | 无操作（没有上游链接可换）——这是脚本层的渠道事实，不是开关失灵 |
+
+红线对照：这是**出站素材物化**（§14.2.1 表中"写素材"一行），不产生额外上游生成
+调用、失败语义不变、并发受 `fanout_concurrency` 约束；策略决策不进框架（§2），
+框架只有"取回→验图→转存"这一段纯机制。
 
 ---
 

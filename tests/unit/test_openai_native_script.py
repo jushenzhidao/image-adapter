@@ -274,3 +274,25 @@ async def test_a_hand_written_option_value_does_not_turn_rehosting_on(
 
     assert out["data"][0]["url"] == link
     assert downloads.urls == [] and stores.calls == []
+
+
+async def test_a_rehost_without_object_storage_passes_the_vendor_link_through(
+    script, monkeypatch
+):
+    """No MinIO: the mechanism answers None and the vendor's own link rides
+    through. A data URI is never dressed up as `url`, and a 502 out of *our*
+    missing storage would fail requests that used to work."""
+    ctx = _ctx()
+    ctx.options["rehost_url"] = True
+
+    async def degraded_upload(data: bytes, ext: str = "png") -> str:
+        return "data:image/png;base64," + base64.b64encode(data).decode()
+
+    monkeypatch.setattr(ctx, "download_image", _Downloads())
+    monkeypatch.setattr(ctx, "upload_temp_image", degraded_upload)
+
+    await script.transform(ctx, {"prompt": "x", "response_format": "url"}, "request")
+    link = "https://vendor-cdn.test/a.png"
+    out = await script.transform(ctx, {"data": [{"url": link}]}, "response")
+
+    assert out["data"][0]["url"] == link

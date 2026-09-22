@@ -332,3 +332,80 @@ async def test_a_missing_header_keeps_being_accepted():
     data = b"no-magic-but-the-header-said-nothing"
     ctx = _ctx_with(_FakeDownload(data, {}))
     assert await ctx.download_image("https://cdn.example/a.png") == data
+
+
+# `rehost_image` is `image_url`'s strict twin for the reply side: image_url
+# passes a link through (right for a reference we hand upstream), rehost_image
+# fetches and re-stores it (right for a link we hand the caller). What the
+# tests pin: the store decision, the sniffed extension, the None-instead-of-
+# data-URI contract, and the loud failure on a link that delivers no picture.
+
+
+@pytest.mark.asyncio
+async def test_rehost_image_stores_a_link_as_our_own(monkeypatch):
+    ctx = _ctx()
+    seen: list[str] = []
+    stored: list[tuple[bytes, str]] = []
+
+    async def fake_download(url: str) -> bytes:
+        seen.append(url)
+        return PNG
+
+    async def fake_upload(data: bytes, ext: str = "png") -> str:
+        stored.append((data, ext))
+        return "https://ours.example/20260922/a.png"
+
+    monkeypatch.setattr(ctx, "download_image", fake_download)
+    monkeypatch.setattr(ctx, "upload_temp_image", fake_upload)
+    out = await ctx.rehost_image("https://vendor.example/a.png")
+    assert out == "https://ours.example/20260922/a.png"
+    assert seen == ["https://vendor.example/a.png"]
+    assert stored == [(PNG, "png")], "the extension follows the sniffed type"
+
+
+@pytest.mark.asyncio
+async def test_rehost_image_never_downloads_an_inline_reference():
+    """A data URI already is the image: decode and store, no network hop."""
+    stored: list[tuple[bytes, str]] = []
+
+    async def fake_upload(data: bytes, ext: str = "png") -> str:
+        stored.append((data, ext))
+        return "https://ours.example/20260922/b.png"
+
+    ctx = _ctx()
+    ctx.upload_temp_image = fake_upload  # noqa: B010 - test-local stand-in
+    out = await ctx.rehost_image(DATA_URI)
+    assert out == "https://ours.example/20260922/b.png"
+    assert stored == [(PNG, "png")]
+
+
+@pytest.mark.asyncio
+async def test_rehost_image_answers_none_when_storage_cannot_give_a_link():
+    """No object storage: upload_temp_image degrades to a data URI, and a data
+    URI is never handed back as a link -- None is the "nothing to rehost onto"
+    answer the scripts pass through on."""
+    assert await _ctx().rehost_image(DATA_URI) is None
+
+
+@pytest.mark.asyncio
+async def test_rehost_image_lets_a_dead_link_fail_loudly():
+    """The checked download is the verdict: a vendor link whose body is an
+    HTML page raises the download's own error, not a picture-less success."""
+    ctx = _ctx()
+
+    async def dead_download(url: str) -> bytes:
+        raise UpstreamError(
+            "Expected an image, got Content-Type 'text/html'",
+            code="image_content_type",
+            status=400,
+        )
+
+    ctx.download_image = dead_download  # noqa: B010 - test-local stand-in
+    with pytest.raises(UpstreamError):
+        await ctx.rehost_image("https://vendor.example/dead.png")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ref", ["", "   ", None, 42])
+async def test_rehost_image_answers_none_for_no_reference(ref):
+    assert await _ctx().rehost_image(ref) is None

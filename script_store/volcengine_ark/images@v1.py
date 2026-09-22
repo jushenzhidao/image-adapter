@@ -249,6 +249,15 @@ the mode for one input shape is how a channel ends up gambling on ARK's 5 s:
                an alias, matching the google script's name for it
     "base64"   any ref -> bare base64 (no data-URI prefix); listed last
                because it is the one form measured to be rejected
+
+`X-Channel-Options.rehost_url: true` is the reply-side opt-in, and the same
+cross-channel convention the openai and qwen scripts read: ark's `url`
+carrier is a verbatim pass-through, so by default the caller holds ark's own
+CDN link -- valid for 24h and then gone. With the option on, every reply link
+is fetched and re-stored via `ctx.rehost_image`, so the caller holds a link
+of ours; a link that fetches no picture fails loudly (the checked download is
+the verdict), and a deployment without object storage keeps the vendor's
+link rather than failing.
 """
 
 from functools import partial
@@ -511,6 +520,29 @@ async def _to_ark_ref(ctx, ref):
     return await ctx.upload_temp_image(data, ext=subtype)
 
 
+async def _rehost_item(ctx, item):
+    """One reply item with an http link -> the same item carrying our link.
+
+    The reply side of this channel is a verbatim pass-through -- ark honours
+    both `response_format` values, so with `url` the caller gets ark's own CDN
+    link, which is valid for 24h and then gone. `rehost_url: true`
+    (`X-Channel-Options`, a cross-channel convention -- the openai and qwen
+    scripts read the same key) fetches each link through the generic mechanism
+    (`ctx.rehost_image`) instead: the checked download doubles as the verdict
+    that the link really delivers a picture, and `None` -- no object storage
+    to produce a link with -- keeps the vendor's link rather than failing a
+    request that used to work. Items already carrying `b64_json` have no link
+    to swap and ride through untouched.
+    """
+    url = item.get("url") if isinstance(item, dict) else None
+    if not isinstance(url, str) or not url.startswith("http"):
+        return item
+    stored = await ctx.rehost_image(url)
+    if stored is None:
+        return item
+    return {**item, "url": stored}
+
+
 async def transform(ctx, payload, phase):
     if phase == "request":
         body = {
@@ -574,10 +606,15 @@ async def transform(ctx, payload, phase):
     # forwarded above and this upstream honours both values, so `data` already
     # has the shape the caller asked for. Only upstreams that lie about
     # response_format need the url <-> b64_json conversion that the openai and
-    # google scripts do -- see docs/05 §2.
+    # google scripts do -- see docs/05 §2. The one opt-in is `rehost_url` (see
+    # `_rehost_item`): same pass-through shape, our link under `url` instead
+    # of the vendor's 24h one.
+    data = payload.get("data", [])
+    if ctx.options.get("rehost_url") is True and isinstance(data, list):
+        data = await ctx.fanout(data, partial(_rehost_item, ctx))
     out = {
         "created": payload.get("created", 0),
-        "data": payload.get("data", []),
+        "data": data,
     }
     if payload.get("usage") is not None:
         out["usage"] = payload["usage"]
