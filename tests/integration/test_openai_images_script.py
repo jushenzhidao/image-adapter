@@ -483,6 +483,29 @@ def test_a_link_is_passed_through_untouched_for_url(client, vendor):
     assert _Vendor.gets == 0
 
 
+def test_rehost_url_option_re_stores_an_upstream_link(client, vendor, storage):
+    """`rehost_url: true`: the vendor's own link is fetched and re-stored.
+
+    The point of the option: the caller holds our link, not the vendor's, so a
+    temporary upstream url (OpenAI's is) cannot expire underneath them.
+    """
+    link = f"{vendor}/assets/a.png"
+    _Vendor.response = {"created": 1712345678, "data": [{"url": link, "width": 1}]}
+    resp = client.post(
+        "/v1/images/generations",
+        headers=_headers(
+            vendor, **{"X-Channel-Options": json.dumps({"rehost_url": True})}
+        ),
+        json={"prompt": "a fox", "response_format": "url"},
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["data"][0]
+    assert item["url"].startswith("https://cdn.test/")
+    assert item["width"] == 1
+    assert _Vendor.gets == 1, "the vendor link must have been fetched"
+    assert len(storage.puts) == 1
+
+
 def test_silence_means_pass_through(client, vendor):
     """No response_format: the upstream's own shape is the answer.
 

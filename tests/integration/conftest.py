@@ -18,9 +18,12 @@ ADAPTER_KEY = "test-adapter-key"
 
 @pytest.fixture
 def settings() -> Settings:
-    # Every storage-related field is stated explicitly. Settings reads .env,
-    # so a developer with STORAGE_BACKEND=fal exported would otherwise run the
-    # whole suite against a different backend than CI does.
+    # Every field that can redirect the suite away from CI's shape is stated
+    # explicitly. Settings reads .env, so a developer with STORAGE_BACKEND=fal
+    # exported -- or a deployment-level proxy (UPSTREAM_PROXY_DEFAULT) or a
+    # Logfire token living in .env -- would otherwise run the whole suite
+    # against a different backend, through a proxy, or exporting real
+    # telemetry (and paying its flush timeout on every teardown).
     return Settings(
         environment="dev",
         adapter_key=ADAPTER_KEY,
@@ -31,6 +34,8 @@ def settings() -> Settings:
         storage_backend="minio",
         minio_endpoint="",
         fal_key="",
+        upstream_proxy_default="",
+        logfire_token="",
     )
 
 

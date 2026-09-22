@@ -14,7 +14,7 @@ Channel setup (New API side):
   X-Upstream-Url:    https://api.openai.com/v1/images/generations
   X-Script-Ref:      openai/images@v1
   Authorization:     Bearer <OPENAI_API_KEY>
-  X-Channel-Options: {"edits_url": "..."}    (optional, see below)
+  X-Channel-Options: {"edits_url": "...", "rehost_url": true}    (optional, see below)
 
 OpenAI splits one task across two endpoints by transport rather than by
 semantics: /v1/images/generations takes JSON, /v1/images/edits takes
@@ -51,6 +51,14 @@ shape that was asked for:
 
     asked for url       a data URI or b64_json is stored and returned as a link
     asked for b64_json  a URL is fetched, or a data URI decoded, and encoded
+
+With `rehost_url: true` the link handed back is always *ours*: an upstream
+that already answered with a plain link has that link fetched and re-stored
+too. It is a channel-level decision rather than a per-request one -- the
+same channel either promises our links or does not -- which is what a caller
+needs when the vendor's own link is temporary (OpenAI's url is). Off by
+default: honouring an upstream link costs nothing, and re-hosting every one
+of them adds a download plus an upload to every reply.
 
 When the caller says nothing the response rides through untouched. The front
 door's `response_format` default decides only whether a value is legal; reading
@@ -170,9 +178,17 @@ async def _as_url(ctx, item):
     answer is passed through untouched -- exactly what this script did before
     it converted anything. What is never done is putting a data URI under
     `url`; if the upstream did that, that is its answer, not one we invented.
+
+    With `rehost_url: true`, a plain upstream link is fetched and re-stored
+    like any other carrier, so the caller holds our link rather than the
+    vendor's.
     """
     url = item.get("url")
-    if isinstance(url, str) and ctx.is_url(url):
+    if (
+        isinstance(url, str)
+        and ctx.is_url(url)
+        and ctx.options.get("rehost_url") is not True
+    ):
         return item
 
     raw = await _payload_bytes(ctx, item)

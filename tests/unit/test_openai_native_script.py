@@ -202,3 +202,75 @@ async def test_a_single_reply_item_is_converted_serially(script, monkeypatch):
     await script.transform(ctx, {"data": [{"url": "https://cdn.test/0.png"}]}, "response")
 
     assert recorder.peak == 1
+
+
+# --- rehost_url: the upstream's own link, fetched and re-stored ------------
+
+
+class _Stores:
+    """Stands in for ``ctx.upload_temp_image`` and records what it stored."""
+
+    def __init__(self, link: str = "https://cdn.test/stored.png") -> None:
+        self.link = link
+        self.calls: list[tuple[bytes, str]] = []
+
+    async def __call__(self, data: bytes, ext: str = "png") -> str:
+        self.calls.append((data, ext))
+        return self.link
+
+
+def _wire_store(monkeypatch, ctx) -> _Stores:
+    recorder = _Stores()
+    monkeypatch.setattr(ctx, "upload_temp_image", recorder)
+    return recorder
+
+
+async def test_an_upstream_link_is_rehosted_when_the_option_is_on(script, monkeypatch):
+    """`rehost_url: true`: the vendor's link is fetched and re-stored as ours."""
+    ctx = _ctx()
+    ctx.options["rehost_url"] = True
+    downloads = _wire(monkeypatch, ctx)
+    stores = _wire_store(monkeypatch, ctx)
+
+    await script.transform(ctx, {"prompt": "x", "response_format": "url"}, "request")
+    link = "https://vendor-cdn.test/a.png"
+    out = await script.transform(
+        ctx, {"created": 1, "data": [{"url": link, "width": 3}]}, "response"
+    )
+
+    item = out["data"][0]
+    assert item["url"] == "https://cdn.test/stored.png"
+    assert item["width"] == 3, "extras must ride along"
+    assert downloads.urls == [link], "the vendor link must be fetched once"
+    assert stores.calls == [(PNG, "png")]
+
+
+async def test_an_upstream_link_passes_through_without_the_option(script, monkeypatch):
+    """Off by default: honouring the upstream's own link costs nothing."""
+    ctx = _ctx()
+    downloads = _wire(monkeypatch, ctx)
+    stores = _wire_store(monkeypatch, ctx)
+
+    await script.transform(ctx, {"prompt": "x", "response_format": "url"}, "request")
+    link = "https://vendor-cdn.test/a.png"
+    out = await script.transform(ctx, {"data": [{"url": link}]}, "response")
+
+    assert out["data"][0]["url"] == link
+    assert downloads.urls == [] and stores.calls == []
+
+
+async def test_a_hand_written_option_value_does_not_turn_rehosting_on(
+    script, monkeypatch
+):
+    """Only the JSON boolean counts -- "true" in quotes stays off."""
+    ctx = _ctx()
+    ctx.options["rehost_url"] = "true"
+    downloads = _wire(monkeypatch, ctx)
+    stores = _wire_store(monkeypatch, ctx)
+
+    await script.transform(ctx, {"prompt": "x", "response_format": "url"}, "request")
+    link = "https://vendor-cdn.test/a.png"
+    out = await script.transform(ctx, {"data": [{"url": link}]}, "response")
+
+    assert out["data"][0]["url"] == link
+    assert downloads.urls == [] and stores.calls == []
