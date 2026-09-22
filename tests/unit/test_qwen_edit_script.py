@@ -242,7 +242,7 @@ def test_single_image_takes_the_edit_link():
     assert len(ctx.http.puts) == 1
     assert ctx.http.puts[0]["data"] == ctx.bytes_for(IMG_A)
     # 生成调用被指向新铸的 chat_id
-    (emitted,) = ctx.emitted
+    (emitted,) = [e for e in ctx.emitted if "query" in e]
     assert emitted["query"] == {"chat_id": "chat-edit-1"}
 
 

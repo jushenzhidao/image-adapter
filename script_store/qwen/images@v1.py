@@ -109,11 +109,17 @@ Two front doors, one script -- logged-in and guest:
   without ever touching the wall. With `token_url` set, the script makes **no**
   signin and **no** warm-up call at all -- verified by counting on the wire.
 
-  ⚠️ The engine additionally emits the channel key upstream as
-  `Authorization: Bearer <key>` by default. Set **`X-Auth-Emit: none`** to
-  suppress it: the web app never sends that header, so leaving it on is a
-  deviation from the captured request for no benefit -- and the token already
-  travels in the Cookie.
+  🔴 The engine emits the channel key upstream as `Authorization: Bearer
+  <key>` by default, and this vendor refuses **any** Authorization header:
+  measured 2026-09-22, every write carrying it answered
+  x5sec/RGV587 (`FAIL_SYS_USER_VALIDATE`) while the same request without it
+  drew the image. The suppression is **baked into this script**: `_headers`
+  emits the name empty, and `transport.build_request` drops empty-valued
+  headers before the call goes out. A qwen channel therefore needs **no**
+  `X-Auth-Emit` of its own, while the service-wide bearer default -- which
+  every other upstream of ours relies on -- stays exactly as it is.
+  `X-Auth-Emit: none` still works if an operator sets it; it is simply
+  redundant now.
 
   `version: 0.2.0` goes out in both modes: §2.5's single-variable run makes it
   necessary and sufficient for a logged-in session, while the guest capture
@@ -963,6 +969,15 @@ def _headers(ctx):
     }
     # 浏览器身份只有一份定义（UA + Accept-Language + sec-ch-ua*），signin 与预热同用。
     h.update(BROWSER_HINTS)
+    # The web endpoint never carries `Authorization`, and the engine's default
+    # emission would put the channel key there as a Bearer. Measured
+    # 2026-09-22: that header alone draws x5sec/RGV587 on every write, while
+    # the same request without it draws the image. Emitting it **empty**
+    # suppresses it (empty-valued headers are dropped in
+    # `transport.build_request`), so a qwen channel needs no `X-Auth-Emit` and
+    # the service-wide bearer default -- which every other upstream of ours
+    # relies on -- stays exactly as it is.
+    h["Authorization"] = ""
     # This vendor authenticates on the Cookie (§2.1), so that is where the
     # credential has to be; `_jar_for` has already reconciled key and jar.
     if jar:
@@ -1847,17 +1862,23 @@ async def transform(ctx, payload, phase):
         mode = _chat_mode(ctx, opts)
         if _key_is_pair(_declared_key(ctx)) and ctx.upstream_error:
             # Only the Cookie. The credential belongs in the jar (that is what
-            # this vendor authenticates on, §2.1), and *where* a channel key goes
-            # on the wire is the engine's business (`X-Auth-Emit`) -- this
-            # docstring even recommends `none` here, so re-introducing an
-            # `Authorization: Bearer` header from inside the script would
-            # contradict the advice it gives.
+            # this vendor authenticates on, §2.1); `Authorization` is emitted
+            # **empty** on purpose -- it suppresses the engine's bearer
+            # emission (see `_headers`) and never carries the credential.
             fresh_jar = _jar_for(ctx, opts.get("cookie") or "")
             ctx.emit(headers={"Cookie": fresh_jar})
         # The session mint must follow the channel's upstream, not the real
         # domain: the channel (or a test double) decides where both calls go.
         base = _upstream_base(ctx, opts)
         headers = _headers(ctx)
+        # Re-emit the full header set here, on the request phase, not only via
+        # the auth phase's return: the engine resets the plan before a 4xx
+        # retry, so on the second attempt the auth-phase emit is gone --
+        # without this, the retried call would go up stripped of the browser
+        # fingerprint set (and of the Authorization suppression above) and be
+        # refused before it is read. On a first attempt the values are the
+        # same ones, freshly minted.
+        ctx.emit(headers=headers)
 
         refs = _input_refs(payload, opts)
         # Materializing input pictures is bounded work, not a second generation

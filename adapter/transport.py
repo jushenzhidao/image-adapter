@@ -55,7 +55,13 @@ def merge_url(base: str, plan: RequestPlan) -> str:
 def apply_auth(
     channel: ChannelSpec, headers: dict[str, str], body: Any, query: dict[str, str]
 ) -> None:
-    """Puts the upstream credential where X-Auth-Emit says it goes."""
+    """Puts the upstream credential where X-Auth-Emit says it goes.
+
+    Every target uses ``setdefault``, deliberately: a name the script already
+    emitted wins, so a script can pre-empt the emission for its vendor --
+    including suppressing it outright by emitting the name with an empty value
+    (dropped in ``build_request``; see the qwen script).
+    """
     auth = channel.auth
     key = channel.upstream_key
     if auth.target == "none" or not key:
@@ -209,6 +215,15 @@ def build_request(
 
     payload = plan.body if plan.body_set else body
     apply_auth(channel, headers, payload, query)
+    # An empty value means "send no such header". It is how a *script*
+    # suppresses one the engine would add on its own: `apply_auth` setdefaults
+    # the credential, so a script-emitted (empty) `Authorization` wins there and
+    # then disappears here. The qwen script relies on exactly this -- the
+    # vendor's web endpoint refuses any Authorization header (measured
+    # 2026-09-22: x5sec/RGV587 on every write until the header was gone), and
+    # baking the suppression into the script keeps every qwen channel free of
+    # `X-Auth-Emit` while the fleet-wide bearer default stays untouched.
+    headers = {k: v for k, v in headers.items() if v}
     if query:
         url = merge_url(url, RequestPlan(query=query))
 

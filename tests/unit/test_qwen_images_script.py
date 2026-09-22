@@ -275,6 +275,22 @@ def test_auth_phase_emits_fingerprint_headers():
     assert h["bx-umidtoken"] == "T2gAx" and h["version"] == "0.2.0"
     assert h["Sec-Fetch-Mode"] == "cors" and "sec-ch-ua" in h
     assert h["source"] == "web"
+    # 抑制引擎的凭证发射（web 端点拒绝任何 Authorization；实测 09-22 该头一票
+    # 否决）——空值＝不发（`transport.build_request` 丢弃空值头）。
+    assert h["Authorization"] == ""
+
+
+def test_request_phase_re_emits_the_full_header_set():
+    """重试路径：引擎在 4xx 重试前 `reset_plan()`，auth 相位 emit 的头会被清空
+    —— request 相位必须重发全套（含 Authorization 抑制与浏览器指纹），否则第二
+    发裸奔、连 WAF 都过不去。"""
+    ctx = FakeCtx()
+    asyncio.run(q.transform(ctx, {"prompt": "x"}, "auth"))
+    asyncio.run(q.transform(ctx, {"prompt": "x"}, "request"))
+
+    emitted = [e["headers"] for e in ctx.emitted if "headers" in e]
+    assert any(h.get("Authorization") == "" for h in emitted), emitted
+    assert any("User-Agent" in h and "Sec-Fetch-Mode" in h for h in emitted)
 
 
 def test_auth_phase_missing_credentials_is_channel_error():
@@ -293,7 +309,7 @@ def test_request_phase_creates_chat_then_emits_generation_url():
     # 恰好一次 chats/new：免费、无内容，不触碰「一次生成调用」不变量
     assert len(ctx.http.calls) == 1
     assert ctx.http.calls[0]["json"]["chat_mode"] == "guest"
-    (emitted,) = ctx.emitted
+    (emitted,) = [e for e in ctx.emitted if "url" in e]
     assert emitted["url"].endswith("/v2/chat/completions")
     assert emitted["query"] == {"chat_id": "chat-1"}
     assert body["chat_id"] == "chat-1" and body["chat_mode"] == "guest"
@@ -972,9 +988,11 @@ def test_401_invalidates_cached_jwt_and_resigns():
     assert len(signin) == 2   # 401 自愈**允许越过冷却窗**（凭据已知失效）
     emitted = [e for e in ctx.emitted if "Cookie" in e.get("headers", {})]
     assert emitted and "token=jwt-refreshed" in emitted[-1]["headers"]["Cookie"]
-    # 只发 Cookie：脚本自己不该重新引入 `Authorization`（那与它给运营方的建议相反，
-    # 引擎的 X-Auth-Emit 才是决定凭证去哪里的地方）
-    assert "Authorization" not in emitted[-1]["headers"]
+    # 脚本把 `Authorization` 发**空**：空值＝不发（`transport.build_request` 丢弃），
+    # 这正是固化下来的抑制（实测 09-22：该头一票否决）。它从不把**凭证**放进
+    # 那个头 —— 凭证在 Cookie 里，位置由 X-Auth-Emit 说了算。
+    assert emitted[-1]["headers"]["Authorization"] == ""
+    assert "jwt-refreshed" not in emitted[-1]["headers"]["Authorization"]
     # 强制路径**不读账号那把键**：那里躺着的是同一份已失效的 token，捡回来等于白跑一趟
     assert "jwt-first" not in emitted[-1]["headers"]["Cookie"]
     assert [k for k in ctx.cache.gets if k == q._signin_cache_key(PAIR_KEY)] == [
