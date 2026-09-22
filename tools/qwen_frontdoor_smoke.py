@@ -160,8 +160,7 @@ def main(argv=None) -> int:
     ap.add_argument("--key-form", choices=("jwt", "guest"), default="jwt",
                     help="凭据形态：jwt=账号门（QWEN_JWT）；guest=现铸访客身份（默认 jwt）")
     ap.add_argument("--proxy", default="",
-                    help="让本渠道走出站代理，如 http://127.0.0.1:11082"
-                         "（本地 SOCKS→HTTP 桥见 tools/socks_http_bridge.py）；"
+                    help="让本渠道走出站代理（HTTP），如 http://127.0.0.1:3128；"
                          "空＝不走代理（默认，与存量渠道一致）")
     ap.add_argument("--headful", action="store_true",
                     help="显示浏览器窗口（默认 headless —— 与 identity_service 一致）")

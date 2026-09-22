@@ -220,8 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--input-image", action="append", default=[],
                     help="垫图本地文件路径（可重复；multi 需要 ≥2 张）→ 转 data URI 进请求体")
     ap.add_argument("--proxy", default="",
-                    help="让本渠道走出站代理，如 http://127.0.0.1:11080"
-                         "（本地 SOCKS→HTTP 桥见 tools/socks_http_bridge.py）；"
+                    help="让本渠道走出站代理（HTTP），如 http://127.0.0.1:3128；"
                          "空＝不走代理（默认，与存量渠道一致）")
     args = ap.parse_args(argv)
 

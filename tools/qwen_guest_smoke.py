@@ -281,8 +281,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-egress-check", action="store_true",
                        help="跳过出口门禁（不建议；用来区分'出口挡'与'访客门挡'）")
     parser.add_argument("--proxy", default="",
-                       help="让本渠道走出站代理，如 http://127.0.0.1:11080"
-                            "（本地 SOCKS→HTTP 桥见 tools/socks_http_bridge.py）；"
+                       help="让本渠道走出站代理（HTTP），如 http://127.0.0.1:3128；"
                             "空＝不走代理（默认，与存量渠道一致）")
     args = parser.parse_args(argv)
 

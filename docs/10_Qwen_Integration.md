@@ -139,7 +139,7 @@ x5sec 窗口），属**窗口态产物**，不能当作常态结论引用。
   之前失败纯属出口问题。
 - ⚠️ 实现障碍：该池**只吃 SOCKS5**（`http://` 形态 2088/2089 均失败），而 **aiohttp 没有原生 SOCKS**
   （只有 `proxy=` 的 HTTP 形态）。所以要么在工具侧用 SOCKS 登录（**token 服务**，与 `identity_url` 对称），
-  要么加一个本地 SOCKS→HTTP 桥再让脚本用 `proxy=`；适配器镜像本身不宜引入 SOCKS 依赖。
+  要么自备一个本地 SOCKS→HTTP 转换器再让脚本用 `proxy=`；适配器镜像本身不宜引入 SOCKS 依赖。
 
 **落地（2026-09-18，B 方案，已实跑）**：`tools/token_service.py` 持有账号、经代理池（每条连接换出口）
 登录并把 token 发出来；渠道配 **`X-Channel-Options.token_url`**（如 `http://127.0.0.1:8792/token`）后，
@@ -662,8 +662,8 @@ data: {"error": {"code": "data_inspection_failed", "modality": ["text"], "stage"
 | ① | **`-pro` 模型 + 显式像素**（会挂满 300s） | ✅ **已落地**：归一到 `auto` + `size_guard` trace 记录（§5.1）。选它而不是 400，是为与脚本既有的「size 从不 400」取向一致；代价是丢弃调用方写的像素（上游本来也不接受） |
 | ② | 框架下载路径按 `Content-Type: image/*` 拒图 | ✅ **已落地**：改按 **magic bytes** 判 —— 头说"不是图"**且**字节也没有图片 magic 才拒；空头与 `image/*` 头行为不变 ⇒ 拒绝面严格小于原判据（真图不再被 `application/octet-stream` 误杀，HTML/文本仍被拒）。`download_image` 的 span 与错误码不变 |
 | ③ | `tools/identity_service.py` 缺**验活/续期**能力（参考仓 `ident_pool.py` 有 `verify`/`refresh`/`stats`） | ⏸ **暂不做**：当前只能靠 `--max-uses 4` 估计退役，看不到真实存活；补齐是新增能力而非修缺陷 |
-| ④ | **出站代理**：`X-Upstream-Proxy` ＋ 本地桥（`-Mode: per-request` 已于 2026-09-20 删除）（2026-09-19 落地） | ✅ **已落地，含每请求轮换**：独立渠道头 `X-Upstream-Proxy`（设 `UPSTREAM_PROXY_ALLOWLIST` 放行；**默认空＝任意 host**——2026-09-20 由「空＝拒绝该头」反转）；覆盖**该渠道的全部出站**（引擎代发 ＋ 脚本经 `ctx.http`，由 `ProxiedHttp` 门面按 host 注入 `proxy` / `proxy_headers`）。两条**不走**：素材下载（`ctx.download_http` 无代理视图，目标是调用方给的 URL）与 `UPSTREAM_PROXY_BYPASS_HOSTS` 里的 host（理由＝**出口够不着**它们，如回环 `token_url`；
-**与上传无关**——上传由构造决定直连）。**已无「每请求轮换」**（2026-09-20 删除 `X-Upstream-Proxy-Mode`：进程内一个共享 session，出口稳定性＝池连接的稳定性，且不再有每请求一次握手）。非法值在任何上游调用之前 400 `channel_config_error`；trace 记脱敏 `proxy`。⚠️ **SOCKS 仍被明确拒绝**（aiohttp 无 SOCKS transport）⇒ 必须先跑 `tools/socks_http_bridge.py`（纯 stdlib；按 session 记隧道、支持 bypass、`/health` 报计数）。🔴 **两条已实测的边界**：① （**历史条目**：那个随 session id 走的 `proxy_headers` 已随 mode 删除，本条不再适用；留着是为了说明当年为何用 https 目标 ＋ 测试内自签证书）；② **连接中途断开后重连＝换 IP**（隧道包着有状态的 TLS 会话，不能跨客户端连接复用）⇒ 「同一请求全程一个 IP」只在连接不断时成立，要真正钉住需池子支持 session-key 粘性。⚠️ 且别指望它解决额度：生成限流**按账号/身份、不按出口 IP**（§4、§6），换出口只对 `signin` 的 IP 墙有意义（已由 `token_service` 覆盖） |
+| ④ | **出站代理**：`X-Upstream-Proxy`（本地桥 2026-09-22 移除；`-Mode: per-request` 2026-09-20 删除）（2026-09-19 落地） | ✅ **已落地，含每请求轮换**：独立渠道头 `X-Upstream-Proxy`（设 `UPSTREAM_PROXY_ALLOWLIST` 放行；**默认空＝任意 host**——2026-09-20 由「空＝拒绝该头」反转）；覆盖**该渠道的全部出站**（引擎代发 ＋ 脚本经 `ctx.http`，由 `ProxiedHttp` 门面按 host 注入 `proxy` / `proxy_headers`）。两条**不走**：素材下载（`ctx.download_http` 无代理视图，目标是调用方给的 URL）与 `UPSTREAM_PROXY_BYPASS_HOSTS` 里的 host（理由＝**出口够不着**它们，如回环 `token_url`；
+**与上传无关**——上传由构造决定直连）。**已无「每请求轮换」**（2026-09-20 删除 `X-Upstream-Proxy-Mode`：进程内一个共享 session，出口稳定性＝池连接的稳定性，且不再有每请求一次握手）。非法值在任何上游调用之前 400 `channel_config_error`；trace 记脱敏 `proxy`。⚠️ **SOCKS 仍被明确拒绝**（aiohttp 无 SOCKS transport）⇒ 需要一个 HTTP 代理（本地桥已于 2026-09-22 按简化架构移除；部署直接走池的 HTTP 入口）。🔴 **两条已实测的边界**：① （**历史条目**：那个随 session id 走的 `proxy_headers` 已随 mode 删除，本条不再适用；留着是为了说明当年为何用 https 目标 ＋ 测试内自签证书）；② **连接中途断开后重连＝换 IP**（隧道包着有状态的 TLS 会话，不能跨客户端连接复用）⇒ 「同一请求全程一个 IP」只在连接不断时成立，要真正钉住需池子支持 session-key 粘性。⚠️ 且别指望它解决额度：生成限流**按账号/身份、不按出口 IP**（§4、§6），换出口只对 `signin` 的 IP 墙有意义（已由 `token_service` 覆盖） |
 | ⑤ | **写类请求头与参考仓 `build_headers` 对齐**（`Accept` / `Connection` / `X-Accel-Buffering`） | ✅ **已落地**（2026-09-19，§4）。依据是参考仓 §10.19 的根因更正 + 「写类请求必备头」附录；与抓包头集合的差集**只有这三条**，`Content-Type` 经实测**不是**缺口。行为代价为零。⚠️ 它与本仓生成端点当前的 x5sec（§6.3）**不是**一对因果关系，别互相套用 |
 | ⑥ | **`response_format`（`url` ⇄ `b64_json`）** | ✅ **已落地**（2026-09-19，§4）。`url`（或不说）＝上游原生载体零成本直通；`b64_json` ＝逐张下载并编码。选它而不是"永远直通"，是因为**下载即死链判据**：§3.0 ⑦ 的 404 死链在本仓会变成明确失败，不再被当成功转出。代价＝要 base64 的调用方每张多一次 GET。**默认不变**，所以存量渠道行为无变化 |
 | ⑦ | **无图 URL 时读 `GET /v2/chats/<id>` 兜底** | ✅ **已落地**（2026-09-19，§4）。只读、**零额度**、只在失败路径上跑。刻意**不**依赖参考仓那个**未验证**的「断流后上游续跑」假设 —— 本仓读的是**已读完**的流 |

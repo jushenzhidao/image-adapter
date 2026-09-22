@@ -40,13 +40,6 @@ ALLOWED_NON_FIELDS = {
     "GUNICORN_TIMEOUT",
     "GUNICORN_GRACEFUL_TIMEOUT",
     "WORKER_CONNECTIONS",
-    # Read by `tools/socks_http_bridge.py`, in *its own* process -- the adapter
-    # has no SOCKS client and never dials the pool, so this is not a Settings
-    # field. It lives in this file (and in compose's bridge service) because an
-    # env file is where an operator's secret belongs: the same value on a
-    # command line is readable by every process on the host, and this one
-    # decides the outbound exit.
-    "SOCKS_BRIDGE_UPSTREAM",
 }
 
 # compose used to run redis/minio sidecars and needed their server-side
