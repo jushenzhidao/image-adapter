@@ -279,13 +279,18 @@ def test_channel_key_becomes_the_cookie_token_on_the_wire(client, vendor):
     assert json.loads(_QwenVendor.chats_new[0]["body"])["chat_mode"] == "normal"
     gen = _QwenVendor.generations[0]
     assert gen["headers"].get("Cookie") == "token=" + JWT
-    # 框架默认还会把密钥发成 `Authorization: Bearer <key>`；这一行是提醒它同时
-    # 存在于线上。不想要它就把渠道配成 `X-Auth-Emit: none`（下一个用例）。
-    assert gen["headers"].get("Authorization") == "Bearer " + JWT
+    # 脚本自己把 `Authorization` 压掉了（`_headers` 发空值 ⇒ `transport.build_request`
+    # 丢弃空值头）。这不是"忘了发"——实测 2026-09-22：带上它上游一律 x5sec/RGV587，
+    # 所以抑制被**固化**成脚本默认，qwen 渠道不需要 `X-Auth-Emit`（下一个用例证明
+    # 那个显式配置依然生效、只是从此冗余）。
+    assert "Authorization" not in gen["headers"]
 
 
 def test_auth_emit_none_keeps_the_token_out_of_a_non_browser_header(client, vendor):
-    """抓包里没有 Authorization ⇒ 可以要求引擎不要发它（X-Auth-Emit: none）。"""
+    """抓包里没有 Authorization ⇒ 显式 `X-Auth-Emit: none` 依然被尊重。
+
+    脚本自带抑制之后这个头已是冗余配置；此用例钉的是"配了也不冲突、行为不变"。
+    """
     _QwenVendor.reset("ok")
     headers = _headers(vendor, {})
     headers["Authorization"] = "Bearer " + JWT
