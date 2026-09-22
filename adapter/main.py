@@ -34,7 +34,6 @@ from adapter.api.health import health_handler
 from adapter.api.image_edits import image_edits_handler
 from adapter.api.images import images_handler
 from adapter.api.responses import responses_handler
-from adapter.channel import parse_default_options
 from adapter.context import build_cache
 from adapter.error_handlers import install_error_handlers
 from adapter.errors import ChannelConfigError
@@ -205,16 +204,6 @@ async def lifespan(app: FastAPI):
             "Inline scripts are enabled outside dev. Header-supplied source is "
             "executed in-process; prefer X-Script-Ref with a sha256 allowlist."
         )
-
-    # A malformed DEFAULT_CHANNEL_OPTIONS would 400 every request (the value is
-    # merged into each channel); make it a boot failure instead, so a bad knob
-    # lights the deployment up red immediately rather than one request at a time.
-    try:
-        parse_default_options(cfg.default_channel_options)
-    except ChannelConfigError as exc:
-        raise RuntimeError(
-            f"refusing to start: DEFAULT_CHANNEL_OPTIONS is invalid ({exc})"
-        ) from None
 
     # Same reasoning one knob over: a bad default proxy would 400 -- or worse,
     # misroute -- every channel that relies on it. Empty stays free.
