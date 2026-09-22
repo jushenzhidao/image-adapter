@@ -98,12 +98,15 @@ services:
   # simply does not run it and leaves the channel header unset. Enable with
   # `docker compose --profile bridge up -d`.
   #
-  # Why it is separate: the pool speaks SOCKS5 and aiohttp does not, and "one
-  # address per client request" needs a dialer that opens a fresh tunnel for
-  # each one (docs/10 §11 ④). The channel then points at *this* service, not at
-  # the pool:
+  # Why it is separate: the pool speaks SOCKS5 and aiohttp has no SOCKS
+  # transport. The channel points at *this* service, not at the pool:
   #     X-Upstream-Proxy: http://socks-bridge:11080
-  #     X-Upstream-Proxy-Mode: per-request
+  #
+  # Exit semantics (docs/10 §11 ④): the adapter keeps one shared session, so
+  # the exit is as stable as the pool's connections are -- one client
+  # connection is one tunnel is one exit, and a connection that drops
+  # mid-request and re-dials gets the pool's next address. Pinning one address
+  # across a reconnect needs a pool with session-key stickiness.
   #
   # The pool credential is read from this service's environment, never from a
   # command line: `ps` shows arguments to every user on the host, and that
