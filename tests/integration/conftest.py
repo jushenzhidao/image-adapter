@@ -13,8 +13,6 @@ from starlette.testclient import TestClient
 from adapter.settings import Settings
 from adapter.storage import StoredObject
 
-ADAPTER_KEY = "test-adapter-key"
-
 
 @pytest.fixture
 def settings() -> Settings:
@@ -26,8 +24,6 @@ def settings() -> Settings:
     # telemetry (and paying its flush timeout on every teardown).
     return Settings(
         environment="dev",
-        adapter_key=ADAPTER_KEY,
-        adapter_key_required=True,
         allow_inline_script=True,
         upstream_allow_private_network=True,
         redis_url="",
@@ -97,7 +93,6 @@ def channel_headers():
 
     def _build(script: str, upstream_url: str, **extra: str) -> dict[str, str]:
         headers = {
-            "X-Adapter-Key": ADAPTER_KEY,
             "X-Upstream-Url": upstream_url,
             "X-Script": script.replace("\n", "\\n"),
             "Content-Type": "application/json",

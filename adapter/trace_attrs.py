@@ -308,10 +308,10 @@ def record_ingress_failure(
     for a call that never reached the upstream. Between them, a request leaves
     a span carrying its prompt however far it got.
 
-    ``stage`` names how far it *did* get -- ``admission`` / ``body`` /
-    ``validation`` / ``channel`` / ``script`` -- and is the honest half of this
-    function. The context is summarised from the payload as it stood when the
-    request died, so one refused at admission carries no ``prompt`` at all
+    ``stage`` names how far it *did* get -- ``body`` / ``validation`` /
+    ``channel`` / ``script`` -- and is the honest half of this function. The
+    context is summarised from the payload as it stood when the request died,
+    so one refused before the body parsed carries no ``prompt`` at all
     rather than an empty one. The attribute set is the root span's minus
     ``gen_ai.*``, and is *sparse by outcome* rather than uniformly present.
 

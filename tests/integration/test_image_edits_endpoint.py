@@ -403,10 +403,3 @@ def test_non_multipart_body_is_rejected(client, channel_headers, vendor):
     headers = channel_headers(ECHO_SCRIPT, f"{vendor}/v2/img2img")
     resp = client.post("/v1/images/edits", headers=headers, json={"prompt": "x"})
     assert resp.status_code == 400, resp.text
-
-
-def test_admission_still_guards_the_route(client, channel_headers, vendor):
-    headers = _headers(channel_headers, ECHO_SCRIPT, f"{vendor}/v2/img2img")
-    headers.pop("X-Adapter-Key")
-    resp = _post(client, headers, files={"image": _png()}, data={"prompt": "x"})
-    assert resp.status_code == 401, resp.text

@@ -28,7 +28,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-ADAPTER_KEY = "test-adapter-key"
 
 CREDENTIALS = {"cookie": "a=1", "bx_ua": "234!x", "bx_umidtoken": "T2gAx",
                "chat_mode": "guest"}
@@ -181,7 +180,6 @@ def _wildcard_localhost_resolves(monkeypatch):
 
 def _headers(vendor: str, options: dict | None = None) -> dict[str, str]:
     headers = {
-        "X-Adapter-Key": ADAPTER_KEY,
         "X-Upstream-Url": f"{vendor}/api/v2/chat/completions",
         "X-Script-Ref": "qwen/images@v1",
         "Content-Type": "application/json",

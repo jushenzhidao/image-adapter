@@ -3,17 +3,17 @@
 The client context exists because a content-policy 400 is unactionable: the
 vendor's message names neither prompt nor reference image. What
 ``test_request_context_span.py`` pins is that context surviving an *upstream*
-refusal. This file covers the other half -- the five front-door steps
-(admission, body parsing, validation, channel parsing, script loading) that
-refuse a request before any span exists at all.
+refusal. This file covers the other half -- the front-door steps
+(body parsing, validation, channel parsing, script loading) that refuse a
+request before any span exists at all.
 
 Two things are pinned, and the second matters as much as the first:
 
 * the context that *was* readable at the point of failure reaches the
   ``ingress_failed`` span;
 * the context that *was not* readable does not appear at all -- a request
-  refused at admission carries no ``prompt``, rather than an empty one. An
-  attribute set that looks uniform would make a never-read prompt
+  refused before the body parsed carries no ``prompt``, rather than an empty
+  one. An attribute set that looks uniform would make a never-read prompt
   indistinguishable from a genuinely absent one.
 
 Driven through ``adapt`` rather than the app, for the reason
@@ -53,7 +53,6 @@ from adapter.settings import Settings
 PROMPT = "a cat wearing a hat"
 IMAGE_URL = "https://refs.example.test/source.png"
 
-ADAPTER_KEY = "admission-key"
 INLINE_SOURCE = "def transform(ctx, payload, phase):\n    return dict(payload)\n"
 
 
@@ -119,8 +118,6 @@ def settings() -> Settings:
     behaviour under test rather than fail a test visibly."""
     return Settings(
         environment="dev",
-        adapter_key=ADAPTER_KEY,
-        adapter_key_required=True,
         upstream_allow_private_network=True,
         redis_url="",
         minio_endpoint="",
@@ -198,31 +195,6 @@ def _urls(attributes: dict, name: str) -> list[str]:
 # --- what reaches the span ------------------------------------------------
 
 
-async def test_an_admission_refusal_reports_itself_and_claims_no_prompt(
-    settings, spans
-):
-    """The body was never parsed, so the span must not pretend otherwise.
-
-    An empty or absent ``prompt`` here is the honest reading: nothing was read
-    yet. This is also the exact opposite ordering from the upstream-refusal
-    case, which is why both are pinned.
-    """
-    outcome = await _run(
-        settings,
-        {"prompt": PROMPT, "image": IMAGE_URL},
-        headers={"x-upstream-url": "https://api.example.test/v1/images"},
-    )
-
-    assert outcome == "err:invalid_adapter_key"
-
-    attributes = _attributes(spans)
-    assert attributes["stage"] == "admission"
-    assert attributes["status"] == 401
-    assert attributes["error_code"] == "invalid_adapter_key"
-    assert "prompt" not in attributes
-    assert "image_urls" not in attributes
-
-
 async def test_a_validation_refusal_keeps_the_context_that_was_read(
     settings, spans
 ):
@@ -235,7 +207,6 @@ async def test_a_validation_refusal_keeps_the_context_that_was_read(
     outcome = await _run(
         settings,
         {"prompt": PROMPT, "mask": IMAGE_URL},
-        headers={"x-adapter-key": ADAPTER_KEY},
         prepare=validate_images_body,
     )
 
@@ -255,7 +226,6 @@ async def test_a_channel_refusal_keeps_the_context_that_was_read(settings, spans
     outcome = await _run(
         settings,
         {"prompt": PROMPT},
-        headers={"x-adapter-key": ADAPTER_KEY},
     )
 
     assert outcome == "err:channel_config_error"
@@ -271,7 +241,6 @@ async def test_a_script_refusal_keeps_the_context_that_was_read(settings, spans)
         settings,
         {"prompt": PROMPT},
         headers={
-            "x-adapter-key": ADAPTER_KEY,
             "x-upstream-url": "https://api.example.test/v1/images",
             "x-script-ref": "https://scripts.example.test/adapter.py",
         },
@@ -310,7 +279,6 @@ async def test_a_request_that_clears_the_front_door_opens_no_ingress_span(
             settings,
             {"prompt": PROMPT},
             headers={
-                "x-adapter-key": ADAPTER_KEY,
                 "x-upstream-url": f"http://127.0.0.1:{server.server_port}/v1/images",
                 "x-script": INLINE_SOURCE,
             },
@@ -338,7 +306,6 @@ async def test_the_ingress_span_does_not_claim_a_model_call(settings, spans):
     await _run(
         settings,
         {"prompt": PROMPT, "model": "seedream-3.0", "mask": IMAGE_URL},
-        headers={"x-adapter-key": ADAPTER_KEY},
         prepare=validate_images_body,
     )
 

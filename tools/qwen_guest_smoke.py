@@ -322,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
     from adapter.settings import Settings
 
     app.state.settings = Settings(
-        environment="dev", adapter_key_required=False, adapter_key="",
+        environment="dev",
         allow_inline_script=True, upstream_allow_private_network=True,
         redis_url="", storage_backend="minio", minio_endpoint="", fal_key="",
         # Only meaningful when the run passes `--proxy`, and harmless otherwise:

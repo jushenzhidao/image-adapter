@@ -39,12 +39,6 @@ def test_health_wrong_method_is_an_openai_405(client):
     assert_openai_envelope(resp, "method_not_allowed")
 
 
-def test_missing_adapter_key_is_an_openai_401(client):
-    resp = client.post("/v1/images/generations", json={"prompt": "x"})
-    assert resp.status_code == 401
-    assert_openai_envelope(resp, "invalid_adapter_key")
-
-
 def test_channel_config_error_keeps_its_code(client):
     """Missing X-Upstream-Url is reported by channel.py, not by validation, so
     the OpenAI envelope and the specific code both survive."""
@@ -52,7 +46,6 @@ def test_channel_config_error_keeps_its_code(client):
         "/v1/images/generations",
         json={"prompt": "x"},
         headers={
-            "X-Adapter-Key": "test-adapter-key",
             "Content-Type": "application/json",
         },
     )
@@ -75,5 +68,5 @@ def test_docs_route_is_served(client):
     # surface as a FastAPI 422 ahead of channel.py's own error code.
     params = schema["paths"]["/v1/images/generations"]["post"]["parameters"]
     names = {p["name"] for p in params}
-    assert {"X-Upstream-Url", "X-Adapter-Key", "X-Script"} <= names
+    assert {"X-Upstream-Url", "X-Script"} <= names
     assert all(p.get("required") is not True for p in params)

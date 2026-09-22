@@ -124,7 +124,6 @@ def vendor():
 def _headers(vendor: str, **extra: str) -> dict[str, str]:
     """The channel the control plane would build: URL names generation only."""
     headers = {
-        "X-Adapter-Key": "test-adapter-key",
         "X-Upstream-Url": f"{vendor}{GEN_PATH}",
         "X-Script-Ref": "openai/images@v1",
         "Content-Type": "application/json",
@@ -292,7 +291,6 @@ def test_edits_url_option_overrides_the_derived_sibling(client, vendor):
 def test_a_query_on_the_channel_url_survives_the_swap(client, vendor):
     """Azure-style deployments carry an api-version query on both endpoints."""
     headers = {
-        "X-Adapter-Key": "test-adapter-key",
         "X-Upstream-Url": f"{vendor}{GEN_PATH}?api-version=2024-02-01",
         "X-Script-Ref": "openai/images@v1",
         "Content-Type": "application/json",
@@ -309,7 +307,6 @@ def test_a_query_on_the_channel_url_survives_the_swap(client, vendor):
 def test_a_non_image_path_falls_back_to_the_sibling_segment(client, vendor):
     """The swap is on the last path segment, whatever it is."""
     headers = {
-        "X-Adapter-Key": "test-adapter-key",
         "X-Upstream-Url": f"{vendor}/v1/gen",
         "X-Script-Ref": "openai/images@v1",
         "Content-Type": "application/json",

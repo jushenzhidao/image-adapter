@@ -53,7 +53,6 @@ New API 在渠道配置里声明适配策略，通过头透传：
 | `X-Script-64` | 三选一 | 源码的 base64（避免 `\n` 转义混乱） |
 | `X-Script-Ref` | 三选一 | 命名引用 `vendor_y/mj@v1.3`，或 https URL |
 | `Authorization` | 否 | **上游厂商**凭证，原样透传，不用于本服务鉴权 |
-| `X-Adapter-Key` | 是 | 本服务准入密钥 |
 | `X-Upstream-Method` | 否 | 默认 `POST` |
 | `X-Upstream-Proxy` | 否 | 本渠道单独走出的 HTTP 代理，如 `http://127.0.0.1:3128`。覆盖**除素材下载外**的所有出站（引擎代发 + 脚本经 `ctx.http` 的调用）；`UPSTREAM_PROXY_BYPASS_HOSTS` 里的 host 除外（把它当"出口够不着"的名单：内网/回环服务、或任何不该走付费出口的目标）。**空＝任意 host**（`UPSTREAM_PROXY_ALLOWLIST` 是**限制**不是开关：设了值则只放行清单内的 host，off-list 仍在调上游之前 400）。**不支持 SOCKS**（`socks5://` 被明确拒绝）——需要换出口时请提供 **HTTP** 代理。**部署级默认**见 `UPSTREAM_PROXY_DEFAULT`（头缺省时生效、头有值则头赢；裸值 `none` = 该渠道显式直连，免受默认代理影响） |
 | `X-Auth-Emit` | 否 | 凭证位置非标准时，如 `header:X-API-Key:Bearer` |
@@ -72,7 +71,7 @@ New API 在渠道配置里声明适配策略，通过头透传：
 > adapter **不解读内容**（原样交给脚本的 `ctx.options`）；值在**启动时校验**，格式不合法则
 > 拒绝启动而非每个请求 400。
 
-这 17 个头在代码里由 `adapter/main.py::channel_contract` 用 `Header()` 声明：因此 `/docs`
+这 16 个头在代码里由 `adapter/main.py::channel_contract` 用 `Header()` 声明：因此 `/docs`
 可以直接填写试调，契约表不会再与实现漂移。全部声明为**可选**是有意为之——缺失的头仍由
 `channel.py` 报 `channel_config_error`（400，OpenAI 错误体），而不是被 FastAPI 拦成 422。
 
@@ -98,7 +97,6 @@ host——写成"排除"却什么都没排除）；**空清单＝一个都不豁
 
 ```json
 {
-  "X-Adapter-Key": "<data-plane-key>",
   "X-Upstream-Url": "https://api.vendor-x.com/v2/text2img",
   "Authorization": "Bearer <vendor-key>",
   "X-Script": "async def transform(ctx, payload, phase):\n    if phase == 'request':\n        return {'desc': payload['prompt']}\n    return {'data': [{'url': payload['img']}]}"
@@ -235,12 +233,15 @@ return {"prompt": "blend", "n": "2"}   # 这些成为 multipart 文本字段
 
 ## 安全模型
 
-从请求头注入 Python 源码本质上是**受控的远程代码执行**，因此有四道防线，全部默认开启：
+从请求头注入 Python 源码本质上是**受控的远程代码执行**，因此有三道防线，全部默认开启：
 
-1. **准入**：`X-Adapter-Key`（恒定时间比较）。`ADAPTER_KEY` 未配置时拒绝所有请求，除非显式 `ADAPTER_KEY_REQUIRED=false`。
-2. **来源策略**：生产建议 `ALLOW_INLINE_SCRIPT=false` + `SCRIPT_SHA256_ALLOWLIST=<hash1,hash2>`，只放行审核过的脚本；远程 URL 引用默认关闭。
-3. **AST 沙箱**：白名单 stdlib 导入；禁 `exec/eval/open/getattr/setattr` 等及一切 dunder 访问，堵死 `().__class__` 逃逸族。
-4. **受限 builtins**：编译后在无文件/网络/import 能力的命名空间执行；基础设施只能通过 `ctx` 触达。
+1. **来源策略**：生产建议 `ALLOW_INLINE_SCRIPT=false` + `SCRIPT_SHA256_ALLOWLIST=<hash1,hash2>`，只放行审核过的脚本；远程 URL 引用默认关闭。
+2. **AST 沙箱**：白名单 stdlib 导入；禁 `exec/eval/open/getattr/setattr` 等及一切 dunder 访问，堵死 `().__class__` 逃逸族。
+3. **受限 builtins**：编译后在无文件/网络/import 能力的命名空间执行；基础设施只能通过 `ctx` 触达。
+
+服务自身**不设准入门**：鉴权就是调用方透传给上游的 `Authorization`，适配器不持有任何凭据
+（2026-09-22 起原 `X-Adapter-Key` 准入机制已整体拆除）。因此**暴露面完全由网络边界兜住**——
+本服务只应部署在内网/防火墙之后；任何能直达端口的人都可以执行 `X-Script`、指定 `X-Upstream-Url`。
 
 `X-Upstream-Url` 与 `ctx.download_image` 均过 SSRF 校验（scheme/host/私网段策略，`UPSTREAM_ALLOW_PRIVATE_NETWORK=false` 时拒绝内网目标）。
 
@@ -253,11 +254,11 @@ return {"prompt": "blend", "n": "2"}   # 这些成为 multipart 文本字段
 /Users/betterme/.workbuddy/binaries/python/versions/3.13.12/bin/python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 测试（475 项）
+# 测试（1250 项）
 .venv/bin/python -m pytest tests/ -q
 
 # 启动
-ADAPTER_KEY=dev-key .venv/bin/python -m uvicorn adapter.main:app --port 8080
+.venv/bin/python -m uvicorn adapter.main:app --port 8080
 ```
 
 E2E 冒烟（火山方舟，脚本走内置 script_store 引用）：渠道头**按 `@stable` 写**（用户口径：
@@ -266,7 +267,6 @@ E2E 冒烟（火山方舟，脚本走内置 script_store 引用）：渠道头**
 ```bash
 curl -s -X POST localhost:8080/v1/images/generations \
   -H "Content-Type: application/json" \
-  -H "X-Adapter-Key: dev-key" \
   -H "X-Upstream-Url: https://ark.cn-beijing.volces.com/api/v3/images/generations" \
   -H "X-Script-Ref: volcengine_ark/images@stable" \
   -H "Authorization: Bearer $VOLCENGINE_ARK_API_KEY" \
@@ -277,7 +277,6 @@ curl -s -X POST localhost:8080/v1/images/generations \
 
 ```bash
 curl -s -X POST localhost:8080/v1/images/edits \
-  -H "X-Adapter-Key: dev-key" \
   -H "X-Upstream-Url: https://ark.cn-beijing.volces.com/api/v3/images/generations" \
   -H "X-Script-Ref: volcengine_ark/images@stable" \
   -H "Authorization: Bearer $VOLCENGINE_ARK_API_KEY" \
@@ -309,7 +308,7 @@ OpenAI 把图片任务按**载体**拆成两个端点：`/v1/images/generations`
 | `url` | `data:` URI 或 `b64_json` | 落对象存储换回真链接（**没配存储则原样返回**） |
 | `b64_json` | 链接（`http` 或 `data:`） | 取回 / 解码后重新编码 |
 | 不传 | 任意 | 不干预，原样透传 |
-| 非法值（`null`／`""`／`{"type":...}`） | 任意 | 同「不传」：该键在准入校验阶段已被删除，不报 400 |
+| 非法值（`null`／`""`／`{"type":...}`） | 任意 | 同「不传」：该键在 body 校验阶段已被删除，不报 400 |
 
 这正是 `docs/04_Spec.md` 的 AC-03 / AC-04（BR-007 / BR-008）。两点要清楚：
 `response_format=b64_json` 且上游只给链接时会发生下载，那个 host 必须在渠道的
@@ -323,7 +322,6 @@ OpenAI 把图片任务按**载体**拆成两个端点：`/v1/images/generations`
 ```bash
 curl -s -X POST localhost:8080/v1/images/generations \
   -H "Content-Type: application/json" \
-  -H "X-Adapter-Key: dev-key" \
   -H "X-Upstream-Url: https://api.openai.com/v1/images/generations" \
   -H "X-Script-Ref: openai/images@stable" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
@@ -435,7 +433,6 @@ manifest 三渠道都定义了它。降级还会开一个 `script_ref_fallback` 
 > 两者不一致时**一律以 `.env` 为准**。
 
 ```bash
-ADAPTER_KEY=                     # 数据面准入密钥（必填，除非显式关闭）
 ALLOW_INLINE_SCRIPT=true         # 生产置 false
 SCRIPT_SHA256_ALLOWLIST=         # 逗号分隔的脚本哈希白名单
 SCRIPT_REF_DIR=./script_store    # 命名引用的默认目录（镜像内置）

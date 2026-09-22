@@ -27,7 +27,6 @@ def png(width: int, height: int) -> bytes:
 @pytest.fixture
 def settings() -> Settings:
     return Settings(
-        adapter_key="k",
         redis_url="",
         minio_endpoint="",
         max_image_pixels=1_000_000,
@@ -139,7 +138,6 @@ class TestConvert:
 class TestOutputCap:
     def test_result_over_the_byte_cap_is_refused(self):
         tight = Settings(
-            adapter_key="k",
             redis_url="",
             minio_endpoint="",
             max_image_pixels=50_000_000,
@@ -161,7 +159,6 @@ def test_operators_do_not_block_the_event_loop():
 
     async def scenario():
         settings = Settings(
-            adapter_key="k",
             redis_url="",
             minio_endpoint="",
             max_image_pixels=50_000_000,
@@ -408,7 +405,6 @@ class TestCompress:
 
     def test_the_output_byte_cap_still_applies(self):
         tight = Settings(
-            adapter_key="k",
             redis_url="",
             minio_endpoint="",
             max_image_pixels=50_000_000,
@@ -424,7 +420,6 @@ def test_compress_does_not_block_the_event_loop():
 
     async def scenario():
         settings = Settings(
-            adapter_key="k",
             redis_url="",
             minio_endpoint="",
             max_image_pixels=50_000_000,

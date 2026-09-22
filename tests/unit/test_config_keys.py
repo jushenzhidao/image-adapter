@@ -3,9 +3,7 @@
 `Settings` sets `extra="ignore"`, so a key that no longer matches a field is
 silently dropped instead of raising. That failure mode is invisible: the
 deployment looks configured and behaves as if the line were absent. It has
-already bitten this repo twice — `ADAPTER_AUTH_ENABLED` (the real fields are
-`adapter_key` / `adapter_key_required`, so admission control stayed on and
-every request 401'd) and `UPSTREAMS_CONFIG_PATH` (pointed at a registry that
+already bitten this repo — `UPSTREAMS_CONFIG_PATH` (pointed at a registry that
 was never implemented).
 
 These tests diff every shipped config source against the real field set.

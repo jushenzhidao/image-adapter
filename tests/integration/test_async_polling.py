@@ -11,7 +11,6 @@ import pytest
 from starlette.testclient import TestClient
 
 from adapter.settings import Settings
-from tests.integration.conftest import ADAPTER_KEY
 
 ASYNC_SCRIPT = """
 PHASES = ['request', 'response', 'poll_request', 'poll_response']
@@ -177,8 +176,6 @@ def test_overlay_ref_wins_over_image_store(tmp_path, monkeypatch):
 
     app.state.settings = Settings(
         environment="dev",
-        adapter_key=ADAPTER_KEY,
-        adapter_key_required=True,
         upstream_allow_private_network=True,
         redis_url="",
         minio_endpoint="",
@@ -192,7 +189,6 @@ def test_overlay_ref_wins_over_image_store(tmp_path, monkeypatch):
             resp = overlay_client.post(
                 "/v1/images/generations",
                 headers={
-                    "X-Adapter-Key": ADAPTER_KEY,
                     "X-Upstream-Url": "https://ark.cn-beijing.volces.com/api/v3/images/generations",
                     "X-Script-Ref": "volcengine_ark/images@v1",
                     "Content-Type": "application/json",
@@ -211,7 +207,6 @@ def test_overlay_ref_wins_over_image_store(tmp_path, monkeypatch):
 def test_script_ref_from_store(client, channel_headers, settings):
     """volcengine_ark/images@v1 ships in script_store and loads by ref."""
     headers = {
-        "X-Adapter-Key": "test-adapter-key",
         "X-Upstream-Url": "https://ark.cn-beijing.volces.com/api/v3/images/generations",
         "X-Script-Ref": "volcengine_ark/images@v1",
         "Content-Type": "application/json",

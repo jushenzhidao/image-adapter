@@ -2,8 +2,7 @@
 
 Like /v1/chat/completions, this route holds no vendor logic: `/v1/images/
 generations` is the canonical contract, the folding and the response wrapping
-live in ``adapter/api/frontdoor.py``, and both run after admission so an
-unauthorised caller never reaches them.
+live in ``adapter/api/frontdoor.py``.
 
 Two things this door carries on top of the folding:
 

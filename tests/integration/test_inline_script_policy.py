@@ -28,7 +28,6 @@ from starlette.testclient import TestClient
 
 from adapter.settings import Settings
 
-ADAPTER_KEY = "test-adapter-key"
 
 #: The code default for Settings.max_inline_script_bytes. Restated rather than
 #: imported: if the default moves, this suite should fail loudly instead of
@@ -64,8 +63,6 @@ def vendor():
 
 _DEFAULTS = dict(
     environment="dev",
-    adapter_key=ADAPTER_KEY,
-    adapter_key_required=True,
     allow_inline_script=True,
     upstream_allow_private_network=True,
     redis_url="",
@@ -125,7 +122,6 @@ def _source_of_size(size: int) -> str:
 
 def _post(client, vendor: str, source: str | None = None, b64: str | None = None, **extra):
     headers = {
-        "X-Adapter-Key": ADAPTER_KEY,
         "X-Upstream-Url": vendor,
         "Content-Type": "application/json",
     }
@@ -245,7 +241,6 @@ def test_base64_that_does_not_decode_to_utf8_is_refused(vendor):
 def test_two_source_headers_are_refused(vendor):
     """Exactly one of the three is the contract; two is ambiguous, not merged."""
     headers = {
-        "X-Adapter-Key": ADAPTER_KEY,
         "X-Upstream-Url": vendor,
         "Content-Type": "application/json",
         "X-Script": _source().replace("\n", "\\n"),
@@ -387,7 +382,6 @@ def image_source():
 
 def _post_readme_sample(client, vendor_url: str, image_url: str):
     headers = {
-        "X-Adapter-Key": ADAPTER_KEY,
         "X-Upstream-Url": vendor_url,
         "Content-Type": "application/json",
         "X-Script": README_VISION_SCRIPT.replace("\n", "\\n"),

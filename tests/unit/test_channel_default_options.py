@@ -32,7 +32,7 @@ BASE = {
 def _settings(**overrides) -> Settings:
     # `_env_file=None`: a bare Settings() reads the production .env, which would
     # make this suite's outcome depend on the machine it runs on.
-    return Settings(_env_file=None, adapter_key_required=False, **overrides)
+    return Settings(_env_file=None, **overrides)
 
 
 def test_empty_default_keeps_channel_options_as_is():

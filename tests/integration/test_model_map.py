@@ -376,23 +376,6 @@ def test_the_retired_option_key_is_refused(client, channel_headers, vendor):
     assert _Recorder.bodies == [], "the request reached the upstream anyway"
 
 
-def test_the_mapping_runs_after_admission(client, channel_headers, vendor):
-    """The table rides in the same header block as everything else.
-
-    Not a mapping test so much as a check on ordering: parsing it must not
-    give an unauthenticated caller anything they did not have before.
-    """
-    headers = channel_headers(PROBE, vendor, **_options({"*": MAPPED}))
-    headers["X-Adapter-Key"] = "wrong"
-    resp = client.post(
-        "/v1/images/generations",
-        headers=headers,
-        json={"model": CLIENT_MODEL, "prompt": "a fox"},
-    )
-    assert resp.status_code == 401
-    assert _Recorder.bodies == []
-
-
 # --- the scripts -------------------------------------------------------------
 
 
@@ -404,7 +387,6 @@ def _ref_headers(url: str, ref: str, table: dict[str, str] | None = None) -> dic
     both would be refused before the test could say anything about mapping.
     """
     headers = {
-        "X-Adapter-Key": "test-adapter-key",
         "X-Upstream-Url": url,
         "X-Script-Ref": ref,
         "Content-Type": "application/json",

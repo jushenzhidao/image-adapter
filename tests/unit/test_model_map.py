@@ -45,7 +45,7 @@ BASE = {
 def _settings() -> Settings:
     # `_env_file=None`: a bare Settings() reads the production .env, which would
     # make this suite's outcome depend on the machine it runs on.
-    return Settings(_env_file=None, adapter_key_required=False)
+    return Settings(_env_file=None)
 
 
 def _table(raw: str) -> dict:

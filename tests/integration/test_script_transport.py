@@ -68,7 +68,6 @@ def vendor():
 
 def _base_headers(vendor_url: str) -> dict[str, str]:
     return {
-        "X-Adapter-Key": "test-adapter-key",
         "X-Upstream-Url": vendor_url,
         "Content-Type": "application/json",
     }

@@ -24,7 +24,6 @@ from adapter.settings import Settings
 def guarded() -> Settings:
     """Settings with the SSRF guard active, as in production."""
     return Settings(
-        adapter_key="k",
         redis_url="",
         minio_endpoint="",
         upstream_allow_private_network=False,

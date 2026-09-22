@@ -7,7 +7,6 @@ upstream URL and the script.
 
 from __future__ import annotations
 
-import hmac
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -19,7 +18,7 @@ from starlette.requests import Request
 from adapter.api.common import get_request_id, parse_json_body
 from adapter.channel import parse_channel
 from adapter.context import AdapterContext
-from adapter.errors import AdapterError, AdmissionError, ScriptSourceError
+from adapter.errors import AdapterError, ScriptSourceError
 from adapter.executor import execute
 from adapter.jsoncodec import JSONResponse
 from adapter.modelmap import resolve as resolve_model
@@ -28,27 +27,6 @@ from adapter.settings import Settings
 from adapter.stages import execute_staged
 from adapter.trace_attrs import record_ingress_failure
 from adapter.transport import read_capped
-
-
-def check_admission(request: Request, settings: Settings) -> None:
-    """Gates the data plane on X-Adapter-Key.
-
-    Inline scripts execute in-process, so an open adapter is an open code
-    execution endpoint. Authorization is deliberately not accepted here: it
-    belongs to the upstream vendor.
-    """
-    if not settings.adapter_key_required:
-        return
-    expected = settings.adapter_key
-    if not expected:
-        raise AdmissionError(
-            "ADAPTER_KEY is not configured; refusing to serve requests"
-        )
-    supplied = request.headers.get("x-adapter-key", "")
-    if not supplied:
-        raise AdmissionError()
-    if not hmac.compare_digest(supplied, expected):
-        raise AdmissionError()
 
 
 async def _fetch_remote_script(url: str, settings: Settings) -> str:
@@ -101,7 +79,7 @@ async def adapt(
     prepare: Callable[[dict], Any] | None = None,
     body: dict | None = None,
 ) -> AdaptResult:
-    """Admission -> prepare -> channel parse -> script load -> execute.
+    """Prepare -> channel parse -> script load -> execute.
 
     `prepare` validates and may enrich the client payload in place. It can be
     sync or async, since some endpoints need to load prior state first.
@@ -112,7 +90,7 @@ async def adapt(
     """
     settings: Settings = request.app.state.settings
     payload: dict | None = body
-    stage = "admission"
+    stage = "body"
     # Everything up to the script is a front door, and each step can refuse the
     # request before `execute` ever runs. None of those refusals used to carry
     # the client's prompt -- the one thing a content-policy 400 leaves
@@ -120,9 +98,6 @@ async def adapt(
     # scope. `stage` says how far the request got, because an attribute that
     # was never readable must not look like one that was.
     try:
-        check_admission(request, settings)
-
-        stage = "body"
         request_id = get_request_id(request)
         if payload is None:
             payload = await parse_json_body(request)

@@ -42,8 +42,8 @@ async def chat_handler(request: Request) -> Response:
 
         Replacement rather than enrichment, because `adapt` keeps using the dict
         it parsed. Doing it here rather than before the call also keeps the
-        admission check and the body-size limit ahead of the work: an
-        unauthorised caller must not reach the folding at all.
+        body-size limit ahead of the work: an oversized payload is refused
+        before any of the folding runs.
 
         The folding runs the canonical validator afterwards rather than growing
         checks of its own, so this door and /v1/images/generations accept and

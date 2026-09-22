@@ -67,16 +67,6 @@ def test_images_roundtrip(client, channel_headers, vendor):
     assert _Vendor.received["auth"] == "Bearer vendor-secret"
 
 
-def test_missing_adapter_key_is_rejected(client, channel_headers, vendor):
-    headers = channel_headers(SCRIPT, vendor)
-    headers.pop("X-Adapter-Key")
-
-    resp = client.post(
-        "/v1/images/generations", headers=headers, json={"prompt": "x"}
-    )
-    assert resp.status_code == 401
-
-
 def test_missing_upstream_url_is_rejected(client, channel_headers, vendor):
     headers = channel_headers(SCRIPT, vendor)
     headers.pop("X-Upstream-Url")

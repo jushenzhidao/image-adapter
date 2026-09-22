@@ -25,14 +25,6 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
 
-    # --- Admission control -------------------------------------------------
-    # X-Adapter-Key gates the data plane. Injecting Python source through a
-    # header is remote code execution by design, so this must be set in any
-    # non-local deployment. Authorization is NOT used here: it is reserved
-    # for passthrough to the upstream vendor.
-    adapter_key: str = ""
-    adapter_key_required: bool = True
-
     # --- Script source policy ---------------------------------------------
     # Inline source (X-Script / X-Script-64) is convenient for development but
     # lets any caller run arbitrary code in-process. Production deployments
@@ -405,11 +397,11 @@ class Settings(BaseSettings):
     # timer, so tracing it buries the requests that matter.
     logfire_excluded_urls: str = "/health"
     # Request headers are never captured, and turning this on is refused rather
-    # than honoured: the channel contract puts X-Adapter-Key (data-plane
-    # credential), Authorization (vendor credential), X-Auth-Emit (which names
-    # the credential header per channel, e.g. x-goog-api-key) and X-Script
-    # (executable source) in headers, so no fixed redaction list can cover them.
-    # init_logfire raises rather than exporting them.
+    # than honoured: the channel contract puts Authorization (vendor
+    # credential), X-Auth-Emit (which names the credential header per channel,
+    # e.g. x-goog-api-key) and X-Script (executable source) in headers, so no
+    # fixed redaction list can cover them. init_logfire raises rather than
+    # exporting them.
     logfire_capture_headers: bool = False
 
     # --- TTLs (seconds) ----------------------------------------------------

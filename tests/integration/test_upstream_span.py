@@ -42,7 +42,6 @@ from adapter.errors import AdapterError
 from adapter.executor import _do_upstream
 from adapter.settings import Settings
 
-ADAPTER_KEY = "test-adapter-key"
 
 # Small enough that a reply declaring more than this is refused before any body
 # byte is read; the production default is 64 MB (see executor._do_upstream).
@@ -104,8 +103,6 @@ def settings() -> Settings:
     # behaviour under test rather than a test failing visibly.
     return Settings(
         environment="dev",
-        adapter_key=ADAPTER_KEY,
-        adapter_key_required=True,
         allow_inline_script=True,
         upstream_allow_private_network=True,
         redis_url="",

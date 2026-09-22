@@ -160,14 +160,14 @@ def test_credential_words_that_are_not_key_names_survive(spans):
 
 @pytest.mark.parametrize(
     "name",
-    ["authorization", "api_key", "x-adapter-key", "x-auth-emit", "x-script"],
-    ids=["authorization", "api-key", "adapter-key", "auth-emit", "script"],
+    ["authorization", "api_key", "x-auth-emit", "x-script"],
+    ids=["authorization", "api-key", "auth-emit", "script"],
 )
 def test_an_attribute_named_after_a_key_is_redacted(spans, name):
     """Names are structured, so a name match needs no assignment to be believed.
 
     This is the shape ``capture_headers=True`` would produce
-    (``http.request.header.x-adapter-key``), which is refused -- but these names
+    (``http.request.header.authorization``), which is refused -- but these names
     also reach a span when someone logs a header line into a value.
     """
     _emit({name: VENDOR_KEY})
@@ -193,7 +193,7 @@ def test_a_whole_value_header_line_is_redacted(spans):
     reads a whole-string match as safe, so the callback was never consulted and
     the credential stayed. Pinned as the inverse of the defect it replaced.
     """
-    _emit({"headers_echo": f"X-Adapter-Key: {ADAPTER_KEY}"})
+    _emit({"headers_echo": f"X-Auth-Emit: {ADAPTER_KEY}"})
 
     assert ADAPTER_KEY not in _attributes(spans)["headers_echo"]
 

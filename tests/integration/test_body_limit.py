@@ -23,15 +23,13 @@ import pytest
 
 from adapter.settings import Settings
 
-ADAPTER_KEY = "test-adapter-key"
 
 # Small enough for a test to cross cheaply; the production default is 64 MB.
 BODY_LIMIT = 4096
 
-JSON_HEADERS = {"Content-Type": "application/json", "X-Adapter-Key": ADAPTER_KEY}
+JSON_HEADERS = {"Content-Type": "application/json"}
 MULTIPART_HEADERS = {
     "Content-Type": "multipart/form-data; boundary=zz",
-    "X-Adapter-Key": ADAPTER_KEY,
 }
 
 
@@ -40,8 +38,6 @@ def settings() -> Settings:
     """Overrides the shared fixture to shrink the ceiling to something reachable."""
     return Settings(
         environment="dev",
-        adapter_key=ADAPTER_KEY,
-        adapter_key_required=True,
         allow_inline_script=True,
         upstream_allow_private_network=True,
         redis_url="",

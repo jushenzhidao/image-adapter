@@ -106,7 +106,6 @@ def vendor():
 def _headers(vendor: str, **extra: str) -> dict[str, str]:
     """The channel New API would build for a Gemini key."""
     headers = {
-        "X-Adapter-Key": "test-adapter-key",
         "X-Upstream-Url": vendor + MODEL_PATH,
         "X-Script-Ref": "google/images@v1",
         "X-Auth-Emit": "header:x-goog-api-key",

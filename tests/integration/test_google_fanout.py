@@ -26,7 +26,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-ADAPTER_KEY = "test-adapter-key"
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
@@ -177,7 +176,6 @@ def store(client):
 
 def _headers(vendor: str, script_ref: str, options: dict | None = None) -> dict[str, str]:
     headers = {
-        "X-Adapter-Key": ADAPTER_KEY,
         "X-Upstream-Url": f"{vendor}{UPSTREAM_PATH}",
         "X-Script-Ref": script_ref,
         "Content-Type": "application/json",

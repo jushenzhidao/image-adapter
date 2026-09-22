@@ -25,7 +25,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import pytest
 from PIL import Image
 
-from tests.integration.conftest import ADAPTER_KEY
 
 SCRIPT_REF = "volcengine_ark/images@v1"
 
@@ -138,7 +137,6 @@ def _post(
     script_ref: str = SCRIPT_REF,
 ):
     headers = {
-        "X-Adapter-Key": ADAPTER_KEY,
         "X-Upstream-Url": ark_url,
         "X-Script-Ref": script_ref,
         "Content-Type": "application/json",
@@ -338,7 +336,6 @@ def concurrent_image_host():
 
 def _post_many(client, ark_url, images, script_ref: str = SCRIPT_REF, options=None):
     headers = {
-        "X-Adapter-Key": ADAPTER_KEY,
         "X-Upstream-Url": ark_url,
         "X-Script-Ref": script_ref,
         "Content-Type": "application/json",

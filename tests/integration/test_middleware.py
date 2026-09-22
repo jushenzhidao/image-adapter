@@ -1,13 +1,11 @@
 """Integration tests for the middleware stack: request ids, CORS preflight and
 rate limiting (AC-19).
 
-These exercise the raw-ASGI implementations in adapter/middleware/. Two tests
-previously here were dropped rather than updated:
-``test_auth_disabled_by_default`` posted to ``/v1/images`` -- a route that has
-never existed -- and asserted only ``status != 401``, so it passed whatever the
-service did, and it named ADAPTER_AUTH_ENABLED, a config key that does not
-exist (the real fields are adapter_key / adapter_key_required). Admission is
-covered properly in test_error_envelope.py.
+These exercise the raw-ASGI implementations in adapter/middleware/. A test
+previously here was dropped rather than updated:
+``test_auth_disabled_by_default`` asserted only ``status != 401``, so it
+passed whatever the service did, and it named ADAPTER_AUTH_ENABLED, a config
+key that does not exist.
 """
 
 from __future__ import annotations
@@ -41,12 +39,12 @@ def test_cors_preflight_allows_the_channel_headers(client):
         headers={
             "Origin": "https://console.example",
             "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "x-adapter-key,x-upstream-url",
+            "Access-Control-Request-Headers": "x-auth-emit,x-upstream-url",
         },
     )
     assert resp.status_code == 200
     allowed = resp.headers["access-control-allow-headers"].lower()
-    assert "x-adapter-key" in allowed
+    assert "x-auth-emit" in allowed
     assert "x-upstream-url" in allowed
 
 
@@ -66,10 +64,9 @@ def test_rate_limit_rejects_with_the_openai_envelope(client, monkeypatch):
 
     _force_limit(monkeypatch, per_minute=1)
     body = {"prompt": "x"}
-    headers = {"X-Adapter-Key": "test-adapter-key"}
 
-    first = client.post("/v1/images/generations", json=body, headers=headers)
-    second = client.post("/v1/images/generations", json=body, headers=headers)
+    first = client.post("/v1/images/generations", json=body)
+    second = client.post("/v1/images/generations", json=body)
     rate_limit._local_counters.clear()
 
     # The first request is allowed through to the pipeline (and fails on the
@@ -99,7 +96,6 @@ def test_rate_limit_key_carries_no_credential(client, monkeypatch):
         "/v1/images/generations",
         json={"prompt": "x"},
         headers={
-            "X-Adapter-Key": "test-adapter-key",
             "Authorization": "Bearer ark-SUPERSECRET-abcdef",
         },
     )

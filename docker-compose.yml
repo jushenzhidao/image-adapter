@@ -28,8 +28,8 @@ services:
 
     # Single source of truth for configuration. Every Settings field is read
     # from here by name (see adapter/settings.py), so adding a knob needs no
-    # compose change. ADAPTER_KEY gates the data plane and must be set: inline
-    # scripts are remote code execution by design.
+    # compose change. There is no admission key: the network boundary is the
+    # gate (inline scripts are remote code execution by design).
     env_file:
       - .env
 

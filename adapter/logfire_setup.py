@@ -13,9 +13,9 @@ per-deployment decision, and a knob whose only two positions are "protect keys"
 and "do not" does not need an environment variable.
 
 **Request headers are never captured, and turning it on is refused.** The
-channel contract carries ``X-Adapter-Key`` (the data-plane credential),
-``Authorization`` (the upstream vendor's credential), ``X-Auth-Emit`` (where the
-credential goes -- and it may name *any* header, e.g. ``x-goog-api-key``) and
+channel contract carries ``Authorization`` (the upstream vendor's credential),
+``X-Auth-Emit`` (where the credential goes -- and it may name *any* header,
+e.g. ``x-goog-api-key``) and
 ``X-Script`` (executable Python source). ``init_logfire`` raises if
 ``capture_headers`` is on: a fixed name list cannot cover a header name the
 control plane picks per channel, and a service that starts is a service nobody
@@ -84,7 +84,6 @@ os.environ.setdefault("OTEL_BSP_SCHEDULE_DELAY", "5000")
 #: would have caught the credential inside it. The tail is now the callback's job
 #: instead (see `_is_assignment_after`).
 _SCRUB_PATTERNS: tuple[str, ...] = (
-    r"x-adapter-key",
     r"x-auth-emit",
     r"x-script(?:-64)?",
 )
@@ -227,8 +226,8 @@ def init_logfire(app: FastAPI, settings: Settings) -> None:
     # service that starts is a service nobody re-reads the startup log of.
     if settings.logfire_capture_headers:
         raise ValueError(
-            "LOGFIRE_CAPTURE_HEADERS=true is refused: X-Adapter-Key, "
-            "Authorization and X-Script would leave in clear text, and "
+            "LOGFIRE_CAPTURE_HEADERS=true is refused: Authorization "
+            "and X-Script would leave in clear text, and "
             "X-Auth-Emit names the credential header per channel, so no fixed "
             "redaction list can cover it. Write a reviewed redaction set in "
             "adapter/logfire_setup.py first."

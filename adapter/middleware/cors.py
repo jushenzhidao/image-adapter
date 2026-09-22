@@ -19,7 +19,6 @@ CHANNEL_HEADERS = [
     "X-Script-64",
     "X-Script-Ref",
     "X-Script-Sha256",
-    "X-Adapter-Key",
     "X-Auth-Emit",
     "X-Async",
     "X-Model-Map",

@@ -9,7 +9,6 @@ declares only how to talk to that endpoint:
   X-Script-64      base64 of the source                   (one of three)
   X-Script-Ref     vendor_y/mj@v1.3 or https://.../mj.py  (one of three)
   Authorization    upstream credential, passed through
-  X-Adapter-Key    admission key for this data plane
   X-Upstream-Method  default POST
   X-Auth-Emit      header:X-API-Key:Bearer
   X-Async          poll=2,timeout=300
@@ -49,7 +48,6 @@ H_AUTH_EMIT = "x-auth-emit"
 H_ASYNC = "x-async"
 H_MODEL_MAP = "x-model-map"
 H_OPTIONS = "x-channel-options"
-H_ADAPTER_KEY = "x-adapter-key"
 #: Not an `X-` header: it carries the *vendor* credential, not a directive.
 #: It gets a constant like the rest because it is part of the same contract
 #: (it is declared to FastAPI and allowed through CORS), and a literal at the

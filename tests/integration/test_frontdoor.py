@@ -111,7 +111,6 @@ def _headers(
     inline: str | None = None,
 ):
     headers = {
-        "X-Adapter-Key": "test-adapter-key",
         "X-Upstream-Url": vendor + path,
         "X-Auth-Emit": "header:x-goog-api-key",
         "Authorization": "Bearer sk-test",

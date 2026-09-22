@@ -21,7 +21,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from tests.integration.conftest import ADAPTER_KEY
 
 #: The wording a script recognises. Only the substring matters.
 MARKER = "Timeout while downloading url="
@@ -137,7 +136,6 @@ def _script(answer: bool) -> str:
 def _post(client, upstream_url: str, image: str, script: str):
     encoded = base64.b64encode(script.encode()).decode()
     headers = {
-        "X-Adapter-Key": ADAPTER_KEY,
         "X-Upstream-Url": upstream_url,
         "X-Script-64": encoded,
         "Content-Type": "application/json",

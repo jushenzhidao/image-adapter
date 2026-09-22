@@ -13,7 +13,7 @@ Two deliberate choices are worth knowing before editing this file:
   ``response_model`` to a route that returns a ``dict`` would silently start
   trimming unknown fields.
 * **Every channel header is declared optional.** ``channel_contract`` exists so
-  the seventeen headers appear in /docs and can be exercised from there, not to
+  the sixteen headers appear in /docs and can be exercised from there, not to
   validate them. Required-header failures stay ``channel_config_error`` (400,
   OpenAI envelope) from ``adapter/channel.py`` instead of a FastAPI 422.
 """
@@ -81,10 +81,6 @@ async def channel_contract(
     authorization: Annotated[
         str | None,
         Header(alias="Authorization", description="上游厂商凭证，原样透传，不用于本服务鉴权"),
-    ] = None,
-    x_adapter_key: Annotated[
-        str | None,
-        Header(alias="X-Adapter-Key", description="本服务准入密钥（必填）"),
     ] = None,
     x_upstream_method: Annotated[
         str | None, Header(alias="X-Upstream-Method", description="默认 POST")
@@ -204,11 +200,6 @@ async def lifespan(app: FastAPI):
             missing_storage_config(cfg),
         )
 
-    if cfg.adapter_key_required and not cfg.adapter_key:
-        logger.error(
-            "ADAPTER_KEY is not set: every request will be rejected. "
-            "Set ADAPTER_KEY, or ADAPTER_KEY_REQUIRED=false for local use only."
-        )
     if cfg.allow_inline_script and cfg.environment != "dev":
         logger.warning(
             "Inline scripts are enabled outside dev. Header-supplied source is "

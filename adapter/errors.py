@@ -66,13 +66,6 @@ class PayloadTooLargeError(AdapterError):
         )
 
 
-class AdmissionError(AdapterError):
-    """X-Adapter-Key missing or wrong. Distinct from upstream credentials."""
-
-    def __init__(self, message: str = "Missing or invalid X-Adapter-Key") -> None:
-        super().__init__(401, message, "authentication_error", None, "invalid_adapter_key")
-
-
 class ChannelConfigError(AdapterError):
     """The channel headers supplied by the control plane are unusable."""
 

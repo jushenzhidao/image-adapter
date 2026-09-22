@@ -24,7 +24,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-ADAPTER_KEY = "test-adapter-key"
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
@@ -140,7 +139,6 @@ def vendor(image_source):
 
 def _headers(vendor: str, script_ref: str) -> dict[str, str]:
     return {
-        "X-Adapter-Key": ADAPTER_KEY,
         "X-Upstream-Url": f"{vendor}{GEN_PATH}",
         "X-Script-Ref": script_ref,
         "Content-Type": "application/json",
