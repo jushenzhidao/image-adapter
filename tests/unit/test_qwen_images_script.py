@@ -330,7 +330,7 @@ def test_size_mapping_rules():
     assert body["size"] == "16:9"
     body = asyncio.run(q.transform(ctx, {"prompt": "x", "size": "not-a-size"},
                                    "request"))
-    # 无法识别 → auto（比例由模型按提示词决定），绝不 400
+    # 无法识别 → auto（画布由模型决定；默认路径实测恒 1024²，见 docs/10 §5.1），绝不 400
     assert body["size"] == "auto"
 
 

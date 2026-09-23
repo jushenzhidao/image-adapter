@@ -1025,8 +1025,10 @@ def _resolve_size(ctx, payload, opts):
       - a tier is expressed upstream as an image model, so it sets
         `image_model` and sends "auto";
       - anything unrecognized becomes "auto" -- a deliberate fallback rather
-        than a 400: the model then picks the ratio from the prompt, which is a
-        working request either way.
+        than a 400: with "auto" the canvas is the model's to choose, which is a
+        working request either way (measured 2026-09-23, docs/10 §5.1: the
+        default path answers 1024x1024 whatever the prompt says; the 2K/pro
+        path follows a ratio the prompt explicitly asks for).
     """
     image_model = opts.get("image_model")
     raw = str(payload.get("size") or opts.get("size") or "auto").strip()
