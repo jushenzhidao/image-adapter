@@ -258,6 +258,7 @@ Where the contract, its evidence and its operations live:
     `qwen/probe/`). Change the contract -- new endpoint, new field -- and those
     are what to read first; this repo holds the conclusions, not the evidence.
 """
+import base64
 import datetime
 import hashlib
 import hmac
@@ -397,6 +398,15 @@ def _declared_key(ctx):
 # **token 只在 `Set-Cookie`**（body 是账号记录，里面没有 token）、挑战页是
 # **200 + text/html**（不是 4xx，所以它有伪装成"登录成功"的余地）。
 SIGNIN_PATH = "/v2/auths/signin"
+#: 2026-09-30 改版：认证从 chat 源搬到独立域 **`auth.qwen.ai`** —— 旧源上的 signin 对所有
+#: 纯 HTTP 客户端回滑块验证码（当日五形态绕过全灭实测），新源对同一 aiohttp 客户端回
+#: JSON 契约，前提是带上 web 端头集（见 `SIGNIN_HEADERS`）。同域还住着 refresh
+#: （cookie 驱动、RT 轮换、15 分钟 access token）。与 `DEFAULT_BASE` 同形：**含 API
+#: 前缀**（`.../api`），signin 路径直接拼在后面。
+AUTH_BASE = "https://auth.qwen.ai/api"
+#: web 端自报的版本号，signin 头集的一员（2026-09-30 抓包实测值）。厂商改版后若 signin
+#: 开始拒头（`Invalid request header`），先怀疑这个值是否已漂移。
+WEB_APP_VERSION = "0.3.12"
 #: The browser identity every request to this vendor must carry. Defined once
 #: because the reference implementation sets these at the *session* level (so
 #: all of its calls had them) while transcribing only its per-call dicts leaves
@@ -424,9 +434,15 @@ SIGNIN_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json",
     "Origin": "https://chat.qwen.ai",
-    "Referer": "https://chat.qwen.ai/auth",
+    "Referer": "https://chat.qwen.ai/",
+    # chat → auth 是跨源同站（都属 *.qwen.ai），浏览器实际报 same-site；认证源按
+    # 这套头校验，缺一件即 `Invalid request header`（2026-09-30 实测，报错原文
+    # 就在响应 details 里）。
     "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
+    "sec-fetch-site": "same-site",
+    "source": "web",
+    "version": WEB_APP_VERSION,
+    "x-request-origin": "https://chat.qwen.ai",
 }
 
 
@@ -439,7 +455,14 @@ def _browser_headers(opts, base):
 
 
 def _signin_headers(opts):
-    return _browser_headers(opts, SIGNIN_HEADERS)
+    """signin 头集 = 浏览器身份 + web 端头集 + 每发新铸的 timezone / x-request-id。
+
+    后两者是认证源校验的一部分，且与浏览器行为一致：每次调用都应该是新的。
+    """
+    head = _browser_headers(opts, SIGNIN_HEADERS)
+    head["Timezone"] = _timezone()
+    head["X-Request-Id"] = str(uuid.uuid4())
+    return head
 
 
 def _warm_headers(opts):
@@ -451,8 +474,13 @@ def _warm_headers(opts):
 #: precisely how the IP-level wall below gets tripped. Entry shape:
 #: `{"jwt": str, "ts": float, "inflight": bool}`.
 _SIGNIN_STATE: dict = {}
-#: JWT 实测有效期 30 天（载荷 `exp` = 签发 + 30d）；缓存留大余量。
+#: 兜底上限：token 载荷里读不出 `exp` 时才用它（老缓存文档）。
 _SIGNIN_TTL = 6 * 86400.0
+#: 🔴 2026-09-30 改版后**会话 token 只有 15 分钟**（access_token `exp` = 签发 + 900s，
+#: 当日晚间实测；refresh_token 仍是 30 天）。缓存新鲜度因此以 **token 自己的 exp**
+#: 为准（见 `_token_usable`），固定 TTL 只作兜底——按 6 天缓存会在 15 分钟后拿着
+#: 死 token 撞一次上游 401，白搭一轮往返再走自愈路径。
+_SIGNIN_EXP_MARGIN = 60.0
 #: 🔴 被拒之后**不按请求重试**。该端点有 **IP 级**频率墙（实测约 12 次/6 分钟即触发；
 #: 浏览器客户端同样被拦，冷却 300 s 后复测 4/4 仍失败，只有换出口 IP 才恢复），而
 #: `_ensure_signin` 每请求会被调两次（auth + request 相位）⇒ 没有闸门的话，一个渠道
@@ -500,6 +528,30 @@ def _signin_entry(key):
     return _SIGNIN_STATE.setdefault(
         _signin_cache_key(key),
         {"jwt": "", "ts": 0.0, "inflight": False, "jar": ""})
+
+
+def _jwt_exp(token):
+    """JWT 载荷里的 `exp`（不验签，只看新鲜度）；取不到回 0。"""
+    try:
+        part = str(token).split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(part)).get("exp") or 0)
+    except Exception:  # noqa: BLE001 - 新鲜度判断，坏 token 一律当过期
+        return 0.0
+
+
+def _token_usable(entry, now):
+    """缓存里这份 token 现在还能用吗。
+
+    2026-09-30 起以 **token 自己的 `exp`** 为准（会话 token 只有 15 分钟），`ts`
+    + `_SIGNIN_TTL` 只兜底读不出 `exp` 的形状（老缓存文档、测试桩里的假 token）。
+    """
+    if not entry.get("jwt"):
+        return False
+    exp = _jwt_exp(entry["jwt"])
+    if exp:
+        return now < exp - _SIGNIN_EXP_MARGIN
+    return now - entry.get("ts", 0.0) < _SIGNIN_TTL
 
 
 def _cookie_header(set_cookies):
@@ -566,13 +618,39 @@ def _effective_key(ctx):
 
 
 def _set_cookie_token(raws):
-    """`token=<jwt>` out of Set-Cookie values. The body has no token in it --
-    it is the account record -- so never look for one there."""
+    """`token=<jwt>` out of Set-Cookie values（**旧契约**的取法）。
+
+    2026-09-30 改版后 Set-Cookie 只剩 `refresh_token`（HttpOnly），会话 token
+    改从响应体取（见 `_body_access_token`）。这里留着兼容仍下发 `token=` cookie
+    的形状与「两条都给」的过渡期。
+    """
     for raw in raws:
         m = re.search(r"(?:^|[;\s])token=([^;]+)", str(raw))
         if m:
             return m.group(1).strip()
     return ""
+
+
+def _body_access_token(text):
+    """`data.access_token` out of the signin reply.
+
+    2026-09-30 改版换了契约：会话 token 落在**响应体**（`data.access_token`），
+    Set-Cookie 里只剩 `refresh_token`（HttpOnly、Domain=.qwen.ai）——旧契约那个
+    `token=` cookie 不再下发。两个来源都读，老形状（cookie）留作兜底；新形状
+    （body）先读，因为它才是现在真正生效的那份。
+
+    ⚠️ 别用「Set-Cookie 里含 `token=`」做判据：`refresh_token=` 是它的子串，
+    会把「只种了 RT」误判成「拿到了 token」（2026-09-30 实测踩到，signin 明明
+    成功却静默回落 guest 门）。
+    """
+    try:
+        doc = json.loads(text or "{}")
+    except ValueError:
+        return ""
+    data = doc.get("data") if isinstance(doc, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("access_token") or "").strip()
 
 
 def _response_set_cookies(resp):
@@ -615,7 +693,7 @@ async def _ensure_signin(ctx, key, force=False):
     entry = _signin_entry(key)
     now = time.time()
     # ---- L1：命中就结束，不产生任何 I/O（**按账号**，见 _SIGNIN_STATE）----
-    if entry.get("jwt") and now - entry["ts"] < _SIGNIN_TTL:
+    if _token_usable(entry, now):
         return
     # ---- L2：只在 L1 没有可用 JWT、且不是在 401 自愈时读 -----------------
     # `force` 的语义是"手上这份凭据**已知失效**"。L2 里躺着的是同一份 token
@@ -628,7 +706,7 @@ async def _ensure_signin(ctx, key, force=False):
             entry.update(jwt=str(doc.get("jwt") or ""),
                          ts=float(doc.get("ts") or 0.0),
                          jar=str(doc.get("jar") or ""))
-            if entry["jwt"] and time.time() - entry["ts"] < _SIGNIN_TTL:
+            if _token_usable(entry, time.time()):
                 _note(ctx, stage="auth", signin="from_cache")
                 return
     # 登录可以交给工具侧的 token 服务（它走代理池轮换出口，见 docs/10 §3.2）：
@@ -660,6 +738,11 @@ async def _ensure_signin(ctx, key, force=False):
     # WAF's cold-start cookies never actually arrived.
     parts = urllib.parse.urlsplit(base)
     warm_url = parts.scheme + "://" + parts.netloc + SIGNIN_WARM_PATH
+    # signin 已不在 chat 源上：2026-09-30 改版把认证搬到了 `auth.qwen.ai`，旧源对
+    # 纯 HTTP 客户端回滑块验证码。`auth_base` 留了渠道选项的口子（换域不改版），
+    # 缺省即新认证源。预热仍打 chat 源：它给的是后续 chats/new 要用的 WAF 冷启动
+    # cookie（与 signin 的成败无关）。
+    auth_base = str(ctx.options.get("auth_base") or AUTH_BASE).rstrip("/")
     token, reason, jar = "", "", ""
     try:
         if service:
@@ -693,33 +776,44 @@ async def _ensure_signin(ctx, key, force=False):
             except Exception:  # noqa: BLE001
                 pass
             async with ctx.http.post(
-                    base + SIGNIN_PATH,
+                    auth_base + SIGNIN_PATH,
                     json={"email": user,
                           "password": hashlib.sha256(password.encode()).hexdigest()},
                     headers=_signin_headers(ctx.options)) as resp:
                 status = resp.status
                 text = await resp.text()
                 signed = _response_set_cookies(resp)
-                token = _set_cookie_token(signed)
+                # 新契约：会话 token 在响应体（`data.access_token`）；旧契约：Set-Cookie
+                # 的 `token=`。两条都读，body 优先（它是现在真正生效的那份）。
+                token = _body_access_token(text) or _set_cookie_token(signed)
             if status != 200:
                 reason = "HTTP " + str(status)
             elif not token:
-                reason = "no token in Set-Cookie (" + _diagnose(text) + ")"
+                reason = ("no session token in the signin reply (body access_token "
+                          "or Set-Cookie token=): " + _diagnose(text))
             else:
                 # 会话 jar：这次登录**自己**种下的 cookie 的全集（WAF 冷启动章 +
-                # Set-Cookie 全集，token 在内）。与 token 同源，写请求带它 = 身份
-                # 自洽；过去把 token 拼进 `cookie` 选项（运营者的 jar）是**身份
-                # 移植**——实测 2026-09-22 正是那种混搭被 x5sec 拒。
-                jar = _cookie_header(warm_cookies + signed)
+                # Set-Cookie 全集）。与 token 同源，写请求带它 = 身份自洽；过去把
+                # token 拼进 `cookie` 选项（运营者的 jar）是**身份移植**——实测
+                # 2026-09-22 正是那种混搭被 x5sec 拒。
+                # 2026-09-30 起 token 可能来自响应体（`data.access_token`），而
+                # Set-Cookie 里没有它 ⇒ 必须把它写进 jar，否则捕获 jar 是个
+                # **没有会话凭据**的壳（`_jar_for` 的 pair 分支会原样用它）。
+                jar = _with_token(_cookie_header(warm_cookies + signed), token)
     except Exception as exc:  # noqa: BLE001 - ctx.fail raises its own shape
         reason = "unreachable: " + str(exc)[:140]
     finally:
         entry["inflight"] = False
     entry.update(jwt=token, ts=time.time(), jar=jar)
     # 429/挑战页要与"口令不对"区分退避：后者 5 分钟足够，前者实测 >5 分钟仍在墙上。
-    backoff = (_SIGNIN_TTL if token
-               else _SIGNIN_WALL_COOLDOWN if "WAF" in reason
-               else _SIGNIN_RETRY_COOLDOWN)
+    # 成功的 L2 寿命＝**这份 token 自己的剩余寿命**（改版后只有 15 分钟），取不到
+    # `exp` 才退回 `_SIGNIN_TTL` 的上限。
+    if token:
+        exp = _jwt_exp(token)
+        backoff = (max(60.0, exp - time.time() - _SIGNIN_EXP_MARGIN) if exp
+                   else _SIGNIN_TTL)
+    else:
+        backoff = _SIGNIN_WALL_COOLDOWN if "WAF" in reason else _SIGNIN_RETRY_COOLDOWN
     # 穿透写回：成功了别人拿去直接用；失败了别人也一起被冷却窗闸住。
     # jar 与 token 是**一套**，所以同一条文档里写回；失败时写空 jar，
     # 顺带把 L2 里可能残留的旧 jar 清掉（token 已失效，旧的不能再用）。

@@ -13,9 +13,11 @@ the function it is about, not on script-store resolution.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import importlib.util
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -806,7 +808,8 @@ def test_pair_form_signs_in_then_uses_jwt():
 
 
 def test_signin_ignores_a_token_in_the_body():
-    """token 只在 Set-Cookie 里；body 是账号记录 —— 从 body 取会静默登不进去。"""
+    """token 只从 `data.access_token`（2026-09-30 新契约）或 Set-Cookie 的
+    `token=`（旧契约）取；body 顶层其它同名字段一律不算 —— 认错字段会静默登不进去。"""
     body_only = FakeResp(200, json.dumps({"success": True, "token": "jwt-in-body"}),
                          headers={"Set-Cookie": "acw_tc=1; Path=/"})
     ctx = FakeCtx(options={"cookie": "fp=1", "bx_ua": "ua-g",
@@ -818,6 +821,23 @@ def test_signin_ignores_a_token_in_the_body():
     assert h["Referer"].endswith("/c/guest")
 
 
+def test_signin_reads_the_body_access_token_the_redesign_moved_it_to():
+    """改版契约：会话 token 在响应体 `data.access_token`，Set-Cookie 只剩
+    `refresh_token`（HttpOnly）。只认 cookie 的旧读法会 **signin 成功却静默回落
+    guest 门**（2026-09-30 线上实测：signin 200 success:true，随后 400
+    channel_config_error）。"""
+    reply = FakeResp(200, json.dumps({
+        "success": True,
+        "data": {"access_token": "jwt-from-body", "refresh_token": "rt-1",
+                 "id": "u1", "email": "user@mail.test"},
+    }), headers={"Set-Cookie": "refresh_token=rt-1; Domain=.qwen.ai; HttpOnly"})
+    ctx = FakeCtx(options={"cookie": "fp=1"}, http=FakeHttp(reply),
+                  key="user@mail.test|passw0rd")
+    h = asyncio.run(q.transform(ctx, {}, "auth"))
+    assert "token=jwt-from-body" in h["Cookie"]      # 取到并写进会话 jar
+    assert h["Referer"].endswith("/c/new-chat")      # 账号门（不是 guest）
+
+
 def test_signin_warmup_gets_the_waf_cold_start_cookies_first():
     """预热打的是**源站根**的 `/auth`，不是 API 前缀下的 `/api/auth` —— 后者是 404，
     而 best-effort 的处理器会把它吞掉，于是那个 WAF 冷启动 cookie 从来没拿到过。"""
@@ -827,7 +847,27 @@ def test_signin_warmup_gets_the_waf_cold_start_cookies_first():
     asyncio.run(q.transform(ctx, {}, "auth"))
     urls = [c["url"] for c in http.calls]
     assert urls[0] == "https://chat.qwen.ai/auth", urls[0]
-    assert urls[1] == "https://chat.qwen.ai/api/v2/auths/signin"
+    # signin 已搬去**认证源**（2026-09-30 改版）：chat 源上的 signin 对所有纯 HTTP
+    # 客户端回滑块验证码，auth 源回 JSON 契约。
+    assert urls[1] == "https://auth.qwen.ai/api/v2/auths/signin"
+
+
+def test_signin_carries_the_web_header_set_the_auth_host_validates():
+    """认证源按 web 端头集校验：缺一件即 `Invalid request header`（2026-09-30 实测，
+    报错原文就在响应 details 里）。钉住这套头——尤其 source / version /
+    x-request-origin、跨源同站的 sec-fetch-site，以及每发新铸的 timezone / x-request-id。"""
+    http = FakeHttp(_signin_ok("jwt-1"))
+    ctx = FakeCtx(options={"cookie": "fp=1"}, http=http,
+                  key="user@mail.test|passw0rd")
+    asyncio.run(q.transform(ctx, {}, "auth"))
+    sent = [c for c in http.calls if c["url"].endswith("/v2/auths/signin")][0]
+    h = sent["headers"]
+    assert sent["url"] == "https://auth.qwen.ai/api/v2/auths/signin"
+    assert h["source"] == "web"
+    assert h["version"] == q.WEB_APP_VERSION
+    assert h["x-request-origin"] == "https://chat.qwen.ai"
+    assert h["sec-fetch-site"] == "same-site"       # chat → auth 是跨源同站
+    assert h["Timezone"] and h["X-Request-Id"]      # 每发新铸，浏览器同款
 
 
 # --- 会话 jar 捕获（pair 形态的身份自洽，2026-09-22） -----------------------
@@ -1093,9 +1133,41 @@ def test_a_non_waf_non_json_failure_does_not_block_the_channel():
 
 
 def test_signin_cache_respects_the_measured_token_life():
-    """TTL：JWT 实测 30 天有效期，缓存取 6 天（大余量），到期自动重新 signin。"""
-    assert q._SIGNIN_TTL == 6 * 86400.0
-    assert q._SIGNIN_TTL < 30 * 86400.0
+    """新鲜度以 **token 自己的 exp** 为准（2026-09-30 改版：会话 token 只有 15 分钟），
+    `_SIGNIN_TTL` 只兜底读不出 exp 的形状。拿死 token 缓存会白撞一轮 401。"""
+    assert q._SIGNIN_EXP_MARGIN > 0
+
+    def jwt(exp):
+        part = base64.urlsafe_b64encode(
+            json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+        return "eyJhbGciOiJIUzI1NiJ9." + part + ".sig"
+
+    now = time.time()
+    assert q._token_usable({"jwt": jwt(now + 300), "ts": now}, now) is True
+    assert q._token_usable({"jwt": jwt(now - 5), "ts": now}, now) is False
+    # 临近过期（余量内）也不再用：省下一次注定 401 的往返
+    assert q._token_usable({"jwt": jwt(now + 10), "ts": now}, now) is False
+    # 读不出 exp 的老形状/测试桩 token 退回 ts + _SIGNIN_TTL
+    assert q._token_usable({"jwt": "jwt-1", "ts": now}, now) is True
+    assert q._token_usable({"jwt": "jwt-1", "ts": now - q._SIGNIN_TTL - 1}, now) is False
+    assert q._token_usable({"jwt": "", "ts": now}, now) is False
+
+
+def test_expired_cached_token_triggers_a_fresh_signin():
+    """缓存里的 token 过期 ⇒ 重新 signin（而不是把它送上去）。
+
+    场景按真实时序铺：15 分钟前登的（`ts` 已出 300s 的失败冷却窗），token 刚过期。
+    """
+    http = FakeHttp(_signin_ok("jwt-1"))
+    ctx = FakeCtx(options={"cookie": "fp=1"}, http=http, key="user@mail.test|passw0rd")
+    expired = "eyJhbGciOiJIUzI1NiJ9." + base64.urlsafe_b64encode(
+        json.dumps({"exp": time.time() - 5}).encode()).decode().rstrip("=") + ".sig"
+    q._SIGNIN_STATE[q._signin_cache_key("user@mail.test|passw0rd")] = {
+        "jwt": expired, "ts": time.time() - 400, "inflight": False,
+        "jar": "token=" + expired}
+    asyncio.run(q.transform(ctx, {}, "auth"))
+    assert [c for c in http.calls if c["url"].endswith("/v2/auths/signin")], \
+        "过期的缓存 token 必须触发重新登录"
 
 
 def test_every_signin_hop_carries_the_browser_identity():

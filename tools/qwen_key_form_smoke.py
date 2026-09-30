@@ -222,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--proxy", default="",
                     help="让本渠道走出站代理（HTTP），如 http://127.0.0.1:3128；"
                          "空＝不走代理（默认，与存量渠道一致）")
+    ap.add_argument("--pause", type=float, default=0.0,
+                    help="[A] 独立 signin 与 [B] 发图之间的等待秒数。默认 0；同一出口"
+                         "背靠背两次 signin 会撞 auth 侧速率窗（2026-09-30 实测），"
+                         "排查 signin 问题时给 20+ 秒隔离变量")
     args = ap.parse_args(argv)
 
     resolved = resolve_credential(args.key_form)
@@ -295,6 +299,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"   垫图 {Path(path).name}：{len(raw)}B {mime}")
         body["image"] = refs
         body["prompt"] = "把这几张图的主体合成到同一个场景里，风格统一"
+    if args.pause > 0:
+        print(f"   停 {args.pause:.0f}s（[A] 与 [B] 的 signin 隔离，避开同出口速率窗）")
+        time.sleep(args.pause)
     print(f"[B] 经适配器发 1 发：`{label}` × {args.tier} × {args.case}"
           f"{'（垫图 ' + str(len(args.input_image)) + ' 张）' if args.case == 'multi' else ''}")
     sent_at = time.time()
