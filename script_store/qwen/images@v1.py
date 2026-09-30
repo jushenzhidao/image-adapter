@@ -9,8 +9,10 @@ Channel setup (New API side):
                       "bx_ua": "<234!... token>", "bx_umidtoken": "<T2gA...>",
                       "image_model": "qwen-image-3.0-pro",
                       "identity_url": "http://127.0.0.1:8791/identity?token=..."}
-  # identity_url is guest-only and optional; it makes the channel rotate a whole
-  # device identity per request (see tools/identity_service.py in this repo).
+  # identity_url is guest-door-only and optional: when the request actually
+  # rides the guest door it rotates a whole device identity per request (see
+  # tools/identity_service.py in this repo). A signed-in account request
+  # never consults it.
 
 Two front doors, one script -- logged-in and guest:
 
@@ -1826,11 +1828,16 @@ async def transform(ctx, payload, phase):
     if phase == "auth":
         # Returning a dict here makes the engine attach these headers to the
         # upstream call (executor: "headers emitted by the auth phase carry
-        # into the request phase"). The identity endpoint (guest channels with
-        # identity_url) is consulted here, once per request, and merged into
-        # ctx.options in place -- the request phase reads the same dict.
-        opts = await _maybe_fresh_identity(ctx, ctx.options)
+        # into the request phase"). Sign-in runs first: only afterwards does a
+        # pair key know which door it landed on. `identity_url` (guest-door
+        # equipment) is consulted exactly when this request will ride the
+        # guest door -- once per request, merged into ctx.options in place;
+        # the request phase reads the same dict. A signed-in pair request
+        # never touches the identity service: no pool draws burned, and no
+        # guest device fingerprint mixed into an account session.
         await _ensure_signin(ctx, _declared_key(ctx))
+        if not _bearer_token(ctx):
+            await _maybe_fresh_identity(ctx, ctx.options)
         _credentials(ctx)
         return _headers(ctx)
 
@@ -1860,6 +1867,14 @@ async def transform(ctx, payload, phase):
             # per-account L1).
             _signin_entry(_declared_key(ctx)).update(jwt="")
         await _ensure_signin(ctx, _declared_key(ctx), force=forced)
+        # 401 self-heal's fallback: the first attempt went out logged-in and
+        # the re-signin was refused, so this attempt rides the guest door --
+        # but the auth phase (logged-in at the time) fetched no identity.
+        # Fetch here, and only when none is present: one identity per request
+        # is the pinned semantic, and a channel carrying a static fingerprint
+        # must not be re-fetched over.
+        if not _bearer_token(ctx) and not ctx.options.get("bx_ua"):
+            await _maybe_fresh_identity(ctx, ctx.options)
         opts = _credentials(ctx)
         mode = _chat_mode(ctx, opts)
         if _key_is_pair(_declared_key(ctx)) and ctx.upstream_error:
