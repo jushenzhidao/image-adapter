@@ -60,37 +60,49 @@ Two front doors, one script -- logged-in and guest:
   | a whole cookie str.  | logged-in | the string *is* the jar, verbatim; token read from it |
   | `<user>|<password>`  | logged-in | `POST /v2/auths/signin` for a JWT **and its session jar** -- below |
 
-  **The `<user>|<password>` form signs in.** `POST /v2/auths/signin` (v2 -- only
-  the read-only account record lives on v1) takes `sha256(password)` and answers
-  the JWT **in `Set-Cookie`**, never in the body, which is the account record. A
-  warm-up `GET /auth` goes first so the WAF's cold-start cookies are in the
-  session jar. The token is then cached module-side for `_SIGNIN_TTL` (6 days,
-  against a measured 30-day life), because signing in is side-effecting and the
-  endpoint is **rate-limited by IP**: roughly 12 attempts in 6 minutes trips an
-  Aliyun challenge page that arrives as **200 + text/html**, lasts minutes, and
-  clears only with a different egress. Hence `_SIGNIN_RETRY_COOLDOWN` -- a
-  refusal is not retried per request, and the window is shared across channels
-  because the wall is per IP. A refusal resolves the pair form to `guest` (the
-  fallback an operator asked for, rather than a guaranteed 401), and a 401 on the
-  generation call earns exactly one forced re-sign-in through the engine's single
-  retry (`ctx.upstream_error`), so a rotated password heals without a redeploy.
+  **The `<user>|<password>` form signs in.** `POST /v2/auths/signin` on the
+  **auth origin** (`auth.qwen.ai`, split off in the 2026-09-30 redesign; the chat
+  origin's signin answers a slider CAPTCHA to every plain-HTTP client) takes
+  `sha256(password)` plus the web header set, and answers the session token in
+  the **response body** (`data.access_token`, 15-minute life) with only a
+  `refresh_token` cookie (30 days, HttpOnly, `Domain=.qwen.ai`). A warm-up
+  `GET /auth` goes first so the WAF's cold-start cookies are in the session jar.
+
+  **续期走 `GET auth.qwen.ai/api/v2/auths/refresh`，signin 只兜底。** The cached
+  jar carries the refresh token, so the normal 15-minute renewal is one
+  cookie-driven GET -- no password, no warm-up, no CAPTCHA, none of signin's
+  per-IP rate wall -- and it returns a fresh access token (plus a refresh token,
+  written back if present). Signin therefore happens only when there is no
+  refresh token to spend (first request of an account, or the RT itself died) --
+  roughly once per 30 days per account instead of once per 15 minutes. Signing in
+  is side-effecting and its endpoint is **rate-limited by IP**: roughly 12
+  attempts in 6 minutes trips an Aliyun challenge page that arrives as
+  **200 + text/html**, lasts minutes, and clears only with a different egress.
+  Hence `_SIGNIN_RETRY_COOLDOWN` -- a refusal is not retried per request, and the
+  window is shared across channels because the wall is per IP. A refusal resolves
+  the pair form to `guest` (the fallback an operator asked for, rather than a
+  guaranteed 401), and a 401 on the generation call earns exactly one forced
+  renewal through the engine's single retry (`ctx.upstream_error`): refresh
+  first, signin if the RT no longer works -- so a rotated password heals without
+  a redeploy.
 
   **The pair form also captures the jar that signed in.** The warm-up and the
-  signin responses mint a set of cookies (the WAF's `acw_tc` / `x-ap` and the
-  account's session entries, `token=` among them) that belong to the very
-  session that produced the JWT; both are captured with it and cached as one
-  entry. Writes then carry *that* jar, so token and jar share an origin -- a
-  token paired with someone else's browser jar is an identity mismatch, and
-  measured 2026-09-22 the vendor refuses exactly that mix with x5sec while the
-  account itself signs in fine. This is also why a pair channel does **not**
-  need the `cookie` option: assembled by hand it is precisely the mismatch.
-  Entries cached before the capture existed (no jar) fall back to the old
-  assembly, so nothing that used to work stops working.
+  signin responses mint a set of cookies (the WAF's `acw_tc` / `x-ap`, the
+  account's session entries) that belong to the very session that produced the
+  token; both are captured with it and cached as one entry, with the session
+  token written in. Writes then carry *that* jar, so token and jar share an
+  origin -- a token paired with someone else's browser jar is an identity
+  mismatch, and measured 2026-09-22 the vendor refuses exactly that mix with
+  x5sec while the account itself signs in fine. This is also why a pair channel
+  does **not** need the `cookie` option: assembled by hand it is precisely the
+  mismatch. Entries cached before the capture existed (no jar) fall back to the
+  old assembly, so nothing that used to work stops working.
 
   Two cache layers keep that cheap: the module-level dict answers the hot path
   with **no I/O at all**, and `ctx.cache` (Redis when `redis_url` is set) is read
-  only when this process holds no usable token -- at most once per `_SIGNIN_TTL`
-  -- so a second worker adopts the token instead of signing in again. Concurrent
+  only when this process holds no usable token -- freshness follows the token's
+  own `exp` (15 minutes now; see `_token_usable`) -- so a second worker adopts the
+  token instead of renewing again. Concurrent
   cold requests single-flight in-process, so a deploy's first burst costs one
   sign-in rather than one per worker.
 
@@ -407,6 +419,11 @@ AUTH_BASE = "https://auth.qwen.ai/api"
 #: web 端自报的版本号，signin 头集的一员（2026-09-30 抓包实测值）。厂商改版后若 signin
 #: 开始拒头（`Invalid request header`），先怀疑这个值是否已漂移。
 WEB_APP_VERSION = "0.3.12"
+#: 续期端点（2026-09-30 改版新增，同日实测）：**cookie 驱动 GET**，凭据是登录时种下的
+#: `refresh_token`（Domain=.qwen.ai、HttpOnly），回一份新的 `access_token`（15 分钟）
+#: 与 `refresh_token`（30 天，实测**不轮换**——同一份复用，所以 jar 更新写成"有则覆盖"）。
+#: 不拦滑块、不要密码、不要预热 ⇒ 正常续期走这条路，signin 只在 RT 也失效时才发生。
+REFRESH_PATH = "/v2/auths/refresh"
 #: The browser identity every request to this vendor must carry. Defined once
 #: because the reference implementation sets these at the *session* level (so
 #: all of its calls had them) while transcribing only its per-call dicts leaves
@@ -667,6 +684,42 @@ def _response_set_cookies(resp):
         return [single] if single else []
 
 
+def _auth_base(ctx):
+    """认证源基址：渠道选项 `auth_base` 可覆盖（换域不发版），缺省 = `AUTH_BASE`。"""
+    return str(ctx.options.get("auth_base") or AUTH_BASE).rstrip("/")
+
+
+async def _refresh_access_token(ctx, jar):
+    """用缓存的会话 jar 换一份新 access token（2026-09-30 改版新增的续期路）。
+
+    返回 `(token, jar)`：`token` 为空即这次续期没成（RT 缺失/失效/网络问题），
+    调用方原样回落 signin。**best-effort** —— 它是一条更便宜的捷径，不该是新的一处
+    失败点，所以任何异常都吞掉、只回空。
+
+    jar 更新两条：新的 `token=`（写请求认的就是它）与响应里的 `refresh_token`
+    （有则覆盖；实测**同一份复用、不轮换**，但轮换与否不该由我们猜）。
+    """
+    try:
+        async with ctx.http.get(
+                _auth_base(ctx) + REFRESH_PATH,
+                headers={**_signin_headers(ctx.options), "Cookie": jar}) as resp:
+            text = await resp.text()
+        doc = json.loads(text or "{}")
+    except Exception:  # noqa: BLE001 - 捷径失败即回落 signin
+        return "", jar
+    data = doc.get("data") if isinstance(doc, dict) else None
+    if not isinstance(data, dict):
+        return "", jar
+    token = str(data.get("access_token") or "").strip()
+    if not token:
+        return "", jar
+    jar = _with_token(jar, token)
+    fresh_rt = str(data.get("refresh_token") or "").strip()
+    if fresh_rt:
+        jar = _with_entry(jar, "refresh_token", fresh_rt)
+    return token, jar
+
+
 async def _ensure_signin(ctx, key, force=False):
     """pair 形态确保缓存里有可用 JWT；TTL 到期或被 401 作废则重新 signin。
 
@@ -715,6 +768,24 @@ async def _ensure_signin(ctx, key, force=False):
     now = time.time()
     if not force and now - entry.get("ts", 0.0) < _SIGNIN_RETRY_COOLDOWN:
         return
+    # ---- 续期优先：jar 里有 refresh_token 就先走 cookie 驱动的那条路 ----
+    # `GET auth.qwen.ai/api/v2/auths/refresh` 免密码、免预热、不拦滑块（2026-09-30
+    # 实测 200/JSON，回新 access_token + refresh_token）。**signin 只在 RT 也失效
+    # 时发生**：正常运营下 15 分钟一次的续期不再碰密码，也不占 signin 那条按 IP 计
+    # 的频率墙。这条捷径直通两个入口：L1 过期（自然到点）与 `force`（401 自愈，
+    # 说明手上这份 access token 提前死了 —— 先拿 RT 换一份，换不到才重新登录）。
+    if _cookie_entry(entry.get("jar") or "", "refresh_token"):
+        token, fresh_jar = await _refresh_access_token(ctx, entry.get("jar"))
+        if token:
+            entry.update(jwt=token, ts=time.time(), jar=fresh_jar)
+            exp = _jwt_exp(token)
+            await _signin_cache_put(
+                ctx, cache_key,
+                {"jwt": token, "ts": entry["ts"], "jar": fresh_jar},
+                max(60.0, exp - time.time() - _SIGNIN_EXP_MARGIN) if exp
+                else _SIGNIN_TTL)
+            _note(ctx, stage="auth", signin="refreshed")
+            return
     # 跨账号节流：冷启动时 N 个账号的登录不能挤在中国同一秒里（实测会把出口打上墙）。
     # ⚠️ 只在"脚本自己登"这条路上闸：走 token 服务时出口在服务那边轮换，这里再卡 45 s
     # 只会让 8 个账号又变成排队 6 分钟。
@@ -742,7 +813,7 @@ async def _ensure_signin(ctx, key, force=False):
     # 纯 HTTP 客户端回滑块验证码。`auth_base` 留了渠道选项的口子（换域不改版），
     # 缺省即新认证源。预热仍打 chat 源：它给的是后续 chats/new 要用的 WAF 冷启动
     # cookie（与 signin 的成败无关）。
-    auth_base = str(ctx.options.get("auth_base") or AUTH_BASE).rstrip("/")
+    auth_base = _auth_base(ctx)
     token, reason, jar = "", "", ""
     try:
         if service:
@@ -889,7 +960,26 @@ def _with_token(cookie, token):
     to a fresh one leaves the vendor to decide which wins, and that is not a
     coin to flip on an auth path.
     """
-    return "; ".join(_jar_parts(cookie, True) + ["token=" + token])
+    return _with_entry(cookie, "token", token)
+
+
+def _with_entry(cookie, name, value):
+    """The jar with `name=<value>` in it (replaced if present), others untouched."""
+    parts = [p for p in _jar_parts(cookie) if p.partition("=")[0].strip() != name]
+    return "; ".join(parts + [name + "=" + value])
+
+
+def _cookie_entry(cookie, name):
+    """The value of cookie `name` in a jar string ("" when absent).
+
+    Hand-rolled rather than `SimpleCookie`: the values are JWTs full of `=`/`.`,
+    and this only ever needs the raw text between `name=` and the next `;`.
+    """
+    for part in _jar_parts(cookie):
+        key, _, value = part.partition("=")
+        if key.strip() == name:
+            return value.strip()
+    return ""
 
 
 def _without_token(cookie):

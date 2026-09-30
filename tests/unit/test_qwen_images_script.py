@@ -133,6 +133,12 @@ def _signin_ok(token, body=None):
                     headers={"Set-Cookie": "token=" + token + "; Path=/; HttpOnly"})
 
 
+def _jwt_token(exp):
+    """试桩用 JWT：只带 `exp`（脚本解载荷只看新鲜度，不验签）。"""
+    part = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode()
+    return "eyJhbGciOiJIUzI1NiJ9." + part.rstrip("=") + ".sig"
+
+
 class FakeHttp:
     """ctx.http 站位：记录调用，按 URL 子串路由回放响应。"""
 
@@ -1137,16 +1143,11 @@ def test_signin_cache_respects_the_measured_token_life():
     `_SIGNIN_TTL` 只兜底读不出 exp 的形状。拿死 token 缓存会白撞一轮 401。"""
     assert q._SIGNIN_EXP_MARGIN > 0
 
-    def jwt(exp):
-        part = base64.urlsafe_b64encode(
-            json.dumps({"exp": exp}).encode()).decode().rstrip("=")
-        return "eyJhbGciOiJIUzI1NiJ9." + part + ".sig"
-
     now = time.time()
-    assert q._token_usable({"jwt": jwt(now + 300), "ts": now}, now) is True
-    assert q._token_usable({"jwt": jwt(now - 5), "ts": now}, now) is False
+    assert q._token_usable({"jwt": _jwt_token(now + 300), "ts": now}, now) is True
+    assert q._token_usable({"jwt": _jwt_token(now - 5), "ts": now}, now) is False
     # 临近过期（余量内）也不再用：省下一次注定 401 的往返
-    assert q._token_usable({"jwt": jwt(now + 10), "ts": now}, now) is False
+    assert q._token_usable({"jwt": _jwt_token(now + 10), "ts": now}, now) is False
     # 读不出 exp 的老形状/测试桩 token 退回 ts + _SIGNIN_TTL
     assert q._token_usable({"jwt": "jwt-1", "ts": now}, now) is True
     assert q._token_usable({"jwt": "jwt-1", "ts": now - q._SIGNIN_TTL - 1}, now) is False
@@ -1157,17 +1158,68 @@ def test_expired_cached_token_triggers_a_fresh_signin():
     """缓存里的 token 过期 ⇒ 重新 signin（而不是把它送上去）。
 
     场景按真实时序铺：15 分钟前登的（`ts` 已出 300s 的失败冷却窗），token 刚过期。
+    前提是 **jar 里没有 refresh_token**（老缓存/薄 jar）—— 有 RT 时先走续期，见下。
     """
     http = FakeHttp(_signin_ok("jwt-1"))
     ctx = FakeCtx(options={"cookie": "fp=1"}, http=http, key="user@mail.test|passw0rd")
-    expired = "eyJhbGciOiJIUzI1NiJ9." + base64.urlsafe_b64encode(
-        json.dumps({"exp": time.time() - 5}).encode()).decode().rstrip("=") + ".sig"
+    expired = _jwt_token(time.time() - 5)
     q._SIGNIN_STATE[q._signin_cache_key("user@mail.test|passw0rd")] = {
         "jwt": expired, "ts": time.time() - 400, "inflight": False,
         "jar": "token=" + expired}
     asyncio.run(q.transform(ctx, {}, "auth"))
     assert [c for c in http.calls if c["url"].endswith("/v2/auths/signin")], \
         "过期的缓存 token 必须触发重新登录"
+
+
+# ------------------------------------------- 续期（refresh，2026-09-30 改版新增）
+
+
+def test_expired_token_is_renewed_by_the_refresh_route():
+    """15 分钟到点走 **cookie 驱动 GET 续期**：不重登、不要密码、不要预热。
+
+    signin 只在 RT 也失效时发生 ⇒ 正常运营是 30 天一次登录而不是 15 分钟一次。
+    """
+    old, fresh = _jwt_token(time.time() - 5), _jwt_token(time.time() + 900)
+    routes = {"/v2/auths/refresh": FakeResp(200, json.dumps(
+        {"success": True,
+         "data": {"access_token": fresh, "refresh_token": "rt-new"}}))}
+    http = FakeHttp(FakeResp(200, json.dumps(CHAT_OK)), routes=routes)
+    ctx = FakeCtx(options={"cookie": "fp=1"}, http=http, key="user@mail.test|passw0rd")
+    q._SIGNIN_STATE[q._signin_cache_key("user@mail.test|passw0rd")] = {
+        "jwt": old, "ts": time.time() - 400, "inflight": False,
+        "jar": "acw_tc=1; refresh_token=rt-old; token=" + old}
+
+    h = asyncio.run(q.transform(ctx, {}, "auth"))
+
+    urls = [c["url"] for c in http.calls]
+    assert any(u.endswith("/v2/auths/refresh") for u in urls), "续期没发生"
+    assert not any(u.endswith("/v2/auths/signin") for u in urls), "有 RT 就不该重登"
+    renew = [c for c in http.calls if c["url"].endswith("/v2/auths/refresh")][0]
+    assert "refresh_token=rt-old" in renew["headers"]["Cookie"]   # 凭据就是这份 jar
+    assert renew["url"] == "https://auth.qwen.ai/api/v2/auths/refresh"
+    assert "token=" + fresh in h["Cookie"]                        # 新 token 上了 wire
+    assert "refresh_token=rt-new" in q._signin_entry(
+        "user@mail.test|passw0rd")["jar"]                         # 回写的 RT 进了缓存
+
+
+def test_refresh_failure_falls_back_to_signin():
+    """RT 失效 ⇒ 回落 signin（密码那条路），而不是把请求判死。"""
+    old = _jwt_token(time.time() - 5)
+    routes = {"/v2/auths/refresh": FakeResp(200, json.dumps(
+        {"success": False,
+         "data": {"code": "Bad_Request", "details": "Invalid refresh token"}}))}
+    http = FakeHttp(_signin_ok("jwt-from-signin"), routes=routes)
+    ctx = FakeCtx(options={"cookie": "fp=1"}, http=http, key="user@mail.test|passw0rd")
+    q._SIGNIN_STATE[q._signin_cache_key("user@mail.test|passw0rd")] = {
+        "jwt": old, "ts": time.time() - 400, "inflight": False,
+        "jar": "refresh_token=rt-dead; token=" + old}
+
+    h = asyncio.run(q.transform(ctx, {}, "auth"))
+
+    urls = [c["url"] for c in http.calls]
+    assert any(u.endswith("/v2/auths/refresh") for u in urls)
+    assert any(u.endswith("/v2/auths/signin") for u in urls), "续期失败必须回落重新登录"
+    assert "token=jwt-from-signin" in h["Cookie"]
 
 
 def test_every_signin_hop_carries_the_browser_identity():
