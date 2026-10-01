@@ -314,3 +314,60 @@ def test_playwright_absent_names_the_install_command():
     with pytest.raises(svc.MintError) as err:
         minter._ensure_browser()
     assert "playwright install" in str(err.value)
+
+
+def test_a_dead_browser_is_replaced_instead_of_poisoning_the_pool(monkeypatch):
+    """浏览器进程死了要**重开**，而不是拿着尸体继续开会话。
+
+    实测（node-064，2026-10-01）：Chrome 崩过一次之后，`_ensure_browser` 只看对象
+    存不存在的写法让 `new_context` 永远抛 TargetClosedError ⇒ 池子补不满、ready
+    归零、每秒一条 mint failed，而 systemd 仍报 active。服务静默瘫痪，只有重启能救。
+    """
+    import sys
+    import types
+
+    events: dict[str, object] = {}
+
+    class _DeadBrowser:
+        def is_connected(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            events["closed"] = True
+
+    class _LiveBrowser:
+        def is_connected(self) -> bool:
+            return True
+
+    class _PW:
+        def __init__(self) -> None:
+            class _Chromium:
+                @staticmethod
+                def launch(**kw: object) -> object:
+                    events["launched"] = kw
+                    return _LiveBrowser()
+
+            self.chromium = _Chromium()
+
+        def stop(self) -> None:
+            events["pw_stopped"] = True
+
+    monkeypatch.setitem(
+        sys.modules, "playwright.sync_api",
+        types.SimpleNamespace(
+            sync_playwright=lambda: types.SimpleNamespace(start=lambda: _PW())))
+
+    minter = svc.BrowserMinter()
+    minter._browser = _DeadBrowser()
+    minter._ensure_browser()
+
+    assert events.get("closed") is True, "尸体浏览器必须先被拆掉"
+    assert "launched" in events, "并且重开一个（否则池子永远补不满）"
+    assert minter._browser is not None
+
+    # 活着的浏览器不该被无谓重开（否则每次取身份都多一次冷启动）
+    events.clear()
+    healthy = svc.BrowserMinter()
+    healthy._browser = _LiveBrowser()
+    healthy._ensure_browser()
+    assert "launched" not in events

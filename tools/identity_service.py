@@ -176,9 +176,30 @@ class BrowserMinter:
         self._browser = None
 
     # -- lifecycle (refill thread only) -----------------------------------
+    @staticmethod
+    def _alive(browser: Any) -> bool:
+        """浏览器进程还活着吗。
+
+        `is_connected()` 是 Playwright 给的健康判据；旧版本取不到就当活着（保持
+        原行为），探测本身抛错则视为不可用。
+        """
+        probe = getattr(browser, "is_connected", None)
+        if probe is None:
+            return True
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001 - 探测失败＝不可用
+            return False
+
     def _ensure_browser(self) -> None:
-        if self._browser is not None:
+        if self._browser is not None and self._alive(self._browser):
             return
+        if self._browser is not None:
+            # 浏览器进程死了（崩过 / OOM / 被 kill），而对象还在：`new_context` 会
+            # 一直抛 TargetClosedError，池子永远补不满、服务静默瘫痪。node-064 实测
+            # 就是这样挂的（21 个身份全退休、ready 归零、每秒一条 mint failed，
+            # 而 systemd 看进程还是 active）。拆掉重开，别拿着尸体继续开会话。
+            self.close()
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:  # pragma: no cover - environment dependent
