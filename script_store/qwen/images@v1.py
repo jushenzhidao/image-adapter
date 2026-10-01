@@ -1695,6 +1695,10 @@ def _diagnose(text):
     is a generation that got cut. "no image URL" alone names none of them.
     """
     low = text.lower()
+    if "502 bad gateway" in low and "<center>alb" in low:
+        # 来自 qwen-service 的两小时误诊教训（2026-10-01）：alb 502 多半不是上游故障，
+        # 而是路径打错 —— auth 域端点含 /api 前缀（AUTH_BASE 已含），拼 origin 会脱轨。
+        return "alb 502 —— 先查 URL 是否丢了 /api 前缀（auth 域未路由路径一律 502），再查上游"
     if ("aliyun_waf" in low or "<!doctype" in low
             or "滑动验证" in text or "captcha" in low):
         return "WAF 拦截（HTML 验证页）—— 反爬头/凭据需重抓"
