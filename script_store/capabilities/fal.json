@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "vendor": "fal",
+  "verified_at": "2026-10-09",
+  "verified_against": "fal.run 真实流量实测（2026-10-09，FAL_KEY 实跑 7 发计费 + 多发零消耗探针，经本适配器引擎全链路）＋ fal.ai 官方 /api 文档。文档与实测的偏差以实测为准，见 resolution_notes。",
+  "shared": {
+    "sync": true,
+    "wire": "POST https://fal.run/<endpoint-id>（Direct Run 模式：连接阻塞到出图，无任务 id、无轮询；队列模式 queue.fal.run 本渠道不用）",
+    "auth": "Authorization: Key <FAL_KEY>（字面 Key 前缀，非 Bearer；渠道用 X-Auth-Emit: header:Authorization:Key 发出。实测：错 key 401、正确 key 过鉴权；引擎把上游 401 映射为 400 upstream_http_error）",
+    "ops": ["text-to-image", "edit-image"],
+    "aspect_ratios": ["21:9", "2:1", "16:9", "3:2", "7:5", "4:3", "5:4", "1:1", "4:5", "3:4", "5:7", "2:3", "9:16", "1:2"],
+    "resolutions": ["768sq", "1k", "2k", "4k"],
+    "resolution_notes": "文档枚举含 512sq/768sq；实测 **512sq 被上游 422 拒**（input_value_error，loc=[body] 粗拒无字段细节），768sq/1k 实测 200。512sq 已从脚本推导表移除、显式 512sq 自动升 768sq。",
+    "tier_semantics": "档位＝像素预算而非画布承诺：实测 768sq（未指定 aspect_ratio）出 1024x576、1k+1:1 出 1024x1024——形状由 aspect_ratio 决定（默认 auto 在 t2i 无参考图时由上游自选）",
+    "latency": "实测 768sq/1k 单发 24~63s（edit 带参考图偏慢，63s）；4k 档未测（文档 'can take several minutes'，会撞 UPSTREAM_TIMEOUT=360s）",
+    "output": {
+      "envelope": "{\"images\": [{url, content_type, file_name, file_size, width, height}]}",
+      "notes": "实测：无 created（脚本本地时钟补）；t2i 响应**无 seed 字段**（文档未列，实测确认）；**file_size 实测为 null**（文档说 integer）；sync_mode=true 实测 images[].url 为 data URI ✓（image/jpeg 前缀完整、~230KB jpeg 解码正常）",
+      "default_url": "默认（无 sync_mode）返回 v3b.fal.media CDN 链接，实测可下载（482KB jpeg，HTTP 200）"
+    },
+    "accepts": ["prompt", "size", "response_format"],
+    "ignores": ["n", "quality", "style", "mask", "watermark"],
+    "limits": {
+      "edit_references": "image_urls 最多 10 张（脚本提前 400）；每张 ≥256px/边 且 ≤4MP（文档值，未实测边界）；URL 与 data URI 双实测通过（fal 拉 v3b.fal.media 自家链接 63s 出图、内联 data URI 36s 出图）；双参考图数组实测通过",
+      "gate_semantics": "canonical 门面把 image 的 null/[] 剥为「无图」→ image:[] 按契约走 text-to-image（实测确认），脚本永远见不到空列表",
+      "error_shape": "应用层拒绝是粗粒度 422 {detail:[{loc:[body], type:input_value_error}]}，**无字段细节**；pydantic 层错误才带 loc（如缺 prompt）。引擎不透传上游错误体（tencent_ci §K 同款已知缺口），表现为 400 upstream_http_error"
+    }
+  },
+  "models": {
+    "blackforestlabs/flux-3/text-to-image": {
+      "kind": "generate",
+      "tiers": ["768sq", "1k", "2k", "4k"],
+      "wide": true,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "size", "response_format"],
+      "ignores": ["n", "quality", "style", "mask", "watermark"],
+      "required": ["prompt"]
+    },
+    "blackforestlabs/flux-3/edit-image": {
+      "kind": "generate",
+      "tiers": ["768sq", "1k", "2k", "4k"],
+      "wide": true,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "image", "size", "response_format"],
+      "ignores": ["n", "quality", "style", "mask", "watermark"],
+      "required": ["prompt", "image_urls"]
+    }
+  },
+  "field_notes": {
+    "models": "键即 fal 完整 endpoint id（fal 按「app/操作」拆端点，与 ark 单端点带 image 字段不同）。脚本按请求有无 image 切末段：text-to-image ↔ edit-image（**双端点切换实测通过**）。渠道 base 也可配裸 app 路径（自动补后缀）。X-Model-Map 的值用完整 endpoint id（如 fal-ai/flux-pro/v1.1-ultra），generate 侧原样使用；edit 侧按后缀约定换末段，映射值末段不含标准后缀时 edit 请求 400 channel_config_error（不猜路径）。",
+    "aspect_ratios": "文档枚举（无 auto——auto 语义是「跟随第一张参考图」，t2i 无参考图时上游自选画布，实测 768sq+auto → 1024x576）。脚本从 size WxH 取最近邻枚举（平局按文档顺序）。",
+    "resolutions": "实测可用档（512sq 被上游拒，见 resolution_notes）。脚本按 size 长边选档：≤768→768sq、≤1536→1k、≤3072→2k、其余 4k。4k 档受 UPSTREAM_TIMEOUT 约束（limits.latency）。",
+    "sync_mode": "**实测确认**：sync_mode=true → images[].url 为 data URI（jpeg base64 完整可解码）；默认不发生成 data URI。response_format=b64_json ⇒ 脚本强制 sync_mode=true 并把 data URI 解成裸 b64_json（**全链路实测通过**：b64 解码 232KB jpeg 正常）。",
+    "accepts": "accepts/ignores 只列 canonical 门字段；fal 自有可选参数（safety_tolerance 0-4、enable_prompt_expansion、output_format jpeg/png、version）由脚本白名单透传。",
+    "verified_by_traffic": "2026-10-09 实测清单：①401/422/4xx 错误映射 ②脚本守卫（edit 无 prompt、>10 张）③t2i 默认 url 直通 + fal.media 可下载 ④t2i b64_json→sync_mode→data URI→b64_json ⑤edit URL 参考图 ⑥edit data URI 参考图 ⑦edit 双参考图数组。未实测：2k/4k 档、safety_tolerance/enable_prompt_expansion/version 透传、4MP/256px 边界、fal.media 链接寿命、rehost_url 路径（测试部署无对象存储）。"
+  }
+}
