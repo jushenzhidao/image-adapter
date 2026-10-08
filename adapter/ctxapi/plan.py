@@ -76,6 +76,12 @@ class RequestPlan:
     raw: bytes | None = None
     files: dict[str, list[FilePart]] | None = None
     timeout: float | None = None
+    #: When set, the script has already produced the artefact locally and no
+    #: upstream call is made at all: the engine hands these bytes to the
+    #: response phase exactly as if the vendor had sent them. The one
+    #: spelling of "this request needs no vendor" -- a size target the input
+    #: already satisfies, for instance -- without spending a billable call.
+    local_result: bytes | None = None
 
 
 class PlanMixin(CtxMixin):
@@ -99,6 +105,7 @@ class PlanMixin(CtxMixin):
         raw: bytes | None = None,
         files: dict[str, Any] | None = None,
         timeout: float | None = None,
+        local_result: bytes | None = None,
     ) -> None:
         """Declares outbound-call overrides from the request phase.
 
@@ -109,6 +116,14 @@ class PlanMixin(CtxMixin):
 
         ``files`` switches the call to multipart/form-data: the dict returned
         by transform() becomes its text parts and ``files`` its binary ones.
+
+        ``local_result`` short-circuits the vendor entirely: no socket is
+        opened and nothing is billed -- the engine hands these bytes to the
+        response phase as if the upstream had answered with them. For the
+        request a script can already satisfy locally (a size target the
+        input meets, say). It replaces every other outbound override: a
+        script emitting it should not also emit url/query/headers for a call
+        that will never happen.
         """
         plan = self.plan
         if url is not None:
@@ -130,3 +145,9 @@ class PlanMixin(CtxMixin):
             plan.files = _normalise_files(files)
         if timeout is not None:
             plan.timeout = float(timeout)
+        if local_result is not None:
+            if not isinstance(local_result, _BYTES_LIKE):
+                raise TypeError(
+                    f"local_result must be bytes, got {type(local_result).__name__}"
+                )
+            plan.local_result = bytes(local_result)

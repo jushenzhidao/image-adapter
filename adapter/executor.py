@@ -355,40 +355,62 @@ async def execute(
             script, ctx, client_payload, PHASE_REQUEST, settings.script_timeout
         )
 
-        try:
-            reply = await _do_upstream(
-                ctx, channel, settings, upstream_body, budget=budget, stage=stage
-            )
-        except UpstreamError as exc:
-            if not _request_was_refused(exc.upstream_status):
-                raise
-            # One more request phase, so the script can answer the failure
-            # itself -- it is the side that knows its vendor and can read the
-            # error text. The engine hands over the failure and nothing else.
-            ctx.upstream_error = {
-                "message": exc.message,
-                "upstream_status": exc.upstream_status,
-            }
-            # Whatever the failed attempt emitted is stale; this attempt emits
-            # what it needs. `reset_plan` only drops outbound overrides, so
-            # there is nothing else to rewind.
-            ctx.reset_plan()
-            retried_body = await _call_phase(
-                script, ctx, client_payload, PHASE_REQUEST, settings.script_timeout
-            )
-            if retried_body == upstream_body:
-                # Nothing changed, so a second call would buy the same refusal.
-                # This is what makes the offer free for every script -- one
-                # pinned to a version from before this existed included -- and
-                # therefore what lets it happen without asking anyone first.
-                raise
-            # Exactly one more upstream call, never a loop: a second failure is
-            # reported as itself. `upstream_retried` on the span, and
-            # `phase_calls["request"] == 2`, are the evidence it happened.
-            span.set_attribute("upstream_retried", True)
-            reply = await _do_upstream(
-                ctx, channel, settings, retried_body, budget=budget, stage=stage
-            )
+        local_result = ctx.plan.local_result
+        if local_result is not None:
+            # The script answered locally: these bytes ARE the artefact, so
+            # no socket is opened and no vendor is billed. The response
+            # phase receives them exactly as if the upstream had sent them
+            # -- the reply is built to be indistinguishable from a 200 with
+            # a non-JSON body, which is what a byte-artefact upstream is.
+            # Job-based upstreams have nothing to short-circuit into: a
+            # poll loop fed a fabricated reply would ask the script to poll
+            # a job that was never created, so the mismatch is refused
+            # before anything runs.
+            if channel.async_spec.enabled:
+                raise ChannelConfigError(
+                    "X-Async cannot be combined with a local result: there "
+                    "is no upstream job to poll when the script produced "
+                    "the artefact itself",
+                    "X-Async",
+                )
+            reply = UpstreamReply(status=200, raw=local_result, headers={})
+            span.set_attribute("upstream_skipped", True)
+            span.set_attribute("local_result_bytes", len(local_result))
+        else:
+            try:
+                reply = await _do_upstream(
+                    ctx, channel, settings, upstream_body, budget=budget, stage=stage
+                )
+            except UpstreamError as exc:
+                if not _request_was_refused(exc.upstream_status):
+                    raise
+                # One more request phase, so the script can answer the failure
+                # itself -- it is the side that knows its vendor and can read the
+                # error text. The engine hands over the failure and nothing else.
+                ctx.upstream_error = {
+                    "message": exc.message,
+                    "upstream_status": exc.upstream_status,
+                }
+                # Whatever the failed attempt emitted is stale; this attempt emits
+                # what it needs. `reset_plan` only drops outbound overrides, so
+                # there is nothing else to rewind.
+                ctx.reset_plan()
+                retried_body = await _call_phase(
+                    script, ctx, client_payload, PHASE_REQUEST, settings.script_timeout
+                )
+                if retried_body == upstream_body:
+                    # Nothing changed, so a second call would buy the same refusal.
+                    # This is what makes the offer free for every script -- one
+                    # pinned to a version from before this existed included -- and
+                    # therefore what lets it happen without asking anyone first.
+                    raise
+                # Exactly one more upstream call, never a loop: a second failure is
+                # reported as itself. `upstream_retried` on the span, and
+                # `phase_calls["request"] == 2`, are the evidence it happened.
+                span.set_attribute("upstream_retried", True)
+                reply = await _do_upstream(
+                    ctx, channel, settings, retried_body, budget=budget, stage=stage
+                )
 
         # X-Async is the control plane asserting this upstream is job-based, so
         # the paired script must handle both poll phases.
