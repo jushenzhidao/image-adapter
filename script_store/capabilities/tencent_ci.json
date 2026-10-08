@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "vendor": "tencent_ci",
+  "verified_at": "2026-10-08",
+  "verified_against": "端到端实测 ap-singapore 桶 agi-1436636638（64×64 → 128×128，magnify=2，1.0s，HTTP 200）＋ 文档 83793 · 106750 · 79735 · 106751 · 36620（使用限制）",
+  "shared": {
+    "ops": ["AISuperResolution", "AIPicMatting", "GoodsMatting", "AIPortraitMatting"],
+    "sync": true,
+    "wire": "GET /?ci-process=<op>&detect-url=<urlencoded>（或 ObjectKey 模式 GET /<key>?ci-process=<op>）→ 响应体直接回处理后的图片字节（下载时处理；桶仅作 API 入口，须已绑定数据万象）",
+    "input_limits": {
+      "formats": ["png", "jpeg", "jpg"],
+      "max_bytes": "10MB",
+      "AISuperResolution": "32x32 ~ 1920x1920",
+      "matting": "32x32 ~ 7680x4320",
+      "note": "出界一律报 400 ImageTooLarge（措辞误导：实为尺寸出界；实测 4x4 与 2048/4096/8192 均触发，magnify=1 也拦）。输出侧无上限拦截：实测 1920+m4 → 7680×7680（24.7MB PNG、8.2s）成功。耗时随输出面积：64px 1.1s → 7680px 8.2s"
+    },
+    "accepts": ["image", "response_format"],
+    "ignores": ["prompt", "n", "size", "quality", "style", "mask", "watermark"]
+  },
+  "models": {
+    "AISuperResolution": {
+      "kind": "enhance",
+      "tiers": [],
+      "wide": false,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["image", "response_format", "magnify", "size"],
+      "ignores": ["prompt", "n", "quality", "style", "mask", "watermark", "center-layout", "padding-layout"]
+    },
+    "AIPicMatting": {
+      "kind": "matting",
+      "tiers": [],
+      "wide": false,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["image", "response_format", "center-layout", "padding-layout"],
+      "ignores": ["prompt", "n", "size", "quality", "style", "mask", "watermark", "magnify"]
+    },
+    "GoodsMatting": {
+      "kind": "matting",
+      "tiers": [],
+      "wide": false,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["image", "response_format", "center-layout", "padding-layout"],
+      "ignores": ["prompt", "n", "size", "quality", "style", "mask", "watermark", "magnify"]
+    },
+    "AIPortraitMatting": {
+      "kind": "matting",
+      "tiers": [],
+      "wide": false,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["image", "response_format", "center-layout", "padding-layout"],
+      "ignores": ["prompt", "n", "size", "quality", "style", "mask", "watermark", "magnify"]
+    }
+  },
+  "field_notes": {
+    "models": "键即数据万象 ci-process 操作名（脚本按它选操作）：AISuperResolution=图像超分(460/83793)、AIPicMatting=通用抠图(460/106750)、GoodsMatting=商品抠图(460/79735)、AIPortraitMatting=人像抠图(460/106751)。一个桶域名一个脚本承载全部四个操作；X-Model-Map 的值必须逐字等于这里的键。",
+    "ops": "操作名白名单。客户端 model 原文命中白名单也可直用（免映射）；都没有则脚本 400 channel_config_error，无静默默认。",
+    "wire": "三种处理方式只接「下载时处理（detect-url）」：结果直接回响应体、不落桶；detect-url 须为公网可取 URL，内联图由适配器先转存自己的对象存储（无存储则 503）。ObjectKey 模式（图已在桶内）等价可用。",
+    "input_limits": "实测+文档（460/36620）：超分 [32x32, 1920x1920]、抠图 [32x32, 7680x4320]，均 ≤10MB、仅 PNG/JPEG/JPG；默认并发超分 2QPS、抠图 5QPS。出界上游报 ImageTooLarge（勿按字面理解）。**脚本已做自动转换**：超上限的输入自动等比缩到 ≤ 上限（URL 输入被缩后 detect-url 换成转存链接）；拒的只有修不了的：短边 <32、非 PNG/JPEG（此二者上游报错无详情）。输出侧无上限拦截：实测 1920+m4 → 7680×7680（24.7MB PNG、8.2s）成功。耗时随输出面积：64px 1.1s → 7680px 8.2s",
+    "size": "仅超分：期望的输出边长。档位 \"1k/2k/4k/8k\"（1024/2048/4096/8192）或 \"WxH\"（取长边）。脚本从 {1,2,4} 里选「输入边长×m 最接近目标」的档（并列取小；输入已达目标 → m=1 只做清晰度增强）。显式 body magnify > size 推导 > X-Channel-Options.magnify > 默认 2。matting 不认识 size（上游无缩放语义）",
+    "magnify": "放大倍数 {1,2,4}，默认 2；1＝只做清晰度增强、不改分辨率。请求体 magnify > X-Channel-Options.magnify > 2。仅超分操作接受。实测 64x64 + magnify=2 → 128x128。",
+    "center-layout": "抠图主体居中 {0,1}，默认 0。仅三种抠图接受。",
+    "padding-layout": "抠图四边留白 \"<dx>x<dy>\"（像素，单边 ≤1000），默认不留白。仅三种抠图接受。"
+  }
+}

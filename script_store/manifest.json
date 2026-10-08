@@ -44,6 +44,15 @@
       "digests": {
         "v1": "84ae15056df3798ff0aa4adbba6dde62f2a0c8b3e20dda16d0793bef61d86f5e"
       }
+    },
+    "tencent_ci/images": {
+      "latest": "v1",
+      "aliases": {
+        "stable": "v1"
+      },
+      "digests": {
+        "v1": "1c84556d1fa3d5e06afd02e73b3c3fb7c79a0ef717636a42410ff1be903a9982"
+      }
     }
   }
 }
