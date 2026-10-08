@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 
 import aiohttp
 
@@ -29,6 +30,8 @@ from adapter.trace_attrs import URL_LIMIT, span_elapsed_ms
 from adapter.urlguard import check_url
 
 _CHUNK = 65536
+
+logger = logging.getLogger(__name__)
 
 
 class ImageRefMixin(NeedsCodec, NeedsStorage):
@@ -70,7 +73,20 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
         with self.logfire.span(
             "download_image", url=safe_url[:URL_LIMIT]
         ) as span, span_elapsed_ms(span):
-            cached = await self.cache.get(cache_key)
+            try:
+                cached = await self.cache.get(cache_key)
+            except Exception as exc:  # noqa: BLE001 - the cache is an accelerator
+                # A dead Redis must not turn every URL reference into a 500:
+                # the fetch below works without the cache, so a cache failure
+                # degrades to "no cache" -- the same posture that lets a dead
+                # object store degrade to a data URI. CancelledError is a
+                # BaseException and passes through untouched, so the phase
+                # cap keeps working.
+                span.set_attribute("cache_error", type(exc).__name__)
+                logger.warning(
+                    "image cache read failed (%s); fetching without cache", exc
+                )
+                cached = None
             if cached:
                 span.set_attribute("cache_hit", True)
                 span.set_attribute("size_bytes", len(cached))
@@ -86,7 +102,14 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
                 raise
             span.set_attribute("size_bytes", len(data))
             span.set_attribute("outcome", "ok")
-            await self.cache.set(cache_key, data, ex=self.settings.img_cache_ttl)
+            try:
+                await self.cache.set(
+                    cache_key, data, ex=self.settings.img_cache_ttl
+                )
+            except Exception as exc:  # noqa: BLE001 - a failed write must not
+                # fail a download that already succeeded
+                span.set_attribute("cache_write_error", type(exc).__name__)
+                logger.warning("image cache write failed (%s); skipping", exc)
             return data
 
     async def _fetch_capped(self, safe_url: str) -> bytes:

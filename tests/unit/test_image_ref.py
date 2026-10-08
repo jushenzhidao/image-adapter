@@ -160,6 +160,53 @@ async def test_download_image_leaves_http_urls_to_the_ssrf_guard(monkeypatch):
     assert excinfo.value is reached
 
 
+# The TTL cache is an accelerator, not a dependency: a dead Redis degrades to
+# a plain fetch (and a skipped write), the same way a dead object store
+# degrades to a data URI. Before the guard, one unreachable Redis turned
+# every URL reference into a 500.
+
+
+class _DeadCache:
+    """Every cache operation fails the way an unreachable Redis does."""
+
+    async def get(self, key):
+        raise ConnectionError("redis is down")
+
+    async def set(self, key, value, ex=None):
+        raise ConnectionError("redis is down")
+
+
+@pytest.mark.asyncio
+async def test_a_dead_cache_read_degrades_to_a_plain_fetch(monkeypatch, caplog):
+    ctx = _ctx()
+    monkeypatch.setattr(ctx, "_cache", _DeadCache())
+    fetched: list[str] = []
+
+    async def fake_fetch(url: str) -> bytes:
+        fetched.append(url)
+        return PNG
+
+    monkeypatch.setattr(ctx, "_fetch_capped", fake_fetch)
+    data = await ctx.download_image("https://cdn.example/a.png")
+
+    assert data == PNG
+    assert fetched == ["https://cdn.example/a.png"]
+    assert any("image cache read failed" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_dead_cache_write_does_not_fail_the_download(monkeypatch):
+    ctx = _ctx()
+    monkeypatch.setattr(ctx, "_cache", _DeadCache())
+
+    async def fake_fetch(url: str) -> bytes:
+        return PNG
+
+    monkeypatch.setattr(ctx, "_fetch_capped", fake_fetch)
+    # The download already succeeded; the failed write must not raise.
+    assert await ctx.download_image("https://cdn.example/a.png") == PNG
+
+
 # `compress_image` is the bytes-out counterpart of `image_url`: a script that
 # needs a smaller reference should not have to know which of the three shapes
 # it arrived in, nor call the codec helpers in the right order. What it must
