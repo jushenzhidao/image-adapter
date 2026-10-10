@@ -62,6 +62,15 @@
       "digests": {
         "v1": "6db9d33f9c546ec23fdf26abef5549fc856eb93f14c0d878b881d951d7d01b7f"
       }
+    },
+    "senseaudio/images": {
+      "latest": "v1",
+      "aliases": {
+        "stable": "v1"
+      },
+      "digests": {
+        "v1": "426f648e723c296dc3d71fc0274af919dd8d9dc6061019cb7cbaa4f33b4ee1c3"
+      }
     }
   }
 }

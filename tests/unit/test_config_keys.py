@@ -31,6 +31,11 @@ ALLOWED_NON_FIELDS = {
     # Consumed by a human running curl against the vendor directly; the
     # adapter never reads upstream credentials from the environment.
     "VOLCENGINE_ARK_API_KEY",
+    # tencent_ci credentials (SecretId|SecretKey): the script computes COS
+    # signatures from the channel's Authorization header, so the adapter
+    # never reads this either -- it documents the credential the control
+    # plane needs when building the channel, same standing as the ark key.
+    "TENCENT_API_KEY",
     # Read by gunicorn.conf.py at process start, not by the adapter. These
     # tune the WSGI/ASGI supervisor (worker count, watchdog), which is a
     # deployment concern that never reaches application settings.

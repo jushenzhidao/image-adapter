@@ -35,3 +35,6 @@ reports/
 .idea/
 .vscode/
 .DS_Store
+
+# 测试产物归档目录（渠道实测图），仅本地留存
+outputs/

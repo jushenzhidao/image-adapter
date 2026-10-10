@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "vendor": "senseaudio",
+  "verified_at": "2026-10-10",
+  "verified_against": "api.senseaudio.cn 真实流量实测（2026-10-10：7+31 发计费生成，输出逐张验尺寸）＋ docs.senseaudio.cn 官方文档。文档与实测的偏差以实测为准，见 resolution_notes。",
+  "shared": {
+    "sync": true,
+    "wire": "POST https://api.senseaudio.cn/v1/image/sync（同步直返 url，连接阻塞到出图；平台另有 /v1/image/async + GET /v1/image/pending 异步孪生，本渠道不用）",
+    "auth": "Authorization: Bearer <SENSEAUDIO_API_KEY>（标准 Bearer，引擎默认即正确，无需 X-Auth-Emit。空 body 探针：400 {\"code\":\"invalid\"} 而非 401 ⇒ 鉴权先于参数校验）",
+    "ops": ["text-to-image", "reference-guided generation（单端点，wire 字段 reference 区分，同 ark 家族）"],
+    "reference": "reference 是**单字符串**（URL 或 data URI，文档明说双支持）；canonical image 数组由脚本折叠，>1 张提前 400（上游无列表可落）。⚠️ **文档「size 不传参考图时必填」的暗示读法被实测推翻（2026-10-10）**：带 reference 不带 size 也是 400「参数错误：size」⇒ size 恒必填，脚本对缺失/垃圾 size 兜底该模型表内最小像素项（四门折叠中 chat/responses/edits 不携带 size，无兜底则三门全废）",
+    "sizes": "每模型固定 WxH 枚举表，表外上游 400（引擎不透传 body ⇒ caller 只见 upstream_http_error，脚本做最近邻修复：表内精确 > 同比例面积最近 > log 几何距离）。**档位词支持：size 可传 1K/2K/4K（大小写不敏感）→ 长边最接近 K*1024 的表项（形状盲，绕过比例规则）**，实测 seedream 4K → 4096x2304",
+    "size_tables": {
+      "senseaudio-image-2.0-260319": "≤1.5K 档（w*h≤3M，15 个）+ 2K 档（6 个），计费分档 0.5/0.8 元每张",
+      "doubao-seedream-5-0-260128": "16 个，4M~9.5M px，计费不按分辨率（0.22 元/张）",
+      "sensenova-u1-fast": "11 个（4.1M~6.4M px）；**上游 502 不可用**，表保留待恢复"
+    },
+    "latency": "实测（全表扫描 2026-10-10）：image-2.0 21 尺寸 27~44s（2K 档偏慢 ~40s）；seedream 16 尺寸 9~20s；UPSTREAM_TIMEOUT=360s 余量充足",
+    "output": {
+      "envelope": "{\"url\": \"<string>\"}（极简：无 data[] 包裹、无 b64 选项、无 seed 回传、无 revised_prompt）",
+      "url_shape": "https://dynamic.senseaudio.cn/image/<uuid>：阿里云 OSS+CDN（x-oss-cdn-auth: success、有 version-id），**无签名参数、无 Expires** ⇒ 非短期签名链接（不同于 ark 24h / qwen 死链族）；content-type 恒 image/jpeg（URL 无扩展名）。平台清理策略未公开 ⇒ rehost_url 仍是耐久性诉求的杠杆"
+    },
+    "accepts": ["prompt", "size", "reference", "seed"],
+    "ignores": ["n", "response_format", "quality", "style", "mask", "watermark"],
+    "limits": {
+      "prompt_budget": "6000 码位（image-2.0）/ 2000 码位（其余两模型），上游执行，脚本不数",
+      "error_shape": "参数校验 400 = {\"code\":\"invalid\"}（无字段细节）；上游错误 = {\"code\":\"upstream_model_not_found\",\"message\":\"...\",\"ref_code\":502101}。引擎不透传上游 body（fal §同款已知缺口）⇒ 脚本提前 fail 命名字段是 caller 唯一能读到解释的地方"
+    },
+    "billing": "Image-2.0 ≤1.5K 0.5 元/张、2K 0.8 元/张；seedream 0.22 元/张；u1-fast 0.5 元/张。积分→代金券→现金三级抵扣（1 元 = 5000 积分）"
+  },
+  "models": {
+    "senseaudio-image-2.0-260319": {
+      "kind": "generate",
+      "sizes": ["1024x1024", "1024x1280", "1280x1024", "1536x864", "864x1536", "1024x1536", "1536x1024", "2016x864", "864x2016", "2048x1024", "1024x2048", "2048x1152", "1152x2048", "2048x1360", "1360x2048", "2688x1152", "1536x2048", "2048x1536", "2688x1344", "1344x2688", "3136x1344"],
+      "prompt_max_codepoints": 6000,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "size", "reference", "seed"],
+      "required": ["prompt", "size（无 reference 时）"],
+      "verified": "1024x1024 实测 200（26.5s，输出 1024x1024 jpeg 精确匹配）；其余 20 尺寸 2026-10-10 全表扫描（见 verified_by_traffic）"
+    },
+    "doubao-seedream-5-0-260128": {
+      "kind": "generate",
+      "sizes": ["2304x1728", "1728x2304", "2496x1664", "1664x2496", "2048x2048", "3136x1344", "2848x1600", "1600x2848", "3456x2592", "2592x3456", "2496x3744", "3744x2496", "4096x2304", "2304x4096", "3072x3072", "4704x2016"],
+      "prompt_max_codepoints": 2000,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "size", "reference", "seed"],
+      "required": ["prompt", "size（无 reference 时）"],
+      "fold": "脚本内置 doubao-seedream-* 前缀折叠到本模型（平台唯一 seedream；new-api 侧历史名免配 X-Model-Map）",
+      "verified": "6 尺寸逐张实测（2304x1728/2048x2048/3136x1344/3456x2592/4096x2304/4704x2016，输出全部精确匹配）；其余 10 尺寸 2026-10-10 全表扫描"
+    },
+    "sensenova-u1-fast": {
+      "kind": "generate",
+      "sizes": ["1664x2496", "2496x1664", "1760x2368", "2368x1760", "1824x2272", "2272x1824", "2048x2048", "2752x1536", "1536x2752", "3072x1376", "1344x3136"],
+      "prompt_max_codepoints": 2000,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "size", "reference", "seed"],
+      "required": ["prompt", "size（无 reference 时）"],
+      "verified": "**不可用**：2026-10-10 三发（1664x2496 / 2048x2048 x2）均 502 {code: upstream_model_not_found, ref_code: 502101}，0.3~0.7s 秒回，换尺寸无效 ⇒ 平台列了模型但上游没接好。尺寸表照放，恢复后免改脚本"
+    }
+  },
+  "field_notes": {
+    "models": "wire model 恒必填。优先级：X-Model-Map 命中（显式运营决策，原样用、不二次回退）> 三已知模型原样 > **其余一切（未知名/seedream 前缀变体/裸名/缺失）回退 doubao-seedream-5-0-260128**——未知名打上游只买得到引擎不透传 body 的 502，打 seedream 买得到图（最便宜且全表验证）。size 修复按回退后的模型表走；仅 mapped 值无表时不修复原样透传",
+    "sizes": "脚本修复规则（bfl 传统，意图保真序）：表内精确直通；同比例（整数交叉相乘判等，零浮点误差）选面积最近；无同比例取 log 空间几何距离最近。1024x1024 打 seedream → 2048x2048（保方形，不落 2304x1728）。垃圾 size：有 reference 时静默丢弃（上游自推导）；无 reference 时提前 400 param=size（上游 400 无细节，白花一发）",
+    "reference": "未实测计费验证（验证期只测了文生图）；透传逻辑按文档契约实现。>1 张参考图提前 400 param=image",
+    "seed": "仅真 int 透传；bool 是 Python int 子类，视为 typo 丢弃不发（上游会读成 1）",
+    "verified_by_traffic": "2026-10-10 实测清单：①image-2.0 全表 21 尺寸 + seedream 全表 16 尺寸（7 发先测 + 31 发扫描）产物逐张 sips 验尺寸、31/31 精确匹配 ②u1-fast 三发三尺寸均 502（upstream_model_not_found / ref_code 502101）→ 经引擎映射 502 upstream_http_error ③空 body 400 invalid 探针 ④CDN URL 无鉴权可拉。**全形态引擎冒烟（TestClient + 真上游，13 发计费）**：reference URL（无 size 兜底 2304x1728 ✓）/ reference data URI ✓ / b64_json（data[0].b64_json ✓）/ rehost_url（落自家存储 ✓）/ edits multipart ✓ / chat 门（finish_reason=stop，URL 嵌 content ✓）/ responses 门 ✓ / 档位词 4K → 4096x2304 ✓ / 无 size 文生图兜底 ✓ / 多 reference 400 param=image ✓ / 空 prompt 门面 400 ✓。未实测：seed 参数、2 张以上 reference 的上游行为（脚本已在 1 张上限内截停）"
+  }
+}
