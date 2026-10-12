@@ -360,3 +360,32 @@ class ImageRefMixin(NeedsCodec, NeedsStorage):
             fmt=fmt,
             quality=quality,
         )
+
+    async def merge_images(
+        self,
+        refs: list[str],
+        *,
+        cell_edge: int = 1024,
+        gap: int = 8,
+        fmt: str = "jpeg",
+        quality: int | None = None,
+    ) -> bytes:
+        """Any mix of the three reference shapes -> one contact sheet, bytes.
+
+        The reference-shaped twin of ``compress_image``: each entry goes
+        through ``image_bytes`` (URL fetch, data-URI decode, bare-base64
+        decode -- the same normalisation every single reference gets), then
+        the decoded set is laid out by ``ctx.image.merge``. The mechanism
+        does the pixels; the script decides that a multi-reference request
+        is worth one sheet, and what its cells should look like.
+        """
+        datas = []
+        for ref in refs:
+            datas.append(await self.image_bytes(ref))
+        return await self.image.merge(
+            datas,
+            cell_edge=cell_edge,
+            gap=gap,
+            fmt=fmt,
+            quality=quality,
+        )

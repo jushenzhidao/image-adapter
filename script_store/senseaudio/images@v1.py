@@ -18,10 +18,15 @@ One endpoint, two modes
 Like ark (and unlike fal), generation and edit share one endpoint: a request
 carrying `image` is a reference-guided generation, everything else is
 text-to-image. The wire field is `reference` -- a *single string*, URL or
-data URI -- so the canonical list collapses to its first entry, and more
-than one reference is refused here with the count named: the upstream has no
-list to truncate into, and silently dropping references is exactly the
-failure this adapter refuses to dress up as success.
+data URI -- so canonical lists beyond one entry are **merged into a contact
+sheet** and sent as that one string: each reference is downloaded and
+decoded through the engine's normal reference path, laid out on a white
+grid (`ctx.image.merge`, one 1024px cell per image), and the sheet rides as
+a data URI. The upstream sees one picture -- the sheet -- and the caller
+keeps every reference they sent, which beats refusing a request the
+composition could have honoured. Nine is the merge ceiling (a 3x3 grid);
+beyond it the request is refused with the count named. A single reference
+rides through untouched -- re-encoding one image buys nothing.
 
 Models
 ------
@@ -132,6 +137,10 @@ import time
 
 #: `doubao-seedream-*` folds here -- the platform's only seedream model.
 SEEDREAM_CANONICAL = "doubao-seedream-5-0-260128"
+
+#: Merge ceiling for multi-reference requests: a 3x3 contact sheet. Beyond
+#: this the sheet stops being a reference and the request is refused.
+MAX_MERGE_REFS = 9
 
 #: Size tables per model, document order (docs.senseaudio.cn, 2026-10-10).
 #: image-2.0 splits into a <=1.5K pricing tier (w*h <= 3_000_000) and a 2K
@@ -299,13 +308,13 @@ async def transform(ctx, payload, phase):
 
     image = payload.get("image")
     refs = image if isinstance(image, list) else ([image] if image else [])
-    if len(refs) > 1:
-        # The wire field is a single string; a list has no upstream meaning,
-        # and dropping the extras would pass off a different picture as the
-        # answer to the one the caller wrote.
+    if len(refs) > MAX_MERGE_REFS:
+        # The wire field is one string; the adapter's answer to several is a
+        # contact sheet, and a 3x3 grid is where a sheet stops being a useful
+        # reference. Refusing names the count instead of spending the request.
         ctx.fail(
-            "senseaudio accepts a single reference image, got "
-            f"{len(refs)}",
+            f"senseaudio takes one reference; the adapter merges up to "
+            f"{MAX_MERGE_REFS} into a contact sheet, got {len(refs)}",
             param="image",
         )
 
@@ -322,7 +331,14 @@ async def transform(ctx, payload, phase):
     if size is not None:
         body["size"] = size
     if refs:
-        body["reference"] = refs[0]
+        if len(refs) == 1:
+            body["reference"] = refs[0]
+        else:
+            # Several references, one wire slot: the contact sheet IS the
+            # reference. bytes-in/bytes-out stays on the engine side; the
+            # script only decides the sheet is worth sending.
+            merged = await ctx.merge_images(refs)
+            body["reference"] = ctx.data_uri(merged, "image/jpeg")
     seed = payload.get("seed")
     # `isinstance(True, int)` is True in Python; a boolean seed is a typo,
     # dropped rather than forwarded as 1.

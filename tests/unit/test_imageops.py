@@ -441,3 +441,70 @@ def test_compress_does_not_block_the_event_loop():
         return ticks
 
     assert asyncio.run(scenario()) > 0
+
+
+class TestMerge:
+    """The contact-sheet operator: grids, centring, budget, junk guards."""
+
+    def test_two_images_sit_side_by_side(self, ops):
+        sheet = run(ops.merge([png(400, 300), png(400, 300)], cell_edge=512, gap=8))
+        meta = run(ops.info(sheet))
+        # 2 cells across, one row: 512*2 + gap.
+        assert (meta["width"], meta["height"]) == (1032, 512)
+        assert meta["format"] == "JPEG"
+
+    def test_four_images_fill_a_square(self, ops):
+        sheet = run(ops.merge([png(100, 100)] * 4, cell_edge=256, gap=0))
+        meta = run(ops.info(sheet))
+        assert (meta["width"], meta["height"]) == (512, 512)
+
+    def test_three_images_fill_two_by_two_with_one_spare(self, ops):
+        # ceil(sqrt(3)) = 2 columns: the fourth cell stays white.
+        sheet = run(ops.merge([png(100, 100)] * 3, cell_edge=128, gap=0, fmt="png"))
+        meta = run(ops.info(sheet))
+        assert (meta["width"], meta["height"]) == (256, 256)
+        img = Image.open(io.BytesIO(sheet))
+        assert img.getpixel((64, 64)) == (10, 120, 200)      # cell (0,0)
+        assert img.getpixel((192, 64)) == (10, 120, 200)     # cell (0,1)
+        assert img.getpixel((64, 192)) == (10, 120, 200)     # cell (1,0)
+        assert img.getpixel((192, 192)) == (255, 255, 255)   # spare cell
+
+    def test_source_is_thumbnail_never_upscaled(self, ops):
+        # A 64px source in a 256px cell stays 64px: thumbnail, not resize.
+        # PNG output so the pixel probes are exact (JPEG shifts colours).
+        sheet = run(ops.merge([png(64, 64)], cell_edge=256, gap=0, fmt="png"))
+        meta = run(ops.info(sheet))
+        assert (meta["width"], meta["height"]) == (256, 256)
+        img = Image.open(io.BytesIO(sheet))
+        # Centre pixel belongs to the pasted thumbnail (blue), the cell
+        # margin stays white.
+        assert img.getpixel((128, 128)) == (10, 120, 200)
+        assert img.getpixel((4, 4)) == (255, 255, 255)
+
+    def test_aspect_ratio_is_kept_and_centred(self, ops):
+        sheet = run(ops.merge([png(400, 200)], cell_edge=256, gap=0, fmt="png"))
+        img = Image.open(io.BytesIO(sheet))
+        # 400x200 thumbnails to 256x128 inside a 256 cell, centred.
+        assert img.getpixel((128, 64)) == (10, 120, 200)
+        assert img.getpixel((128, 8)) == (255, 255, 255)
+        assert img.getpixel((128, 248)) == (255, 255, 255)
+
+    def test_empty_list_is_rejected(self, ops):
+        with pytest.raises(InvalidRequestError):
+            run(ops.merge([]))
+
+    def test_non_bytes_entry_is_rejected(self, ops):
+        with pytest.raises(InvalidRequestError):
+            run(ops.merge([png(10, 10), "not-bytes"]))
+
+    def test_canvas_budget_is_enforced(self, ops):
+        # settings cap is 1M px; a 1024-edge grid of 4 is 4.2M.
+        with pytest.raises(InvalidRequestError):
+            run(ops.merge([png(10, 10)] * 4, cell_edge=1024, gap=0))
+
+    def test_jpeg_quality_is_honoured(self, ops):
+        hi = run(ops.merge([png(400, 300)], cell_edge=512, gap=0, quality=95))
+        lo = run(ops.merge([png(400, 300)], cell_edge=512, gap=0, quality=40))
+        # Not a strict monotone guarantee across every input, but on flat
+        # solid colour higher quality clearly holds more detail.
+        assert len(hi) >= len(lo)

@@ -444,3 +444,89 @@ class ImageOps:
                 code="image_too_large",
             )
         return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+    async def merge(
+        self,
+        images: list[bytes],
+        *,
+        cell_edge: int = 1024,
+        gap: int = 8,
+        fmt: str = "jpeg",
+        quality: int | None = None,
+    ) -> bytes:
+        """Lays a list of images out on a white contact sheet, one cell each.
+
+        Each source is thumbnail'd inside a ``cell_edge`` square (aspect ratio
+        kept, never upscaled) and centred in its cell; the sheet is a grid of
+        ``ceil(sqrt(n))`` columns, so 2 images sit side by side and 4 fill a
+        square. This exists so a single-reference upstream can still take
+        several: the sheet is the reference. Like every operator here it is a
+        mechanism -- whether merging is the right answer for a channel, and
+        how many images are worth merging, is the script's call.
+
+        ``gap`` is the white gutter between cells; ``fmt``/``quality`` shape
+        the output exactly as ``convert`` does. The canvas is checked against
+        the pixel budget before allocation, so a huge ``cell_edge`` fails the
+        same way an oversized ``resize`` target does.
+
+        Raises ``InvalidRequestError`` for an empty list, a non-bytes entry,
+        unreadable bytes, or a canvas over the pixel limit.
+        """
+        if not isinstance(images, list) or not images:
+            _fail("merge needs a non-empty list of images")
+        self._check_positive_int("cell_edge", cell_edge)
+        # gap of 0 is legitimate -- seamless sheets are a real composition --
+        # so unlike cell_edge this is a non-negative check, not positive.
+        if not isinstance(gap, int) or isinstance(gap, bool) or gap < 0:
+            _fail("gap must be a non-negative integer")
+        if quality is not None:
+            self._check_quality(quality)
+        return await asyncio.to_thread(
+            self._do_merge, list(images), cell_edge, gap, fmt, quality
+        )
+
+    def _do_merge(
+        self,
+        images: list[bytes],
+        cell_edge: int,
+        gap: int,
+        fmt: str,
+        quality: int | None,
+    ) -> bytes:
+        from PIL import Image
+
+        cells = []
+        for i, data in enumerate(images):
+            if not isinstance(data, (bytes, bytearray)):
+                _fail(f"image {i} is not bytes")
+            img = self._open(bytes(data))
+            img = img.copy()
+            img.thumbnail((cell_edge, cell_edge), Image.LANCZOS)
+            cells.append(img)
+
+        count = len(cells)
+        # Standard grid: ceil(sqrt(n)) columns -- 2 sits side by side, 3-4
+        # fill a square, 9 makes 3x3. Integer ceil, no float slop.
+        cols = max(1, min(int(count ** 0.5 + 0.999), count))
+        rows = (count + cols - 1) // cols
+        width = cols * cell_edge + (cols - 1) * gap
+        height = rows * cell_edge + (rows - 1) * gap
+        if width * height > self._settings.max_image_pixels:
+            _fail(
+                f"Merged canvas {width}x{height} exceeds the "
+                f"{self._settings.max_image_pixels} pixel limit",
+                code="image_too_large",
+            )
+
+        canvas = Image.new("RGB", (width, height), (255, 255, 255))
+        for i, img in enumerate(cells):
+            row, col = divmod(i, cols)
+            x = col * (cell_edge + gap) + (cell_edge - img.width) // 2
+            y = row * (cell_edge + gap) + (cell_edge - img.height) // 2
+            canvas.paste(img, (x, y))
+
+        target = self._format_of(canvas, fmt)
+        params: dict[str, Any] = {}
+        if quality is not None and target in LOSSY_FORMATS:
+            params["quality"] = quality
+        return self._encode(canvas, target, **params)

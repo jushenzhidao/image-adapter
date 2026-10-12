@@ -86,6 +86,7 @@ class Recorder:
         self.uploads: list[bytes] = []
         self.rehosts: list[str] = []
         self.b64_fetches: list[str] = []
+        self.merges: list[list[str]] = []
 
     async def upload(self, data: bytes, ext: str = "png") -> str:
         self.uploads.append(data)
@@ -329,15 +330,35 @@ async def test_reference_rides_through_with_explicit_size(monkeypatch):
     assert body["size"] == "1024x1024"
 
 
-async def test_two_references_are_refused_not_truncated(monkeypatch):
-    # The wire field is a single string; dropping the second would pass off
-    # a different picture as the answer to the two the caller wrote.
+async def test_two_references_become_one_sheet(monkeypatch):
+    # The wire field is a single string; several canonical references are
+    # merged into one contact sheet and sent as a data URI -- every
+    # reference the caller sent survives, instead of a refusal or a silent
+    # drop. The merge happens engine-side; the script only decides to send.
+    ctx, spy = _ctx(monkeypatch)
+
+    async def fake_merge(refs, **kw):
+        spy.merges = [list(refs)]
+        spy.merge_kw = kw
+        return b"sheet-bytes"
+
+    monkeypatch.setattr(ctx, "merge_images", fake_merge)
+    body = await _request(ctx, {"model": IMAGE2, "prompt": "combine",
+                                "size": "1024x1024", "image": [REF, REF2]})
+    assert spy.merges == [[REF, REF2]]
+    assert body["reference"].startswith("data:image/jpeg;base64,")
+
+
+async def test_more_than_nine_references_refused(monkeypatch):
+    # A 3x3 grid is where a contact sheet stops being a reference: beyond
+    # the merge ceiling the request is refused with the count named.
     ctx, _ = _ctx(monkeypatch)
+    refs = [REF] * 10
     with pytest.raises(AdapterError) as err:
         await _request(ctx, {"model": IMAGE2, "prompt": "combine",
-                             "size": "1024x1024", "image": [REF, REF2]})
+                             "size": "1024x1024", "image": refs})
     assert err.value.param == "image"
-    assert "2" in err.value.message
+    assert "10" in err.value.message
 
 
 async def test_seed_int_rides_bool_and_str_dropped(monkeypatch):
