@@ -67,7 +67,16 @@
       "mask"
     ]
   },
-  "gemini-3-pro-image": {
+    "gemini-3-pro-image": {
+      "kind": "generate",
+      "tiers": ["1K", "2K", "4K"],
+      "wide": true,
+      "outputs": ["image"],
+      "async": false,
+      "accepts": ["prompt", "image", "size", "response_format"],
+      "ignores": ["n", "quality", "watermark", "mask"]
+    },
+    "gemini-3-pro-image-preview": {
       "kind": "generate",
       "tiers": ["1K", "2K", "4K"],
       "wide": true,
@@ -82,7 +91,7 @@
     "wide": "accepts the extreme ratios (1:4, 4:1, 1:8, 8:1); false means they must fall back to a nearer ratio.",
     "shared": "vendor-wide facts merged into every model entry by the loader, so a list shared by the whole family is written once.",
     "ratios": "every ratio the family documents, as vendor-spelled strings (\"16:9\").",
-    "models": "the ids this table has measured facts for. A name that matches an entry here travels to the vendor VERBATIM -- the loader rewrites nothing but `aliases`, so no spelling is ever folded onto a near id, and a suffixed spelling with no entry of its own is an unknown model (sent with less, never guessed at). A spelling a gateway's channels are keyed on therefore belongs in `models`; a name only the control plane knows belongs in the channel's `X-Model-Map`. Measured 2026-09-11 against api.chatfire.cn: the bare `gemini-3.1-flash-image` is answered 503 \"no available channel for gemini-3-pro-image\" (the message names a post-mapping model, so it looks like a bug on our side), while `gemini-3.1-flash-image-preview` returns an image. Hence the preview id has its own entry.",
+    "models": "the ids this table has measured facts for. A name that matches an entry here travels to the vendor VERBATIM -- the loader rewrites nothing but `aliases`, so no spelling is ever folded onto a near id, and a suffixed spelling with no entry of its own is an unknown model (sent with less, never guessed at). A spelling a gateway's channels are keyed on therefore belongs in `models`; a name only the control plane knows belongs in the channel's `X-Model-Map`. Measured 2026-09-11 against api.chatfire.cn: the bare `gemini-3.1-flash-image` is answered 503 \"no available channel for gemini-3-pro-image\" (the message names a post-mapping model, so it looks like a bug on our side), while `gemini-3.1-flash-image-preview` returns an image. Hence the preview id has its own entry. Measured 2026-11-16 against subdirect.aicodexvip.top: `gemini-3-pro-image-preview` answers 1:1 as 1024/2048/4096 and 16:9 as 1376x768/2752x1536/5504x3072 (its 16:9 is really 1.7917, not 1.7778); a long edge above 2048 selects the 4K tier, so 4096x2304 comes back as 5504x3072.",
   "kind": "generate | format | enhance | erase | watermark | beauty. Lets a script pick defaults and lets an orchestrator reason about a chain.",
     "outputs": "what one call produces (image | mask | text). An orchestrator uses it to check a chain is satisfiable - no consumer yet.",
     "async": "the upstream answers with a task id instead of a result (needs X-Async polling).",
